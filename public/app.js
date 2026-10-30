@@ -650,7 +650,7 @@ function accountSection() {
 
 function renderSettings() {
   if (!isOwner()) {
-    return `${accountSection()}<p class="footer-note">🥭 Mango Signer ${esc(state.server.version || '')}</p>`;
+    return `${accountSection()}<p class="footer-note">🥭 Mango Signer ${esc(state.server.version || '')}<br>© 2026 MangoMods · All rights reserved</p>`;
   }
   const s = state.server;
   const b = s.storageBreakdown || {};
@@ -706,7 +706,7 @@ function renderSettings() {
       <div class="setting"><span>Users</span><span class="value">${state.users.length}</span></div>
     </div>
     ${accountSection()}
-    <p class="footer-note">🥭 Mango Signer · signing powered by zsign</p>`;
+    <p class="footer-note">🥭 Mango Signer · signing powered by zsign (MIT)<br>© 2026 MangoMods · All rights reserved</p>`;
 }
 
 function bindView(view) {
