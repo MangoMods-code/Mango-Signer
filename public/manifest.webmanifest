@@ -1,0 +1,12 @@
+{
+  "name": "Mango Signer",
+  "short_name": "Mango",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#140c1a",
+  "theme_color": "#140c1a",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}

@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#140c1a">
+  <title>{{title}}</title>
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; background: #140c1a; color: #f6eefc;
+      font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; text-align: center; padding: 24px; box-sizing: border-box; }
+    .card { width: 100%; max-width: 360px; background: #241830; border-radius: 24px; padding: 30px 22px 24px; }
+    img { width: 96px; height: 96px; border-radius: 22px; box-shadow: 0 10px 40px rgba(255, 159, 28, .2); }
+    h1 { font-size: 24px; margin: 16px 0 4px; overflow-wrap: anywhere; }
+    p { color: #a898b5; margin: 0 0 22px; font-size: 14px; }
+    a.btn { display: block; padding: 15px; border-radius: 15px; font-weight: 700; font-size: 17px; text-decoration: none; color: #1a0d05;
+      background: linear-gradient(135deg, #ff9f1c, #ff7a1a); }
+    .hidden { display: none; }
+    small { display: block; margin-top: 16px; color: #a898b5; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <img src="{{icon}}" alt="">
+    <h1>{{name}}</h1>
+    <p>{{meta}}</p>
+    <a class="btn {{hidden}}" href="{{install}}">Install</a>
+    <small>🥭 Shared with Mango Signer · Open in Safari on iPhone</small>
+  </div>
+</body>
+</html>
