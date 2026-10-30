@@ -8,6 +8,57 @@ const state = {
   lib: { q: '', cat: 'all', sort: 'smart', select: false, selected: new Set() },
 };
 const isOwner = () => state.account && state.account.role === 'owner';
+
+// ---------- version & updates ----------
+const CLIENT_VERSION = /^\d/.test(document.documentElement.dataset.version || '') ? document.documentElement.dataset.version : null;
+
+async function checkForUpdate() {
+  try {
+    const r = await fetch('/api/version', { cache: 'no-store' });
+    const { version } = await r.json();
+    const bar = $('#updateBar');
+    if (CLIENT_VERSION && version && version !== CLIENT_VERSION) {
+      bar.innerHTML = `<b>✨ Version Updated! Tap here to refresh</b><span>V${esc(CLIENT_VERSION)} → V${esc(version)}</span>`;
+      bar.classList.remove('hidden');
+      document.body.classList.add('has-update');
+    }
+  } catch { /* offline — try again later */ }
+}
+$('#updateBar').onclick = () => {
+  const u = new URL(location.href);
+  u.searchParams.set('r', Date.now().toString(36));
+  location.replace(u.toString());
+};
+setInterval(checkForUpdate, 60 * 1000);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') checkForUpdate(); });
+
+// ---------- what's new ----------
+const SEEN_KEY = 'mango.seenVersion';
+function whatsNewHtml(v, open) {
+  return `<details class="wn" ${open ? 'open' : ''}>
+    <summary><span class="wn-ver">V${esc(v.version)}</span><span class="wn-title">${esc(v.title)}</span><span class="wn-date">${fmtDate(v.date + 'T12:00:00')}</span></summary>
+    <p class="wn-summary">${esc(v.summary)}</p>
+    ${v.sections.map((sec) => `<div class="wn-sec"><h4>${esc(sec.title)}</h4><ul>${sec.items.map((i) => `<li>${esc(i)}</li>`).join('')}</ul></div>`).join('')}
+  </details>`;
+}
+async function whatsNewSheet() {
+  try {
+    const { version, versions } = await api('GET', '/api/whats-new');
+    openSheet(`
+      <h2>What's New</h2>
+      <p class="muted small" style="margin-top:-8px">You're on Mango Signer V${esc(CLIENT_VERSION || version)}</p>
+      ${versions.map((v, i) => whatsNewHtml(v, i === 0)).join('')}
+      <button class="btn primary big block" id="wnDone" style="margin-top:14px">Got it</button>`, (el) => {
+      $('#wnDone', el).onclick = closeSheet;
+    });
+    try { localStorage.setItem(SEEN_KEY, CLIENT_VERSION || version); } catch { /* */ }
+  } catch (e) { toast(e.message, true); }
+}
+function maybeShowWhatsNew() {
+  let seen = null;
+  try { seen = localStorage.getItem(SEEN_KEY); } catch { return; }
+  if (CLIENT_VERSION && seen !== CLIENT_VERSION && $('#sheet').classList.contains('hidden')) whatsNewSheet();
+}
 try { Object.assign(state.lib, JSON.parse(localStorage.getItem('mango.lib') || '{}'), { q: '', select: false, selected: new Set() }); } catch { /* */ }
 const saveLibPrefs = () => { try { localStorage.setItem('mango.lib', JSON.stringify({ cat: state.lib.cat, sort: state.lib.sort })); } catch { /* */ } };
 
@@ -638,6 +689,7 @@ function accountSection() {
   return `
     <div class="section-title">Account</div>
     <div class="list">
+      <button class="row" data-act="whats-new"><span class="row-main" style="font-weight:600">✨ What's New</span><span class="value muted">V${esc(CLIENT_VERSION || state.server.version || '')} ›</span></button>
       <div class="setting"><span>Username</span><span class="value">${esc(a.username)}</span></div>
       <div class="setting"><span>iPhone</span><span class="value">${a.udid ? `${esc(a.deviceName || 'iPhone')}<br><span class="mono">${esc(shortUdid(a.udid))}</span>` : 'Not linked'}</span></div>
       ${a.udid ? '<button class="row" data-act="copy-udid"><span class="row-main" style="font-weight:600">Copy my UDID</span></button><button class="row" data-act="unlink-device"><span class="row-main" style="color:var(--red);font-weight:600">Unlink iPhone</span></button>'
@@ -741,6 +793,7 @@ function bindView(view) {
         'new-invite': newInviteSheet,
         invite: () => inviteSheet(idv),
         user: () => userSheet(idv),
+        'whats-new': whatsNewSheet,
         'copy-udid': () => copy(state.account.udid, 'UDID copied'),
         'unlink-device': unlinkDevice,
         'change-password': changePasswordSheet,
@@ -1558,7 +1611,7 @@ async function handleUrlParams() {
   const q = new URLSearchParams(location.search);
   const udid = q.get('udid');
   const invite = q.get('invite');
-  if (udid || invite) history.replaceState(null, '', '/');
+  if (udid || invite || q.has('r')) history.replaceState(null, '', '/');
   if (invite) { $('#suInvite').value = invite; return 'signup'; }
   if (!udid) return null;
   const msgs = {
@@ -1595,10 +1648,12 @@ async function boot() {
   $('#login').classList.add('hidden');
   $('#app').classList.remove('hidden');
   await refresh();
+  maybeShowWhatsNew();
 }
 
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && !$('#app').classList.contains('hidden') && $('#sheet').classList.contains('hidden') && !uploadFile.active) refresh().catch(() => {});
 });
 
+checkForUpdate();
 boot().catch((e) => toast(e.message, true));

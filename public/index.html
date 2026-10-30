@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-version="__VERSION__">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
@@ -12,9 +12,10 @@
   <link rel="apple-touch-icon" href="/apple-touch-icon.png">
   <link rel="icon" type="image/png" href="/icon-64.png">
   <link rel="manifest" href="/manifest.webmanifest">
-  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/styles.css?v=__VERSION__">
 </head>
 <body>
+  <button id="updateBar" class="update-bar hidden" type="button"></button>
   <div id="login" class="login hidden">
     <img src="/icon-180.png" alt="" class="login-icon">
     <h1>Mango Signer</h1>
@@ -65,6 +66,6 @@
   <div id="toast" class="toast hidden"></div>
   <input type="file" id="filePicker" class="hidden">
 
-  <script src="/app.js"></script>
+  <script src="/app.js?v=__VERSION__"></script>
 </body>
 </html>
