@@ -1,0 +1,14 @@
+{
+  "name": "mango-signer",
+  "version": "1.0.0",
+  "description": "Self-hosted iOS app signer and installer for iPhone",
+  "main": "server.js",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
