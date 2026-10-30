@@ -10,15 +10,19 @@ const state = {
 const isOwner = () => state.account && state.account.role === 'owner';
 
 // ---------- version & updates ----------
-const CLIENT_VERSION = /^\d/.test(document.documentElement.dataset.version || '') ? document.documentElement.dataset.version : null;
+const pageData = document.documentElement.dataset;
+const real = (v) => (v && !/^__/.test(v) ? v : null);
+const CLIENT_VERSION = real(pageData.version); // what's shown (can be a custom label)
+const CLIENT_BUILD = real(pageData.build); // changes with every update
+const CODE_VERSION = real(pageData.codeVersion); // the real version, used for What's New
 
 async function checkForUpdate() {
   try {
     const r = await fetch('/api/version', { cache: 'no-store' });
-    const { version } = await r.json();
+    const { version, build } = await r.json();
     const bar = $('#updateBar');
-    if (CLIENT_VERSION && version && version !== CLIENT_VERSION) {
-      bar.innerHTML = `<b>✨ Version Updated! Tap here to refresh</b><span>V${esc(CLIENT_VERSION)} → V${esc(version)}</span>`;
+    if (CLIENT_BUILD && build && build !== CLIENT_BUILD) {
+      bar.innerHTML = `<b>✨ Version Updated! Tap here to refresh</b><span>${CLIENT_VERSION === version ? `V${esc(version)} · new build` : `V${esc(CLIENT_VERSION)} → V${esc(version)}`}</span>`;
       bar.classList.remove('hidden');
       document.body.classList.add('has-update');
     }
@@ -51,13 +55,13 @@ async function whatsNewSheet() {
       <button class="btn primary big block" id="wnDone" style="margin-top:14px">Got it</button>`, (el) => {
       $('#wnDone', el).onclick = closeSheet;
     });
-    try { localStorage.setItem(SEEN_KEY, CLIENT_VERSION || version); } catch { /* */ }
+    try { localStorage.setItem(SEEN_KEY, CODE_VERSION || version); } catch { /* */ }
   } catch (e) { toast(e.message, true); }
 }
 function maybeShowWhatsNew() {
   let seen = null;
   try { seen = localStorage.getItem(SEEN_KEY); } catch { return; }
-  if (CLIENT_VERSION && seen !== CLIENT_VERSION && $('#sheet').classList.contains('hidden')) whatsNewSheet();
+  if (CODE_VERSION && seen !== CODE_VERSION && $('#sheet').classList.contains('hidden')) whatsNewSheet();
 }
 try { Object.assign(state.lib, JSON.parse(localStorage.getItem('mango.lib') || '{}'), { q: '', select: false, selected: new Set() }); } catch { /* */ }
 const saveLibPrefs = () => { try { localStorage.setItem('mango.lib', JSON.stringify({ cat: state.lib.cat, sort: state.lib.sort })); } catch { /* */ } };
@@ -218,6 +222,7 @@ function ago(iso) {
 }
 const fmtDate = (iso) => (iso ? new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' }) : '—');
 const shortUdid = (u) => (u ? `${u.slice(0, 8)}…${u.slice(-4)}` : '');
+const shownVersion = (a) => a.versionOverride || a.version || '';
 const catById = (cid) => state.categories.find((c) => c.id === cid);
 const catLabel = (cid) => { const c = catById(cid); return c ? `${c.emoji} ${c.name}` : 'Uncategorized'; };
 
@@ -258,20 +263,104 @@ const TAB_ICONS = {
 };
 
 // ---------- sheet ----------
+// Freezes the page behind a sheet so pulling on the sheet can't drag or scroll the page.
+let pageLock = null;
+function lockPage() {
+  if (pageLock) return;
+  pageLock = { y: window.scrollY };
+  Object.assign(document.body.style, { position: 'fixed', top: `-${pageLock.y}px`, left: '0', right: '0', width: '100%' });
+}
+function unlockPage() {
+  if (!pageLock) return;
+  const { y } = pageLock;
+  pageLock = null;
+  Object.assign(document.body.style, { position: '', top: '', left: '', right: '', width: '' });
+  window.scrollTo(0, y);
+}
+
+function resetSheetPosition() {
+  const sheet = $('#sheet');
+  sheet.style.transition = '';
+  sheet.style.transform = '';
+  $('#sheetBackdrop').style.opacity = '';
+}
+
 function openSheet(html, onMount) {
+  const sheet = $('#sheet');
+  const wasOpen = !sheet.classList.contains('hidden');
+  resetSheetPosition();
   $('#sheetBody').innerHTML = html;
-  $('#sheet').classList.remove('hidden');
+  sheet.classList.toggle('locked', !!closeSheet.locked);
+  sheet.classList.remove('hidden');
   $('#sheetBackdrop').classList.remove('hidden');
-  $('#sheet').scrollTop = 0;
+  if (wasOpen) sheet.classList.add('no-anim'); else sheet.classList.remove('no-anim');
+  sheet.scrollTop = 0;
+  lockPage();
   onMount && onMount($('#sheetBody'));
 }
 function closeSheet() {
   if (closeSheet.locked) return;
+  resetSheetPosition();
   $('#sheet').classList.add('hidden');
   $('#sheetBackdrop').classList.add('hidden');
   $('#sheetBody').innerHTML = '';
+  unlockPage();
 }
 $('#sheetBackdrop').onclick = closeSheet;
+$('#sheetClose').onclick = closeSheet;
+
+// Swipe down to close. Works from the handle anywhere, or from the content when it's scrolled to the top.
+(function sheetGestures() {
+  const sheet = $('#sheet');
+  const backdrop = $('#sheetBackdrop');
+  let startY = 0, startX = 0, dy = 0, startT = 0, mode = 'idle', fromHandle = false;
+
+  sheet.addEventListener('touchstart', (e) => {
+    mode = 'idle';
+    if (closeSheet.locked || e.touches.length !== 1) return;
+    fromHandle = !!e.target.closest('.grabber-zone');
+    if (!fromHandle && (sheet.scrollTop > 0 || e.target.closest('input, textarea, select, .chips-row, .shelf, .log'))) return;
+    startY = e.touches[0].clientY;
+    startX = e.touches[0].clientX;
+    dy = 0;
+    startT = Date.now();
+    mode = 'maybe';
+  }, { passive: true });
+
+  sheet.addEventListener('touchmove', (e) => {
+    if (mode === 'idle') return;
+    const d = e.touches[0].clientY - startY;
+    const dx = Math.abs(e.touches[0].clientX - startX);
+    if (mode === 'maybe') {
+      if (d > 8 && d > dx && (fromHandle || sheet.scrollTop <= 0)) mode = 'drag';
+      else if (Math.abs(d) > 8 || dx > 8) { mode = 'idle'; return; } else return;
+    }
+    e.preventDefault();
+    dy = Math.max(0, d);
+    sheet.style.transition = 'none';
+    sheet.style.transform = `translateY(${dy}px)`;
+    backdrop.style.opacity = String(Math.max(0.2, 1 - dy / 500));
+  }, { passive: false });
+
+  const finish = (cancelled) => {
+    if (mode !== 'drag') { mode = 'idle'; return; }
+    mode = 'idle';
+    const speed = dy / Math.max(1, Date.now() - startT);
+    sheet.style.transition = 'transform .22s ease';
+    backdrop.style.transition = 'opacity .22s ease';
+    if (!cancelled && (dy > 120 || (dy > 30 && speed > 0.35))) {
+      sheet.style.transform = 'translateY(105%)';
+      backdrop.style.opacity = '0';
+      setTimeout(() => { backdrop.style.transition = ''; closeSheet(); }, 210);
+    } else {
+      sheet.style.transform = '';
+      backdrop.style.opacity = '';
+      setTimeout(() => { sheet.style.transition = ''; backdrop.style.transition = ''; }, 230);
+    }
+  };
+  sheet.addEventListener('touchend', () => finish(false));
+  sheet.addEventListener('touchcancel', () => finish(true));
+})();
 
 // ---------- shared toggles & presets ----------
 function toggle(id, label, sub = '', checked = false) {
@@ -427,7 +516,7 @@ function filteredApps() {
   let apps = state.apps.slice();
   if (q) {
     const needle = q.toLowerCase();
-    apps = apps.filter((a) => [a.name, a.bundleId, a.description, a.developer, a.notes, catLabel(a.categoryId)].some((f) => (f || '').toLowerCase().includes(needle)));
+    apps = apps.filter((a) => [a.name, a.bundleId, a.description, a.developer, a.notes, shownVersion(a), catLabel(a.categoryId)].some((f) => (f || '').toLowerCase().includes(needle)));
   }
   if (cat === 'featured') apps = apps.filter((a) => a.featured);
   else if (cat === 'none') apps = apps.filter((a) => !a.categoryId || !catById(a.categoryId));
@@ -453,7 +542,7 @@ function appRow(a) {
       ${appIcon(a)}
       <div class="row-main">
         <div class="row-title">${esc(a.name)}${a.featured ? '<span class="star">★</span>' : ''}${isOwner() && !a.published ? '<span class="badge">Hidden</span>' : ''}</div>
-        <div class="row-sub">${esc(a.version || '—')} · ${esc(a.description ? a.description.split('\n')[0] : a.bundleId)}</div>
+        <div class="row-sub">${esc(shownVersion(a) || '—')} · ${esc(a.description ? a.description.split('\n')[0] : a.bundleId)}</div>
         <div class="row-sub">${esc(sub2)}${defaults.length ? ` · <span class="mango-text">${esc(defaults.slice(0, 2).join(', '))}${defaults.length > 2 ? '…' : ''}</span>` : ''}</div>
       </div>
       ${sel ? '' : `<button class="pill" data-act="sign" data-id="${a.id}">Sign</button>`}
@@ -858,6 +947,7 @@ async function runWithProgress(el, work, onDone) {
   const box = $('#addProgress', el);
   el.querySelectorAll('button, input').forEach((b) => { b.disabled = true; });
   closeSheet.locked = true;
+  $('#sheet').classList.add('locked');
   box.innerHTML = uploadProgressHtml();
   const setProgress = (p, msg) => {
     if (p != null) $('.bar > div', box).style.width = `${Math.round(p * 100)}%`;
@@ -867,11 +957,13 @@ async function runWithProgress(el, work, onDone) {
   try {
     const { app } = await work(setProgress, setSub);
     closeSheet.locked = false;
+    $('#sheet').classList.remove('locked');
     await refresh();
     const fresh = state.apps.find((a) => a.id === app.id) || app;
     onDone ? onDone(fresh) : closeSheet();
   } catch (e) {
     closeSheet.locked = false;
+    $('#sheet').classList.remove('locked');
     el.querySelectorAll('button, input').forEach((b) => { b.disabled = false; });
     box.innerHTML = '';
     toast(e.message, true);
@@ -880,7 +972,7 @@ async function runWithProgress(el, work, onDone) {
 
 function updateIpaSheet(a) {
   openSheet(`
-    <div class="sheet-head">${appIcon(a, true)}<div class="row-main"><h2>Update ${esc(a.name)}</h2><div class="row-sub">Now ${esc(a.version || '—')}</div></div></div>
+    <div class="sheet-head">${appIcon(a, true)}<div class="row-main"><h2>Update ${esc(a.name)}</h2><div class="row-sub">Now ${esc(shownVersion(a) || '—')}</div></div></div>
     <p class="muted small">Swap in a new .ipa. The name, category, description, notes, icon and default sign settings all stay the same.</p>
     <button class="file-btn" id="uPick">${ICONS.file}<div class="row-main"><div class="row-title">Choose new .ipa</div><div class="row-sub">Resumes if your connection drops</div></div></button>
     <div class="section-title">Or from a link</div>
@@ -920,7 +1012,7 @@ function appSheet(appId) {
       <span class="badge mango">${esc(catLabel(a.categoryId))}</span>
       ${a.featured ? '<span class="badge warn">★ Featured</span>' : ''}
       ${owner && !a.published ? '<span class="badge">Hidden</span>' : ''}
-      <span class="badge">v${esc(a.version || '?')}</span>
+      <span class="badge">v${esc(shownVersion(a) || '?')}</span>
       <span class="badge">${fmtSize(a.size)}</span>
     </div>
     <button class="btn primary big block" id="aSign">Sign &amp; Install</button>
@@ -929,7 +1021,7 @@ function appSheet(appId) {
     ${a.notes ? `<div class="section-title">What's changed / notes</div><p class="desc">${esc(a.notes)}</p>` : ''}
     <div class="section-title">Info</div>
     <dl class="kv card" style="margin:0">
-      <dt>Version</dt><dd>${esc(a.version || '—')}${a.build && a.build !== a.version ? ` (${esc(a.build)})` : ''}${a.previousVersion && a.previousVersion !== a.version ? `<br><span class="muted small">was ${esc(a.previousVersion)}</span>` : ''}</dd>
+      <dt>Version</dt><dd>${esc(shownVersion(a) || '—')}${!a.versionOverride && a.build && a.build !== a.version ? ` (${esc(a.build)})` : ''}${a.versionOverride && isOwner() ? `<br><span class="muted small">file says ${esc(a.version || '?')}</span>` : ''}${a.previousVersion && a.previousVersion !== a.version ? `<br><span class="muted small">was ${esc(a.previousVersion)}</span>` : ''}</dd>
       <dt>Bundle ID</dt><dd class="mono">${esc(a.bundleId)}</dd>
       <dt>Minimum iOS</dt><dd>${esc(a.minOS || '—')}</dd>
       <dt>Size</dt><dd>${fmtSize(a.size)}</dd>
@@ -976,11 +1068,14 @@ function categorySelectHtml(selected) {
 function editAppSheet(a, isNew = false) {
   const pending = { icon: null, resetIcon: false };
   openSheet(`
-    <div class="sheet-head">${appIcon(a, true)}<div class="row-main"><h2>${isNew ? 'Add details' : 'Edit app'}</h2><div class="row-sub">${esc(a.originalName || a.name)} · ${esc(a.version || '')}</div></div></div>
+    <div class="sheet-head">${appIcon(a, true)}<div class="row-main"><h2>${isNew ? 'Add details' : 'Edit app'}</h2><div class="row-sub">${esc(a.originalName || a.name)} · ${esc(shownVersion(a))}</div></div></div>
     ${isNew ? '<p class="hint" style="margin-top:-6px">All optional — you can change these any time.</p>' : ''}
 
     <div class="field"><label>Name in the library</label><input type="text" id="eName" value="${esc(a.name)}"></div>
     <div class="field"><label>Category</label>${categorySelectHtml(a.categoryId)}</div>
+    <div class="field"><label>Version</label><input type="text" id="eVer" value="${esc(a.versionOverride || '')}" placeholder="${esc(a.version || '1.0')}" autocapitalize="off" autocorrect="off">
+      <div class="hint">Leave blank to use the version from the .ipa (${esc(a.version || 'none')}). Cleared automatically when you Update IPA.</div></div>
+    <div class="group">${toggle('eVerSign', 'Use this version when signing', 'Installed apps show it in Settings › General › iPhone Storage. Only numbers, letters, dots and dashes are used.', a.useVersionWhenSigning !== false)}</div>
     <div class="field"><label>Developer / source</label><input type="text" id="eDev" value="${esc(a.developer || '')}" placeholder="e.g. Nintendo, or where you got it"></div>
     <div class="field"><label>Description</label><textarea id="eDesc" placeholder="What it is, in a sentence or two">${esc(a.description || '')}</textarea></div>
     <div class="field"><label>Notes / what's tweaked</label><textarea id="eNotes" placeholder="e.g. Ad-free, works with controllers, turn on JIT in StikDebug first">${esc(a.notes || '')}</textarea></div>
@@ -1027,6 +1122,8 @@ function editAppSheet(a, isNew = false) {
           name: $('#eName', el).value,
           categoryId: $('#eCat', el).value === '__new' ? a.categoryId : ($('#eCat', el).value || null),
           developer: $('#eDev', el).value,
+          versionOverride: $('#eVer', el).value.trim(),
+          useVersionWhenSigning: $('#eVerSign', el).checked,
           description: $('#eDesc', el).value,
           notes: $('#eNotes', el).value,
           published: $('#ePub', el).checked,
@@ -1120,7 +1217,7 @@ function signSheet(appId, overrides) {
   const summary = defaultsSummary(defaults);
 
   openSheet(`
-    <div class="sheet-head">${appIcon(a, true)}<div class="row-main"><h2>Sign ${esc(a.name)}</h2><div class="row-sub">${esc(a.version)} · ${fmtSize(a.size)}</div></div></div>
+    <div class="sheet-head">${appIcon(a, true)}<div class="row-main"><h2>Sign ${esc(a.name)}</h2><div class="row-sub">${esc(shownVersion(a))} · ${fmtSize(a.size)}</div></div></div>
 
     <div class="field"><label>Certificate</label>
       <select id="sCert">${state.certs.map((c) => `<option value="${c.id}" ${c.id === def.id ? 'selected' : ''}>${esc(c.label)} · ${esc(c.profile.type)}</option>`).join('')}</select>
@@ -1134,7 +1231,7 @@ function signSheet(appId, overrides) {
       <div class="section-title">App details</div>
       <div class="field"><label>Name</label><input type="text" id="sName" placeholder="${esc(a.name)}"></div>
       <div class="field"><label>Bundle ID</label><input type="text" id="sBundle" placeholder="${esc(a.bundleId)}" autocapitalize="off" autocorrect="off"><div class="hint">Change it to install a second copy next to the original.</div></div>
-      <div class="field"><label>Version</label><input type="text" id="sVersion" placeholder="${esc(a.version)}" autocapitalize="off"></div>
+      <div class="field"><label>Version</label><input type="text" id="sVersion" placeholder="${esc(shownVersion(a))}" autocapitalize="off"></div>
       <div class="field"><label>Minimum iOS</label><input type="text" id="sMin" value="${esc(defaults.minOS || '')}" placeholder="${esc(a.minOS || 'unchanged')}" inputmode="decimal"></div>
 
       <div class="section-title">Icon</div>
@@ -1248,6 +1345,7 @@ function resignFromSigned(sid) {
 
 function runSign(a, opts, extra) {
   closeSheet.locked = true;
+  $('#sheet').classList.add('locked');
   openSheet(`
     <div class="progress-wrap">
       ${appIcon(a, true).replace('class="app-icon big"', 'class="app-icon big" style="margin:4px auto 0"')}
@@ -1284,10 +1382,14 @@ function runSign(a, opts, extra) {
         if (j.log.length) { log.classList.remove('hidden'); log.textContent = j.log.join('\n'); log.scrollTop = log.scrollHeight; }
       });
       closeSheet.locked = false;
+      $('#sheet').classList.remove('locked');
+    $('#sheet').classList.remove('locked');
       await refresh().catch(() => {});
       showSigned(result.signed, opts);
     } catch (e) {
       closeSheet.locked = false;
+      $('#sheet').classList.remove('locked');
+    $('#sheet').classList.remove('locked');
       openSheet(`
         <div class="progress-wrap">
           <h2>Signing failed</h2>

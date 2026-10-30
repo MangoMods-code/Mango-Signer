@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" data-version="__VERSION__">
+<html lang="en" data-version="__VERSION__" data-build="__BUILD__" data-code-version="__CODE_VERSION__">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
@@ -12,7 +12,7 @@
   <link rel="apple-touch-icon" href="/apple-touch-icon.png">
   <link rel="icon" type="image/png" href="/icon-64.png">
   <link rel="manifest" href="/manifest.webmanifest">
-  <link rel="stylesheet" href="/styles.css?v=__VERSION__">
+  <link rel="stylesheet" href="/styles.css?v=__BUILD__">
 </head>
 <body>
   <button id="updateBar" class="update-bar hidden" type="button"></button>
@@ -59,13 +59,13 @@
 
   <div id="sheetBackdrop" class="backdrop hidden"></div>
   <section id="sheet" class="sheet hidden" role="dialog" aria-modal="true">
-    <div class="grabber"></div>
+    <div class="grabber-zone"><div class="grabber"></div><button id="sheetClose" class="sheet-x" type="button" aria-label="Close">✕</button></div>
     <div id="sheetBody"></div>
   </section>
 
   <div id="toast" class="toast hidden"></div>
   <input type="file" id="filePicker" class="hidden">
 
-  <script src="/app.js?v=__VERSION__"></script>
+  <script src="/app.js?v=__BUILD__"></script>
 </body>
 </html>
