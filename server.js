@@ -15,7 +15,7 @@ const plist = require('./lib/plist');
 const { parseProvision, profileEntitlements, parseP12, run } = require('./lib/certs');
 const { drawAppIcon } = require('./lib/png');
 
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 const PORT = Number(process.env.PORT) || 3000;
 const DATA_DIR = path.resolve(process.env.DATA_DIR || (fs.existsSync('/data') ? '/data' : './data'));
 const ZSIGN = process.env.ZSIGN_PATH || 'zsign';
@@ -44,6 +44,17 @@ for (const s of store.signed) if (!s.ownerId) s.ownerId = 'owner';
 for (const a of store.apps) if (a.published === undefined) a.published = true;
 if (store.settings.maxSignedPerUser === undefined) store.settings.maxSignedPerUser = 10;
 if (store.settings.udidLogin === undefined) store.settings.udidLogin = true;
+if (store.settings.signedRetentionDays === undefined) store.settings.signedRetentionDays = 7;
+if (!store.categories.length && !store.settings.categoriesSeeded) {
+  [['🎮', 'Games'], ['🕹️', 'Emulators'], ['💬', 'Social'], ['🎵', 'Music & Video'], ['🧰', 'Utilities'], ['✨', 'Tweaked']]
+    .forEach(([emoji, name], i) => store.categories.push({ id: crypto.randomBytes(8).toString('hex'), name, emoji, order: i }));
+  store.settings.categoriesSeeded = true;
+}
+for (const a of store.apps) {
+  if (a.categoryId === undefined) a.categoryId = null;
+  if (a.featured === undefined) a.featured = false;
+  if (!a.signDefaults) a.signDefaults = {};
+}
 store.save();
 
 // ---------- secrets ----------
@@ -209,13 +220,14 @@ async function serveFile(req, res, file, { type, download, cache = 'no-store' } 
   return pipeline(fs.createReadStream(file), res).catch(() => {});
 }
 
-// Temp uploads belong to whoever uploaded them.
-const uploads = new Map();
+// Temp uploads belong to whoever uploaded them. Chunked uploads track how much has arrived.
+const uploads = new Map(); // id -> { owner, size (expected, or null), received }
 function tmpPath(uploadId, account) {
   if (!/^[a-f0-9]{16}$/.test(uploadId || '')) throw httpError(400, 'Missing or invalid upload');
-  const owner = uploads.get(uploadId);
+  const u = uploads.get(uploadId);
   const p = path.join(dirs.tmp, uploadId);
-  if (!owner || owner !== account.id || !fs.existsSync(p)) throw httpError(400, 'Upload expired — please pick the file again');
+  if (!u || u.owner !== account.id || !fs.existsSync(p)) throw httpError(400, 'Upload expired — please pick the file again');
+  if (u.size != null && u.received !== u.size) throw httpError(400, 'Upload isn\'t finished yet');
   uploads.delete(uploadId);
   return p;
 }
@@ -317,6 +329,7 @@ function signedView(s, req) {
   const manifest = `${base}/i/${s.token}/manifest.plist`;
   return {
     ...s,
+    fileAvailable: !s.fileDeleted,
     installUrl: `itms-services://?action=download-manifest&url=${encodeURIComponent(manifest)}`,
     shareUrl: `${base}/i/${s.token}`,
     downloadUrl: `${base}/i/${s.token}/app.ipa`,
@@ -531,7 +544,7 @@ route('GET', /^\/api\/udid\/pending$/, (req, res) => {
 }, 'open');
 
 // ----- state -----
-async function storageUsed() {
+async function dirSize(dir) {
   let total = 0;
   const walk = async (d) => {
     for (const e of await fsp.readdir(d, { withFileTypes: true }).catch(() => [])) {
@@ -539,15 +552,41 @@ async function storageUsed() {
       if (e.isDirectory()) await walk(p); else total += (await fsp.stat(p).catch(() => ({ size: 0 }))).size;
     }
   };
-  await walk(DATA_DIR);
+  await walk(dir);
   return total;
 }
+const storageUsed = () => dirSize(DATA_DIR);
+async function storageBreakdown() {
+  return {
+    library: await dirSize(dirs.apps),
+    signed: await dirSize(dirs.signed),
+    certs: await dirSize(dirs.certs),
+    temp: (await dirSize(dirs.tmp)) + (await dirSize(dirs.work)),
+  };
+}
+
+// Signed .ipa files are only needed to install, so old ones are deleted to save space.
+// The record stays so people can see it and tap "Sign again".
+async function cleanupSignedFiles(maxAgeDays = Number(store.settings.signedRetentionDays)) {
+  if (!maxAgeDays) return 0;
+  let n = 0;
+  for (const s of store.signed) {
+    if (s.fileDeleted || Date.now() - new Date(s.signedAt) < maxAgeDays * 864e5) continue;
+    await rmQuiet(path.join(dirs.signed, s.id + '.ipa'));
+    s.fileDeleted = true;
+    n++;
+  }
+  if (n) store.save();
+  return n;
+}
+setInterval(() => cleanupSignedFiles().catch(() => {}), 60 * 60 * 1000).unref();
 
 route('GET', /^\/api\/state$/, async (req, res, m, acc) => {
   const base = baseUrl(req);
   const out = {
     account: accountView(acc),
     apps: visibleApps(acc).map((a) => appView(a, acc)),
+    categories: sortedCategories(),
     certs: myCerts(acc).map((c) => certView(c, acc)),
     signed: mySigned(acc).map((s) => signedView(s, req)),
     server: { baseUrl: base, https: base.startsWith('https://'), version: VERSION },
@@ -556,9 +595,9 @@ route('GET', /^\/api\/state$/, async (req, res, m, acc) => {
     out.settings = store.settings;
     out.users = store.users.map(userView);
     out.invites = store.invites;
-    out.server = { ...out.server, zsign: zsignVersion, passwordSet: !!APP_PASSWORD, storage: await storageUsed() };
+    out.server = { ...out.server, zsign: zsignVersion, passwordSet: !!APP_PASSWORD, storage: await storageUsed(), storageBreakdown: await storageBreakdown() };
   } else {
-    out.settings = { maxSignedPerUser: store.settings.maxSignedPerUser };
+    out.settings = { maxSignedPerUser: store.settings.maxSignedPerUser, signedRetentionDays: store.settings.signedRetentionDays };
   }
   json(res, out);
 });
@@ -583,31 +622,145 @@ route('POST', /^\/api\/upload$/, async (req, res, m, acc) => {
     throw e;
   }
   if (!size) { await rmQuiet(dest); return fail(res, 400, 'Empty file'); }
-  uploads.set(uid, acc.id);
+  uploads.set(uid, { owner: acc.id, size: null, received: size });
   json(res, { uploadId: uid, size });
 });
 
-// ----- app library (owner manages, everyone browses) -----
-async function addAppFromFile(file, fileName, source) {
-  let meta;
+// Resumable uploads: start, send chunks at an offset, ask how much arrived.
+route('POST', /^\/api\/upload\/start$/, async (req, res, m, acc) => {
+  const { size } = await readJson(req);
+  const total = Number(size);
+  const limit = isOwner(acc) ? MAX_UPLOAD : MAX_USER_UPLOAD;
+  if (!Number.isFinite(total) || total <= 0) return fail(res, 400, 'Empty file');
+  if (total > limit) return fail(res, 413, 'File is too large');
+  const uid = id();
+  await fsp.writeFile(path.join(dirs.tmp, uid), Buffer.alloc(0));
+  uploads.set(uid, { owner: acc.id, size: total, received: 0 });
+  json(res, { uploadId: uid, received: 0 });
+});
+
+function ownUpload(acc, uid) {
+  const u = /^[a-f0-9]{16}$/.test(uid) && uploads.get(uid);
+  if (!u || u.owner !== acc.id) throw httpError(404, 'Upload expired — please pick the file again');
+  return u;
+}
+
+route('GET', /^\/api\/upload\/([a-f0-9]{16})$/, (req, res, m, acc) => {
+  const u = ownUpload(acc, m[1]);
+  json(res, { received: u.received, size: u.size });
+});
+
+route('PUT', /^\/api\/upload\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
+  const u = ownUpload(acc, m[1]);
+  const offset = Number(req.query.get('offset'));
+  const reject = async (body) => {
+    // Read and throw away the body first, so the phone gets a clean answer instead of a dropped connection.
+    req.resume();
+    await new Promise((r) => { req.on('end', r); req.on('error', r); req.on('close', r); });
+    json(res, { received: u.received, ...body }, 409);
+  };
+  if (offset !== u.received) return reject({ mismatch: true });
+  if (u.busy) return reject({ busy: true });
+  u.busy = true;
+  const file = path.join(dirs.tmp, m[1]);
+  let got = 0;
+  const limiter = new Transform({
+    transform(chunk, _enc, cb) {
+      got += chunk.length;
+      if (got > 32 * 1024 * 1024 || u.received + got > u.size) return cb(httpError(413, 'Chunk too large'));
+      cb(null, chunk);
+    },
+  });
   try {
-    meta = await ipa.inspect(file);
+    await pipeline(req, limiter, fs.createWriteStream(file, { flags: 'r+', start: offset }));
+    u.received = offset + got;
+  } catch (e) {
+    // Keep only what fully arrived: trim the file back to the last good offset.
+    await fsp.truncate(file, u.received).catch(() => {});
+    throw e;
+  } finally {
+    u.busy = false;
+  }
+  json(res, { received: u.received, done: u.received === u.size });
+});
+
+// ----- app library (owner manages, everyone browses) -----
+function metaFields(meta) {
+  return {
+    bundleId: meta.bundleId, version: meta.version, build: meta.build, minOS: meta.minOS,
+    extensions: meta.extensions, hasWatch: meta.hasWatch, size: meta.size, hasIcon: !!meta.icon,
+  };
+}
+
+async function inspectOrFail(file) {
+  try {
+    return await ipa.inspect(file);
   } catch (e) {
     await rmQuiet(file);
     throw httpError(400, e.message || 'Not a valid .ipa');
   }
+}
+
+async function addAppFromFile(file, fileName, source) {
+  const meta = await inspectOrFail(file);
   const appId = id();
   await fsp.rename(file, path.join(dirs.apps, appId + '.ipa'));
   if (meta.icon) await fsp.writeFile(path.join(dirs.apps, appId + '.png'), meta.icon);
+  const now = new Date().toISOString();
   const rec = {
-    id: appId, fileName: fileName || `${meta.name}.ipa`, source: source || 'upload', addedAt: new Date().toISOString(),
-    name: meta.name, bundleId: meta.bundleId, version: meta.version, build: meta.build, minOS: meta.minOS,
-    extensions: meta.extensions, hasWatch: meta.hasWatch, size: meta.size, hasIcon: !!meta.icon,
-    published: true, description: '',
+    id: appId, fileName: fileName || `${meta.name}.ipa`, source: source || 'upload', addedAt: now, updatedAt: now,
+    name: meta.name, originalName: meta.name, ...metaFields(meta),
+    published: true, featured: false, categoryId: null, description: '', notes: '', developer: '',
+    customIcon: false, useIconWhenSigning: true, signDefaults: {},
   };
   store.apps.unshift(rec);
   store.save();
   return rec;
+}
+
+// Swap in a new .ipa for an existing library app, keeping its name, category, notes and defaults.
+async function replaceAppFile(app, file) {
+  const meta = await inspectOrFail(file);
+  const oldVersion = app.version;
+  await fsp.rename(file, path.join(dirs.apps, app.id + '.ipa'));
+  if (meta.icon) await fsp.writeFile(path.join(dirs.apps, app.id + '.png'), meta.icon);
+  Object.assign(app, metaFields(meta), { updatedAt: new Date().toISOString(), previousVersion: oldVersion });
+  if (!app.customIcon) app.hasIcon = !!meta.icon;
+  store.save();
+  return app;
+}
+
+async function downloadToTmp(u, job) {
+  const dest = path.join(dirs.tmp, id());
+  job.log.push(`Downloading ${u.hostname}…`);
+  const r = await fetch(u, { redirect: 'follow' });
+  if (!r.ok || !r.body) throw new Error(`Download failed (HTTP ${r.status})`);
+  const type = r.headers.get('content-type') || '';
+  if (/text\/html/i.test(type)) throw new Error("That link opens a web page, not a file. Use a direct download link (for Dropbox, change dl=0 to dl=1).");
+  const total = Number(r.headers.get('content-length')) || 0;
+  let got = 0;
+  const body = Readable.fromWeb(r.body);
+  body.on('data', (c) => {
+    got += c.length;
+    job.progress = total ? got / total : null;
+    if (got > MAX_UPLOAD) body.destroy(new Error('File is too large'));
+  });
+  try {
+    await pipeline(body, fs.createWriteStream(dest));
+  } catch (e) {
+    await rmQuiet(dest);
+    throw e;
+  }
+  return dest;
+}
+
+function parseLink(url) {
+  let u;
+  try { u = new URL(String(url).trim()); } catch { throw httpError(400, 'Enter a valid link'); }
+  if (!/^https?:$/.test(u.protocol)) throw httpError(400, 'Link must start with http or https');
+  // Friendly fix for Dropbox share links
+  if (/(^|\.)dropbox\.com$/.test(u.hostname) && u.searchParams.get('dl') === '0') u.searchParams.set('dl', '1');
+  return u;
 }
 
 route('POST', /^\/api\/apps$/, async (req, res, m, acc) => {
@@ -618,70 +771,180 @@ route('POST', /^\/api\/apps$/, async (req, res, m, acc) => {
 
 route('POST', /^\/api\/apps\/import$/, async (req, res, m, acc) => {
   const { url } = await readJson(req);
-  let u;
-  try { u = new URL(String(url)); } catch { return fail(res, 400, 'Enter a valid link'); }
-  if (!/^https?:$/.test(u.protocol)) return fail(res, 400, 'Link must start with http or https');
+  const u = parseLink(url);
   const job = newJob(acc);
   json(res, { jobId: job.id });
   (async () => {
-    const dest = path.join(dirs.tmp, id());
     try {
-      job.log.push(`Downloading ${u.hostname}…`);
-      const r = await fetch(u, { redirect: 'follow' });
-      if (!r.ok || !r.body) throw new Error(`Download failed (HTTP ${r.status})`);
-      const total = Number(r.headers.get('content-length')) || 0;
-      let got = 0;
-      const body = Readable.fromWeb(r.body);
-      body.on('data', (c) => {
-        got += c.length;
-        job.progress = total ? got / total : null;
-        if (got > MAX_UPLOAD) body.destroy(new Error('File is too large'));
-      });
-      await pipeline(body, fs.createWriteStream(dest));
+      const dest = await downloadToTmp(u, job);
       job.log.push('Reading app info…');
       const name = decodeURIComponent(path.basename(u.pathname)) || 'download.ipa';
       const rec = await addAppFromFile(dest, name, 'url');
       job.result = { app: appView(rec, acc) };
       job.status = 'done';
     } catch (e) {
-      await rmQuiet(dest);
       job.error = e.message;
       job.status = 'error';
     }
   })();
 }, 'owner');
 
+route('POST', /^\/api\/apps\/([a-f0-9]{16})\/replace$/, async (req, res, m, acc) => {
+  const app = store.apps.find((a) => a.id === m[1]);
+  if (!app) return fail(res, 404, 'App not found');
+  const { uploadId, url } = await readJson(req);
+  if (uploadId) {
+    await replaceAppFile(app, tmpPath(uploadId, acc));
+    return json(res, { app: appView(app, acc) });
+  }
+  const u = parseLink(url);
+  const job = newJob(acc);
+  json(res, { jobId: job.id });
+  (async () => {
+    try {
+      const dest = await downloadToTmp(u, job);
+      job.log.push('Reading app info…');
+      await replaceAppFile(app, dest);
+      job.result = { app: appView(app, acc) };
+      job.status = 'done';
+    } catch (e) {
+      job.error = e.message;
+      job.status = 'error';
+    }
+  })();
+}, 'owner');
+
+function cleanSignDefaults(d) {
+  if (!d || typeof d !== 'object') return {};
+  const out = {
+    entitlements: cleanEdits(d.entitlements, 'entitlement'),
+    plist: cleanEdits(d.plist, 'Info.plist'),
+  };
+  for (const k of ['removeExtensions', 'removeWatch', 'removeUISD', 'enableDocs', 'weakDylibs', 'injectExtensions']) {
+    if (d[k] !== undefined) out[k] = !!d[k];
+  }
+  if (typeof d.minOS === 'string' && /^(\d+(\.\d+){0,2})?$/.test(d.minOS.trim())) out.minOS = d.minOS.trim();
+  return out;
+}
+
 route('PATCH', /^\/api\/apps\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
   const app = store.apps.find((a) => a.id === m[1]);
   if (!app) return fail(res, 404, 'App not found');
   const b = await readJson(req);
   if (typeof b.name === 'string' && b.name.trim()) app.name = b.name.trim().slice(0, 80);
-  if (typeof b.description === 'string') app.description = b.description.trim().slice(0, 500);
+  if (typeof b.description === 'string') app.description = b.description.trim().slice(0, 1500);
+  if (typeof b.notes === 'string') app.notes = b.notes.trim().slice(0, 1500);
+  if (typeof b.developer === 'string') app.developer = b.developer.trim().slice(0, 80);
   if (typeof b.published === 'boolean') app.published = b.published;
+  if (typeof b.featured === 'boolean') app.featured = b.featured;
+  if (typeof b.useIconWhenSigning === 'boolean') app.useIconWhenSigning = b.useIconWhenSigning;
+  if (b.categoryId !== undefined) {
+    if (b.categoryId && !store.categories.some((c) => c.id === b.categoryId)) return fail(res, 400, 'Category not found');
+    app.categoryId = b.categoryId || null;
+  }
+  if (b.signDefaults !== undefined) app.signDefaults = cleanSignDefaults(b.signDefaults);
+  if (b.iconUploadId) {
+    const f = tmpPath(b.iconUploadId, acc);
+    const head = await fsp.readFile(f).then((x) => x.subarray(0, 8)).catch(() => Buffer.alloc(0));
+    if (!head.equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) { await rmQuiet(f); return fail(res, 400, 'Icon must be a PNG image'); }
+    await fsp.rename(f, path.join(dirs.apps, app.id + '-custom.png'));
+    app.customIcon = true;
+    app.iconVersion = Date.now();
+  }
+  if (b.resetIcon) {
+    await rmQuiet(path.join(dirs.apps, app.id + '-custom.png'));
+    app.customIcon = false;
+    app.iconVersion = Date.now();
+  }
+  app.updatedAt = new Date().toISOString();
   store.save();
   json(res, { app: appView(app, acc) });
 }, 'owner');
 
-route('DELETE', /^\/api\/apps\/([a-f0-9]{16})$/, async (req, res, m) => {
-  const i = store.apps.findIndex((a) => a.id === m[1]);
-  if (i < 0) return fail(res, 404, 'App not found');
+async function deleteApp(appId) {
+  const i = store.apps.findIndex((a) => a.id === appId);
+  if (i < 0) return false;
   store.apps.splice(i, 1);
+  for (const suffix of ['.ipa', '.png', '-custom.png']) await rmQuiet(path.join(dirs.apps, appId + suffix));
+  return true;
+}
+
+route('DELETE', /^\/api\/apps\/([a-f0-9]{16})$/, async (req, res, m) => {
+  if (!(await deleteApp(m[1]))) return fail(res, 404, 'App not found');
   store.save();
-  await rmQuiet(path.join(dirs.apps, m[1] + '.ipa'));
-  await rmQuiet(path.join(dirs.apps, m[1] + '.png'));
   json(res, { ok: true });
+}, 'owner');
+
+route('POST', /^\/api\/apps\/bulk$/, async (req, res) => {
+  const { ids = [], action, categoryId = null } = await readJson(req);
+  const apps = store.apps.filter((a) => Array.isArray(ids) && ids.includes(a.id));
+  if (!apps.length) return fail(res, 400, 'Pick at least one app');
+  if (action === 'category' && categoryId && !store.categories.some((c) => c.id === categoryId)) return fail(res, 400, 'Category not found');
+  for (const a of apps) {
+    if (action === 'category') a.categoryId = categoryId || null;
+    else if (action === 'show') a.published = true;
+    else if (action === 'hide') a.published = false;
+    else if (action === 'feature') a.featured = true;
+    else if (action === 'unfeature') a.featured = false;
+    else if (action === 'delete') await deleteApp(a.id);
+    else return fail(res, 400, 'Unknown action');
+  }
+  store.save();
+  json(res, { ok: true, count: apps.length });
 }, 'owner');
 
 route('GET', /^\/api\/apps\/([a-f0-9]{16})\/icon$/, (req, res, m, acc) => {
   const app = visibleApps(acc).find((a) => a.id === m[1]);
   if (!app) return fail(res, 404, 'Not found');
-  return serveFile(req, res, path.join(dirs.apps, m[1] + '.png'), { cache: 'private, max-age=86400' });
+  const file = app.customIcon ? path.join(dirs.apps, m[1] + '-custom.png') : path.join(dirs.apps, m[1] + '.png');
+  return serveFile(req, res, file, { cache: 'private, max-age=86400' });
 });
 
 route('GET', /^\/api\/apps\/([a-f0-9]{16})\/download$/, (req, res, m) => {
   const app = store.apps.find((a) => a.id === m[1]);
   if (!app) return fail(res, 404, 'App not found');
   return serveFile(req, res, path.join(dirs.apps, m[1] + '.ipa'), { download: `${app.name} ${app.version}.ipa` });
+}, 'owner');
+
+// ----- categories -----
+const sortedCategories = () => [...store.categories].sort((a, b) => a.order - b.order);
+
+route('POST', /^\/api\/categories$/, async (req, res) => {
+  const { name, emoji } = await readJson(req);
+  const n = String(name || '').trim().slice(0, 30);
+  if (!n) return fail(res, 400, 'Give the category a name');
+  if (store.categories.some((c) => c.name.toLowerCase() === n.toLowerCase())) return fail(res, 400, 'That category already exists');
+  const cat = { id: id(), name: n, emoji: String(emoji || '📁').trim().slice(0, 8) || '📁', order: store.categories.length };
+  store.categories.push(cat);
+  store.save();
+  json(res, { category: cat });
+}, 'owner');
+
+route('PATCH', /^\/api\/categories\/([a-f0-9]{16})$/, async (req, res, m) => {
+  const cat = store.categories.find((c) => c.id === m[1]);
+  if (!cat) return fail(res, 404, 'Category not found');
+  const { name, emoji } = await readJson(req);
+  if (typeof name === 'string' && name.trim()) cat.name = name.trim().slice(0, 30);
+  if (typeof emoji === 'string' && emoji.trim()) cat.emoji = emoji.trim().slice(0, 8);
+  store.save();
+  json(res, { category: cat });
+}, 'owner');
+
+route('DELETE', /^\/api\/categories\/([a-f0-9]{16})$/, (req, res, m) => {
+  const i = store.categories.findIndex((c) => c.id === m[1]);
+  if (i < 0) return fail(res, 404, 'Category not found');
+  store.categories.splice(i, 1);
+  for (const a of store.apps) if (a.categoryId === m[1]) a.categoryId = null;
+  sortedCategories().forEach((c, n) => { c.order = n; });
+  store.save();
+  json(res, { ok: true });
+}, 'owner');
+
+route('POST', /^\/api\/categories\/order$/, async (req, res) => {
+  const { ids = [] } = await readJson(req);
+  ids.forEach((cid, n) => { const c = store.categories.find((x) => x.id === cid); if (c) c.order = n; });
+  store.save();
+  json(res, { categories: sortedCategories() });
 }, 'owner');
 
 // ----- certificates (each account has its own) -----
@@ -880,6 +1143,10 @@ route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
         const iconPath = path.join(work, 'icon.png');
         await fsp.rename(iconFile, iconPath);
         args.push('-I', iconPath);
+      } else if (app.customIcon && app.useIconWhenSigning !== false) {
+        const iconPath = path.join(work, 'icon.png');
+        await fsp.copyFile(path.join(dirs.apps, app.id + '-custom.png'), iconPath);
+        args.push('-I', iconPath);
       }
       for (const d of dylibFiles) {
         const p = path.join(work, d.name);
@@ -968,8 +1235,22 @@ route('PATCH', /^\/api\/settings$/, async (req, res) => {
   if (b.zipLevel !== undefined) store.settings.zipLevel = Math.min(9, Math.max(0, Number(b.zipLevel) || 0));
   if (b.maxSignedPerUser !== undefined) store.settings.maxSignedPerUser = Math.min(100, Math.max(1, Number(b.maxSignedPerUser) || 10));
   if (b.udidLogin !== undefined) store.settings.udidLogin = !!b.udidLogin;
+  if (b.signedRetentionDays !== undefined) store.settings.signedRetentionDays = Math.min(365, Math.max(0, Number(b.signedRetentionDays) || 0));
   store.save();
   json(res, { settings: store.settings });
+}, 'owner');
+
+route('POST', /^\/api\/maintenance$/, async (req, res) => {
+  const { action } = await readJson(req);
+  if (action === 'clear-temp') {
+    for (const f of await fsp.readdir(dirs.tmp).catch(() => [])) { await rmQuiet(path.join(dirs.tmp, f)); uploads.delete(f); }
+    return json(res, { message: 'Temporary files cleared' });
+  }
+  if (action === 'purge-signed') {
+    const n = await cleanupSignedFiles(1);
+    return json(res, { message: n ? `Removed ${n} signed file${n === 1 ? '' : 's'} older than a day` : 'Nothing to clean up' });
+  }
+  return fail(res, 400, 'Unknown action');
 }, 'owner');
 
 function inviteCode() {
@@ -1032,7 +1313,7 @@ const findByToken = (t) => store.signed.find((s) => s.token === t);
 
 route('GET', /^\/i\/([\w-]{20,40})\/manifest\.plist$/, (req, res, m) => {
   const s = findByToken(m[1]);
-  if (!s) return fail(res, 404, 'Link expired');
+  if (!s || s.fileDeleted) return fail(res, 404, 'Link expired');
   const base = baseUrl(req);
   const assets = [{ kind: 'software-package', url: `${base}/i/${s.token}/app.ipa` }];
   if (s.hasIcon) {
@@ -1050,7 +1331,7 @@ route('GET', /^\/i\/([\w-]{20,40})\/manifest\.plist$/, (req, res, m) => {
 
 route('GET', /^\/i\/([\w-]{20,40})\/app\.ipa$/, (req, res, m) => {
   const s = findByToken(m[1]);
-  if (!s) return fail(res, 404, 'Link expired');
+  if (!s || s.fileDeleted) return fail(res, 404, 'Link expired');
   return serveFile(req, res, path.join(dirs.signed, s.id + '.ipa'), { download: `${s.name}.ipa` });
 }, 'open');
 
@@ -1065,7 +1346,7 @@ route('GET', /^\/i\/([\w-]{20,40})\/?$/, async (req, res, m) => {
   const tpl = await fsp.readFile(path.join(PUBLIC_DIR, 'install.html'), 'utf8');
   const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
   const fill = (vals) => tpl.replace(/{{(\w+)}}/g, (_, k) => esc(vals[k] ?? ''));
-  if (!s) {
+  if (!s || s.fileDeleted) {
     return send(res, 404, fill({ title: 'Link expired', name: 'This link has expired', meta: 'Ask for a new install link.', icon: '/icon-180.png', install: '#', hidden: 'hidden' }), { 'Content-Type': 'text/html; charset=utf-8' });
   }
   const v = signedView(s, req);

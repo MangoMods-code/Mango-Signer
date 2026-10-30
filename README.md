@@ -4,7 +4,9 @@ A self-hosted iOS app signer, installer and App Library you use from Safari on y
 Upload an `.ipa`, add a `.p12` + `.mobileprovision`, tap **Sign**, then **Install**.
 
 ## Features
-- **App Library** – the owner uploads apps (or imports from a link); invited users browse, sign and install them
+- **App Library** – the owner uploads apps (or imports from a link); invited users browse, search, sign and install them
+- **Organization** – categories with emoji, featured apps, search, sorting, bulk select, full app editing, Update IPA, and default sign settings per app
+- **Big files** – resumable uploads that survive dropped connections; old signed files are cleaned up automatically
 - **Accounts** – invite codes, username + password login, or sign in with your iPhone (UDID)
 - **Certificates** – each account adds its own `.p12` + `.mobileprovision`; shows type, expiry, revoke status, cert/profile mismatch, and whether your iPhone is in the profile
 - **Entitlements** – one-tap JIT support (`get-task-allow`), increased memory limit, extended virtual addressing, plus custom entitlements; warns when your profile doesn't allow one
