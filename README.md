@@ -42,6 +42,9 @@ The owner signs in with the password only (leave username blank). Everyone else 
 - `server.js` – web server and API (no npm dependencies)
 - `lib/` – zip, plist, PNG (Apple CgBI icon) and certificate readers
 - `public/` – the iPhone web app
-- Signing is done by [zsign](https://github.com/zhlynn/zsign), compiled in the Docker build.
+- Signing is done by [zsign](https://github.com/zhlynn/zsign) (MIT License, by zhlynn), compiled in the Docker build.
 
 Only sign and share apps you have the right to use.
+
+## License
+© 2026 MangoMods. **All rights reserved.** The code is public so you can see how it works and run it on your own server for personal use. You may not copy, reupload, rebrand, sell, or present it as your own. See [LICENSE](LICENSE) for the full terms.

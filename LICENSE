@@ -1,0 +1,37 @@
+Mango Signer
+Copyright (c) 2026 MangoMods. All rights reserved.
+
+This software and its source code (the "Software") are the property of MangoMods.
+The source code is made public so people can see how it works and run it for
+themselves. It is NOT open source.
+
+YOU MAY:
+  1. View and read the source code.
+  2. Download the Software and run it on your own server for your own personal,
+     non-commercial use, and let people you personally invite use that server.
+  3. Change your own copy for that personal use, as long as you don't share
+     the changed version.
+
+YOU MAY NOT, without written permission from MangoMods:
+  1. Copy, republish, reupload or redistribute the Software or any part of it,
+     whether changed or not, including in other repositories or projects.
+  2. Rename, rebrand or present the Software, or any part of it, as your own work.
+  3. Sell the Software, or charge for access to it or to a service built on it.
+  4. Remove or change this license, the copyright notice, or the credits in the
+     Software.
+
+Forking this repository on GitHub is allowed only because GitHub's Terms of
+Service require it; a fork does not give you any of the rights listed above.
+
+THIRD-PARTY SOFTWARE
+The Software downloads and builds zsign (https://github.com/zhlynn/zsign),
+which is licensed separately under the MIT License by its author. This license
+does not apply to zsign.
+
+NO WARRANTY
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED. IN NO EVENT SHALL MANGOMODS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY ARISING FROM THE USE OF THE SOFTWARE. You are responsible for only
+signing and sharing apps you have the right to use.
+
+For permission requests, contact MangoMods through GitHub.
