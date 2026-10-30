@@ -1,25 +1,29 @@
-// Mango Signer — a self-hosted iOS app signer and installer.
-// Zero npm dependencies: Node built-ins + the zsign and openssl command-line tools.
+// Mango Signer — a self-hosted iOS app signer, installer and App Library.
+// Zero npm dependencies: Node built-ins + the zsign, openssl, zip and unzip command-line tools.
 const http = require('http');
 const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
+const { spawn } = require('child_process');
 const { pipeline } = require('stream/promises');
-const { Readable } = require('stream');
+const { Readable, Transform } = require('stream');
 
 const Store = require('./lib/store');
 const ipa = require('./lib/ipa');
 const plist = require('./lib/plist');
-const { parseProvision, parseP12, run } = require('./lib/certs');
+const { parseProvision, profileEntitlements, parseP12, run } = require('./lib/certs');
 const { drawAppIcon } = require('./lib/png');
 
+const VERSION = '1.1.0';
 const PORT = Number(process.env.PORT) || 3000;
 const DATA_DIR = path.resolve(process.env.DATA_DIR || (fs.existsSync('/data') ? '/data' : './data'));
 const ZSIGN = process.env.ZSIGN_PATH || 'zsign';
 const APP_PASSWORD = process.env.APP_PASSWORD || '';
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const MAX_UPLOAD = Number(process.env.MAX_UPLOAD_MB || 4096) * 1024 * 1024;
+const MAX_USER_UPLOAD = 300 * 1024 * 1024; // users only upload certs, icons and tweaks
+const MAX_CONCURRENT_SIGNS = Number(process.env.MAX_CONCURRENT_SIGNS || 2);
 
 const dirs = {
   apps: path.join(DATA_DIR, 'apps'),
@@ -33,6 +37,14 @@ fs.rmSync(dirs.work, { recursive: true, force: true });
 fs.mkdirSync(dirs.work, { recursive: true });
 
 const store = new Store(path.join(DATA_DIR, 'db.json'));
+
+// Upgrade data from older versions.
+for (const c of store.certs) if (!c.ownerId) c.ownerId = 'owner';
+for (const s of store.signed) if (!s.ownerId) s.ownerId = 'owner';
+for (const a of store.apps) if (a.published === undefined) a.published = true;
+if (store.settings.maxSignedPerUser === undefined) store.settings.maxSignedPerUser = 10;
+if (store.settings.udidLogin === undefined) store.settings.udidLogin = true;
+store.save();
 
 // ---------- secrets ----------
 function loadSecret() {
@@ -63,20 +75,35 @@ function decrypt(blob) {
 const id = () => crypto.randomBytes(8).toString('hex');
 const token = () => crypto.randomBytes(18).toString('base64url');
 
-// ---------- sessions ----------
-const SESSION_DAYS = 90;
-function makeSession() {
-  const issued = Date.now().toString(36);
-  const sig = crypto.createHmac('sha256', SECRET).update('session:' + issued).digest('base64url');
-  return `${issued}.${sig}`;
+function hashPassword(pw, salt = crypto.randomBytes(16).toString('hex')) {
+  return { salt, hash: crypto.scryptSync(String(pw), salt, 32).toString('hex') };
 }
-function validSession(value) {
-  if (!value) return false;
-  const [issued, sig] = value.split('.');
-  if (!issued || !sig) return false;
-  const expect = crypto.createHmac('sha256', SECRET).update('session:' + issued).digest('base64url');
-  if (sig.length !== expect.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expect))) return false;
-  return Date.now() - parseInt(issued, 36) < SESSION_DAYS * 864e5;
+function checkPassword(pw, user) {
+  const { hash } = hashPassword(pw, user.salt);
+  return crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(user.hash, 'hex'));
+}
+const safeEqual = (a, b) => {
+  const x = Buffer.from(String(a)), y = Buffer.from(String(b));
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+};
+
+// ---------- accounts & sessions ----------
+const SESSION_DAYS = 90;
+const OWNER = () => ({
+  id: 'owner', username: 'owner', role: 'owner',
+  udid: store.settings.ownerUdid || null, deviceName: store.settings.ownerDeviceName || null, sv: 0,
+});
+const findUser = (uid) => store.users.find((u) => u.id === uid);
+function accountById(uid) {
+  if (uid === 'owner') return OWNER();
+  const u = findUser(uid);
+  return u && !u.disabled ? { ...u, role: 'user' } : null;
+}
+
+function sign(data) { return crypto.createHmac('sha256', SECRET).update(data).digest('base64url'); }
+function makeSession(account) {
+  const payload = `${account.id}.${account.sv || 0}.${Date.now().toString(36)}`;
+  return `${payload}.${sign('session:' + payload)}`;
 }
 function cookies(req) {
   const out = {};
@@ -86,10 +113,30 @@ function cookies(req) {
   }
   return out;
 }
-function isAuthed(req) {
-  return !APP_PASSWORD || validSession(cookies(req).mango_session);
+function getAccount(req) {
+  if (!APP_PASSWORD) return OWNER();
+  const value = cookies(req).mango_session;
+  if (!value) return null;
+  const parts = value.split('.');
+  if (parts.length !== 4) return null;
+  const [uid, sv, issued, sig] = parts;
+  if (!safeEqual(sig, sign(`session:${uid}.${sv}.${issued}`))) return null;
+  if (Date.now() - parseInt(issued, 36) > SESSION_DAYS * 864e5) return null;
+  const acc = accountById(uid);
+  if (!acc || String(acc.sv || 0) !== sv) return null;
+  return acc;
+}
+function sessionCookie(req, account) {
+  const secure = baseUrl(req).startsWith('https') ? '; Secure' : '';
+  return `mango_session=${makeSession(account)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_DAYS * 86400}${secure}`;
 }
 const loginFails = new Map();
+function rateLimited(req) {
+  const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+  const f = loginFails.get(ip) || { n: 0, t: 0 };
+  if (Date.now() - f.t > 60_000) f.n = 0;
+  return { limited: f.n >= 6, fail: () => loginFails.set(ip, { n: f.n + 1, t: Date.now() }), ok: () => loginFails.delete(ip) };
+}
 
 // ---------- helpers ----------
 function baseUrl(req) {
@@ -112,19 +159,23 @@ function send(res, status, body, headers = {}) {
 }
 const json = (res, body, status = 200) => send(res, status, body);
 const fail = (res, status, message) => send(res, status, { error: message });
+const httpError = (status, message) => Object.assign(new Error(message), { status });
+const redirect = (res, location, status = 302) => { res.writeHead(status, { Location: location, 'Cache-Control': 'no-store' }); res.end(); };
 
-async function readJson(req, limit = 1024 * 1024) {
+async function readBody(req, limit) {
   let size = 0;
   const chunks = [];
   for await (const c of req) {
     size += c.length;
-    if (size > limit) throw Object.assign(new Error('Request too large'), { status: 413 });
+    if (size > limit) throw httpError(413, 'Request too large');
     chunks.push(c);
   }
-  if (!chunks.length) return {};
-  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch {
-    throw Object.assign(new Error('Invalid JSON'), { status: 400 });
-  }
+  return Buffer.concat(chunks);
+}
+async function readJson(req, limit = 1024 * 1024) {
+  const buf = await readBody(req, limit);
+  if (!buf.length) return {};
+  try { return JSON.parse(buf.toString('utf8')); } catch { throw httpError(400, 'Invalid JSON'); }
 }
 
 const MIME = {
@@ -158,10 +209,14 @@ async function serveFile(req, res, file, { type, download, cache = 'no-store' } 
   return pipeline(fs.createReadStream(file), res).catch(() => {});
 }
 
-function tmpPath(uploadId) {
-  if (!/^[a-f0-9]{16}$/.test(uploadId || '')) throw Object.assign(new Error('Missing or invalid upload'), { status: 400 });
+// Temp uploads belong to whoever uploaded them.
+const uploads = new Map();
+function tmpPath(uploadId, account) {
+  if (!/^[a-f0-9]{16}$/.test(uploadId || '')) throw httpError(400, 'Missing or invalid upload');
+  const owner = uploads.get(uploadId);
   const p = path.join(dirs.tmp, uploadId);
-  if (!fs.existsSync(p)) throw Object.assign(new Error('Upload expired — please pick the file again'), { status: 400 });
+  if (!owner || owner !== account.id || !fs.existsSync(p)) throw httpError(400, 'Upload expired — please pick the file again');
+  uploads.delete(uploadId);
   return p;
 }
 
@@ -171,15 +226,17 @@ async function rmQuiet(p) { await fsp.rm(p, { recursive: true, force: true }).ca
 let zsignVersion = null;
 (async () => {
   const r = await run(ZSIGN, ['-v'], { timeout: 10000 });
-  const out = (r.stdout.toString() + r.stderr).trim();
-  zsignVersion = r.code === -1 ? null : (out.match(/\d+\.\d+(\.\d+)?[\w.-]*/) || [out || 'installed'])[0];
-  console.log(zsignVersion ? `zsign ready (${zsignVersion})` : 'WARNING: zsign not found — signing will not work');
+  if (r.code === -1) { console.log('WARNING: zsign not found — signing will not work'); return; }
+  const out = (r.stdout.toString() + r.stderr).replace(/\x1b\[[0-9;]*m/g, '').trim();
+  const v = out.match(/version[:\s]+v?([\w.\-]+)/i) || out.match(/(\d+\.\d+(?:\.\d+)?[\w.-]*)/);
+  zsignVersion = v ? v[1] : 'installed';
+  if (/^[0-9a-f]{7,40}$/i.test(zsignVersion)) zsignVersion = `build ${zsignVersion.slice(0, 7)}`;
+  console.log(`zsign ready (${zsignVersion})`);
 })();
 
-function runLogged(cmd, args, job, timeout = 20 * 60 * 1000) {
+function runLogged(cmd, args, job, { timeout = 20 * 60 * 1000, cwd = dirs.work } = {}) {
   return new Promise((resolve) => {
-    const { spawn } = require('child_process');
-    const child = spawn(cmd, args, { cwd: dirs.work });
+    const child = spawn(cmd, args, { cwd });
     const timer = setTimeout(() => { job.log.push('Timed out.'); child.kill('SIGKILL'); }, timeout);
     const onData = (d) => {
       for (const line of d.toString().split(/\r?\n/)) {
@@ -208,23 +265,53 @@ function parseCheckOutput(text) {
   return { status, ocsp, fields };
 }
 
-// ---------- jobs ----------
+// ---------- jobs (with a small signing queue) ----------
 const jobs = new Map();
-function newJob() {
-  const job = { id: id(), status: 'running', log: [], result: null, error: null, started: Date.now() };
+function newJob(account) {
+  const job = { id: id(), owner: account.id, status: 'running', log: [], result: null, error: null, started: Date.now() };
   jobs.set(job.id, job);
   setTimeout(() => jobs.delete(job.id), 60 * 60 * 1000).unref();
   return job;
 }
+let activeSigns = 0;
+const signQueue = [];
+function enqueueSign(job, work) {
+  const start = async () => {
+    activeSigns++;
+    job.status = 'running';
+    try { await work(); } finally {
+      activeSigns--;
+      const next = signQueue.shift();
+      if (next) next();
+      signQueue.forEach((fn, i) => { fn.job.log = [`Waiting in line (${i + 1} ahead of you)…`]; });
+    }
+  };
+  if (activeSigns < MAX_CONCURRENT_SIGNS) return start();
+  start.job = job;
+  job.status = 'queued';
+  job.log.push(`Waiting in line (${signQueue.length + 1} ahead of you)…`);
+  signQueue.push(start);
+}
 
-// ---------- public views ----------
-function certView(c) {
+// ---------- views ----------
+const isOwner = (acc) => acc && acc.role === 'owner';
+const deviceInProfile = (profile, udid) => {
+  if (profile.type === 'Enterprise') return true;
+  if (!udid || !Array.isArray(profile.devices)) return null;
+  return profile.devices.some((d) => String(d).toLowerCase() === udid.toLowerCase());
+};
+function certView(c, acc) {
   return {
-    id: c.id, label: c.label, createdAt: c.createdAt, isDefault: store.settings.defaultCertId === c.id,
+    id: c.id, label: c.label, createdAt: c.createdAt, isDefault: defaultCertId(acc) === c.id,
     p12: c.p12, profile: { ...c.profile, devices: undefined }, check: c.check || null, matches: c.matches,
+    deviceIncluded: deviceInProfile(c.profile, acc.udid),
   };
 }
-function appView(a) { return { ...a, hasIcon: !!a.hasIcon }; }
+function appView(a, acc) {
+  if (isOwner(acc)) return { ...a };
+  const { fileName, source, ...rest } = a;
+  return rest;
+}
 function signedView(s, req) {
   const base = baseUrl(req);
   const manifest = `${base}/i/${s.token}/manifest.plist`;
@@ -235,50 +322,215 @@ function signedView(s, req) {
     downloadUrl: `${base}/i/${s.token}/app.ipa`,
   };
 }
+function userView(u) {
+  return {
+    id: u.id, username: u.username, udid: u.udid || null, deviceName: u.deviceName || null,
+    createdAt: u.createdAt, lastLogin: u.lastLogin || null, disabled: !!u.disabled, invite: u.invite || null,
+    certCount: store.certs.filter((c) => c.ownerId === u.id).length,
+    signedCount: store.signed.filter((s) => s.ownerId === u.id).length,
+  };
+}
+function accountView(acc) {
+  return { id: acc.id, username: acc.username, role: acc.role, udid: acc.udid || null, deviceName: acc.deviceName || null };
+}
+function defaultCertId(acc) {
+  if (isOwner(acc)) return store.settings.defaultCertId;
+  const u = findUser(acc.id);
+  return u && u.defaultCertId;
+}
+function setDefaultCert(acc, certId) {
+  if (isOwner(acc)) store.settings.defaultCertId = certId;
+  else { const u = findUser(acc.id); if (u) u.defaultCertId = certId; }
+}
+const myCerts = (acc) => store.certs.filter((c) => c.ownerId === acc.id);
+const mySigned = (acc) => store.signed.filter((s) => s.ownerId === acc.id);
+const visibleApps = (acc) => (isOwner(acc) ? store.apps : store.apps.filter((a) => a.published));
 
-// ---------- route handlers ----------
+// ---------- routing ----------
+// access: 'open' (anyone), 'user' (any logged-in account), 'owner'
 const routes = [];
-const route = (method, pattern, handler, { open = false } = {}) => routes.push({ method, pattern, handler, open });
+const route = (method, pattern, handler, access = 'user') => routes.push({ method, pattern, handler, access });
 
-route('GET', /^\/api\/session$/, (req, res) => json(res, {
-  authed: isAuthed(req), passwordSet: !!APP_PASSWORD,
-}), { open: true });
+// ----- session -----
+route('GET', /^\/api\/session$/, (req, res) => {
+  const acc = getAccount(req);
+  json(res, { authed: !!acc, account: acc ? accountView(acc) : null, passwordSet: !!APP_PASSWORD, udidLogin: !!store.settings.udidLogin, version: VERSION });
+}, 'open');
 
 route('POST', /^\/api\/login$/, async (req, res) => {
-  const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
-  const f = loginFails.get(ip) || { n: 0, t: 0 };
-  if (f.n >= 5 && Date.now() - f.t < 60_000) return fail(res, 429, 'Too many tries — wait a minute');
-  const { password } = await readJson(req);
-  const a = Buffer.from(String(password || '')), b = Buffer.from(APP_PASSWORD);
-  if (!APP_PASSWORD || (a.length === b.length && crypto.timingSafeEqual(a, b))) {
-    loginFails.delete(ip);
-    const secure = baseUrl(req).startsWith('https') ? '; Secure' : '';
-    return send(res, 200, { ok: true }, {
-      'Set-Cookie': `mango_session=${makeSession()}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_DAYS * 86400}${secure}`,
-    });
+  const rl = rateLimited(req);
+  if (rl.limited) return fail(res, 429, 'Too many tries — wait a minute');
+  const { username = '', password = '' } = await readJson(req);
+  const name = String(username).trim().toLowerCase();
+
+  if ((!name || name === 'owner') && APP_PASSWORD && safeEqual(password, APP_PASSWORD)) {
+    rl.ok();
+    return send(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(req, OWNER()) });
   }
-  loginFails.set(ip, { n: f.n + 1, t: Date.now() });
-  return fail(res, 401, 'Wrong password');
-}, { open: true });
+  const u = store.users.find((x) => x.username === name);
+  if (u && !u.disabled && checkPassword(password, u)) {
+    rl.ok();
+    u.lastLogin = new Date().toISOString();
+    store.save();
+    return send(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(req, { ...u }) });
+  }
+  rl.fail();
+  if (u && u.disabled) return fail(res, 403, 'This account is turned off');
+  return fail(res, 401, name ? 'Wrong username or password' : 'Wrong password');
+}, 'open');
+
+route('POST', /^\/api\/signup$/, async (req, res) => {
+  const rl = rateLimited(req);
+  if (rl.limited) return fail(res, 429, 'Too many tries — wait a minute');
+  const { username = '', password = '', invite = '', udidState = '' } = await readJson(req);
+  const name = String(username).trim().toLowerCase();
+  const code = String(invite).trim().toUpperCase();
+  const inv = store.invites.find((i) => i.code === code);
+  if (!inv || inv.uses >= inv.maxUses) { rl.fail(); return fail(res, 400, 'That invite code is invalid or used up'); }
+  if (!/^[a-z0-9_.]{3,24}$/.test(name)) return fail(res, 400, 'Username must be 3–24 letters, numbers, dots or underscores');
+  if (name === 'owner' || name === 'admin' || store.users.some((u) => u.username === name)) return fail(res, 400, 'That username is taken');
+  if (String(password).length < 6) return fail(res, 400, 'Password must be at least 6 characters');
+
+  let udid = null, deviceName = null;
+  const st = udidState && udidStates.get(String(udidState));
+  if (st && st.udid && !udidOwner(st.udid)) { udid = st.udid; deviceName = st.deviceName; udidStates.delete(String(udidState)); }
+
+  const { salt, hash } = hashPassword(password);
+  const user = {
+    id: id(), username: name, salt, hash, sv: 0, udid, deviceName,
+    createdAt: new Date().toISOString(), lastLogin: new Date().toISOString(), invite: code, disabled: false,
+  };
+  store.users.push(user);
+  inv.uses += 1;
+  inv.usedBy = [...(inv.usedBy || []), name];
+  store.save();
+  rl.ok();
+  send(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(req, user) });
+}, 'open');
 
 route('POST', /^\/api\/logout$/, (req, res) => send(res, 200, { ok: true }, {
   'Set-Cookie': 'mango_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0',
-}));
+}), 'open');
 
-route('GET', /^\/api\/state$/, async (req, res) => {
-  const base = baseUrl(req);
-  json(res, {
-    apps: store.apps.map(appView),
-    certs: store.certs.map(certView),
-    signed: store.signed.map((s) => signedView(s, req)),
-    settings: store.settings,
-    server: {
-      baseUrl: base, https: base.startsWith('https://'), zsign: zsignVersion,
-      passwordSet: !!APP_PASSWORD, storage: await storageUsed(),
-    },
-  });
+route('PATCH', /^\/api\/account$/, async (req, res, m, acc) => {
+  const b = await readJson(req);
+  if (isOwner(acc)) {
+    if (b.unlinkDevice) { delete store.settings.ownerUdid; delete store.settings.ownerDeviceName; }
+    store.save();
+    return json(res, { account: accountView(OWNER()) });
+  }
+  const u = findUser(acc.id);
+  if (b.newPassword !== undefined) {
+    if (!checkPassword(b.currentPassword || '', u)) return fail(res, 400, 'Current password is wrong');
+    if (String(b.newPassword).length < 6) return fail(res, 400, 'New password must be at least 6 characters');
+    Object.assign(u, hashPassword(b.newPassword));
+    u.sv = (u.sv || 0) + 1;
+    store.save();
+    return send(res, 200, { account: accountView(u) }, { 'Set-Cookie': sessionCookie(req, u) });
+  }
+  if (b.unlinkDevice) { u.udid = null; u.deviceName = null; }
+  store.save();
+  json(res, { account: accountView({ ...u, role: 'user' }) });
 });
 
+// ----- UDID via iOS profile service -----
+const udidStates = new Map();
+function udidOwner(udid) {
+  const low = String(udid).toLowerCase();
+  if (store.settings.ownerUdid && store.settings.ownerUdid.toLowerCase() === low) return 'owner';
+  const u = store.users.find((x) => x.udid && x.udid.toLowerCase() === low);
+  return u ? u.id : null;
+}
+setInterval(() => {
+  for (const [k, v] of udidStates) if (Date.now() - v.created > 20 * 60 * 1000) udidStates.delete(k);
+}, 5 * 60 * 1000).unref();
+
+route('GET', /^\/udid\/profile\.mobileconfig$/, (req, res) => {
+  const intent = req.query.get('intent') === 'link' ? 'link' : 'login';
+  const acc = getAccount(req);
+  if (intent === 'link' && !acc) return redirect(res, '/');
+  if (intent === 'login' && !store.settings.udidLogin) return redirect(res, '/?udid=off');
+  const state = token();
+  udidStates.set(state, { intent, uid: acc ? acc.id : null, created: Date.now() });
+  const base = baseUrl(req);
+  const body = plist.build({
+    PayloadContent: {
+      URL: `${base}/udid/callback?s=${state}`,
+      DeviceAttributes: ['UDID', 'PRODUCT', 'VERSION', 'DEVICE_NAME'],
+      Challenge: state,
+    },
+    PayloadOrganization: 'Mango Signer',
+    PayloadDisplayName: 'Mango Signer — Device ID',
+    PayloadDescription: 'Lets Mango Signer read this iPhone\'s UDID so you can sign in and check your certificates. Nothing is installed on your device.',
+    PayloadVersion: 1,
+    PayloadUUID: crypto.randomUUID().toUpperCase(),
+    PayloadIdentifier: `site.mangosigner.udid.${state.slice(0, 8)}`,
+    PayloadType: 'Profile Service',
+  });
+  send(res, 200, body, {
+    'Content-Type': 'application/x-apple-aspen-config',
+    'Content-Disposition': 'attachment; filename="MangoSigner.mobileconfig"',
+  });
+}, 'open');
+
+route('POST', /^\/udid\/callback$/, async (req, res) => {
+  const state = req.query.get('s') || '';
+  const st = udidStates.get(state);
+  const base = baseUrl(req);
+  try {
+    const buf = await readBody(req, 256 * 1024);
+    const start = buf.indexOf('<?xml');
+    const end = buf.indexOf('</plist>');
+    if (!st || start < 0 || end < 0) throw new Error('bad');
+    const data = plist.parse(buf.subarray(start, end + 8));
+    if (data.CHALLENGE !== state || !/^[0-9A-Fa-f-]{20,48}$/.test(data.UDID || '')) throw new Error('bad');
+    st.udid = data.UDID.toUpperCase();
+    st.deviceName = data.DEVICE_NAME || data.PRODUCT || 'iPhone';
+    st.product = data.PRODUCT || '';
+    st.osVersion = data.VERSION || '';
+  } catch {
+    return redirect(res, `${base}/?udid=error`, 301);
+  }
+  redirect(res, `${base}/udid/done?s=${state}`, 301);
+}, 'open');
+
+route('GET', /^\/udid\/done$/, (req, res) => {
+  const state = req.query.get('s') || '';
+  const st = udidStates.get(state);
+  if (!st || !st.udid) return redirect(res, '/?udid=error');
+  const holder = udidOwner(st.udid);
+
+  if (st.intent === 'link') {
+    if (holder && holder !== st.uid) { udidStates.delete(state); return redirect(res, '/?udid=taken'); }
+    if (st.uid === 'owner') { store.settings.ownerUdid = st.udid; store.settings.ownerDeviceName = st.deviceName; }
+    else {
+      const u = findUser(st.uid);
+      if (!u) return redirect(res, '/?udid=error');
+      u.udid = st.udid; u.deviceName = st.deviceName;
+    }
+    store.save();
+    udidStates.delete(state);
+    return redirect(res, '/?udid=linked');
+  }
+
+  // login
+  if (holder) {
+    const acc = accountById(holder);
+    udidStates.delete(state);
+    if (!acc) return redirect(res, '/?udid=disabled');
+    if (holder !== 'owner') { findUser(holder).lastLogin = new Date().toISOString(); store.save(); }
+    res.writeHead(302, { Location: '/?udid=welcome', 'Set-Cookie': sessionCookie(req, acc), 'Cache-Control': 'no-store' });
+    return res.end();
+  }
+  return redirect(res, `/?udid=new&s=${encodeURIComponent(state)}`);
+}, 'open');
+
+route('GET', /^\/api\/udid\/pending$/, (req, res) => {
+  const st = udidStates.get(req.query.get('s') || '');
+  json(res, st && st.udid ? { udid: st.udid, deviceName: st.deviceName } : { udid: null });
+}, 'open');
+
+// ----- state -----
 async function storageUsed() {
   let total = 0;
   const walk = async (d) => {
@@ -291,15 +543,36 @@ async function storageUsed() {
   return total;
 }
 
-// Raw file upload: the body is the file. Returns an upload id used by other endpoints.
-route('POST', /^\/api\/upload$/, async (req, res) => {
+route('GET', /^\/api\/state$/, async (req, res, m, acc) => {
+  const base = baseUrl(req);
+  const out = {
+    account: accountView(acc),
+    apps: visibleApps(acc).map((a) => appView(a, acc)),
+    certs: myCerts(acc).map((c) => certView(c, acc)),
+    signed: mySigned(acc).map((s) => signedView(s, req)),
+    server: { baseUrl: base, https: base.startsWith('https://'), version: VERSION },
+  };
+  if (isOwner(acc)) {
+    out.settings = store.settings;
+    out.users = store.users.map(userView);
+    out.invites = store.invites;
+    out.server = { ...out.server, zsign: zsignVersion, passwordSet: !!APP_PASSWORD, storage: await storageUsed() };
+  } else {
+    out.settings = { maxSignedPerUser: store.settings.maxSignedPerUser };
+  }
+  json(res, out);
+});
+
+// ----- uploads -----
+route('POST', /^\/api\/upload$/, async (req, res, m, acc) => {
+  const limit = isOwner(acc) ? MAX_UPLOAD : MAX_USER_UPLOAD;
   const uid = id();
   const dest = path.join(dirs.tmp, uid);
   let size = 0;
-  const limiter = new (require('stream').Transform)({
+  const limiter = new Transform({
     transform(chunk, _enc, cb) {
       size += chunk.length;
-      if (size > MAX_UPLOAD) return cb(Object.assign(new Error('File is too large'), { status: 413 }));
+      if (size > limit) return cb(httpError(413, 'File is too large'));
       cb(null, chunk);
     },
   });
@@ -310,16 +583,18 @@ route('POST', /^\/api\/upload$/, async (req, res) => {
     throw e;
   }
   if (!size) { await rmQuiet(dest); return fail(res, 400, 'Empty file'); }
+  uploads.set(uid, acc.id);
   json(res, { uploadId: uid, size });
 });
 
+// ----- app library (owner manages, everyone browses) -----
 async function addAppFromFile(file, fileName, source) {
   let meta;
   try {
     meta = await ipa.inspect(file);
   } catch (e) {
     await rmQuiet(file);
-    throw Object.assign(new Error(e.message || 'Not a valid .ipa'), { status: 400 });
+    throw httpError(400, e.message || 'Not a valid .ipa');
   }
   const appId = id();
   await fsp.rename(file, path.join(dirs.apps, appId + '.ipa'));
@@ -328,24 +603,25 @@ async function addAppFromFile(file, fileName, source) {
     id: appId, fileName: fileName || `${meta.name}.ipa`, source: source || 'upload', addedAt: new Date().toISOString(),
     name: meta.name, bundleId: meta.bundleId, version: meta.version, build: meta.build, minOS: meta.minOS,
     extensions: meta.extensions, hasWatch: meta.hasWatch, size: meta.size, hasIcon: !!meta.icon,
+    published: true, description: '',
   };
   store.apps.unshift(rec);
   store.save();
   return rec;
 }
 
-route('POST', /^\/api\/apps$/, async (req, res) => {
+route('POST', /^\/api\/apps$/, async (req, res, m, acc) => {
   const { uploadId, fileName } = await readJson(req);
-  const rec = await addAppFromFile(tmpPath(uploadId), String(fileName || '').slice(0, 200), 'upload');
-  json(res, { app: appView(rec) });
-});
+  const rec = await addAppFromFile(tmpPath(uploadId, acc), String(fileName || '').slice(0, 200), 'upload');
+  json(res, { app: appView(rec, acc) });
+}, 'owner');
 
-route('POST', /^\/api\/apps\/import$/, async (req, res) => {
+route('POST', /^\/api\/apps\/import$/, async (req, res, m, acc) => {
   const { url } = await readJson(req);
   let u;
   try { u = new URL(String(url)); } catch { return fail(res, 400, 'Enter a valid link'); }
   if (!/^https?:$/.test(u.protocol)) return fail(res, 400, 'Link must start with http or https');
-  const job = newJob();
+  const job = newJob(acc);
   json(res, { jobId: job.id });
   (async () => {
     const dest = path.join(dirs.tmp, id());
@@ -365,7 +641,7 @@ route('POST', /^\/api\/apps\/import$/, async (req, res) => {
       job.log.push('Reading app info…');
       const name = decodeURIComponent(path.basename(u.pathname)) || 'download.ipa';
       const rec = await addAppFromFile(dest, name, 'url');
-      job.result = { app: appView(rec) };
+      job.result = { app: appView(rec, acc) };
       job.status = 'done';
     } catch (e) {
       await rmQuiet(dest);
@@ -373,16 +649,18 @@ route('POST', /^\/api\/apps\/import$/, async (req, res) => {
       job.status = 'error';
     }
   })();
-});
+}, 'owner');
 
-route('PATCH', /^\/api\/apps\/([a-f0-9]{16})$/, async (req, res, m) => {
+route('PATCH', /^\/api\/apps\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
   const app = store.apps.find((a) => a.id === m[1]);
   if (!app) return fail(res, 404, 'App not found');
-  const { name } = await readJson(req);
-  if (typeof name === 'string' && name.trim()) app.name = name.trim().slice(0, 80);
+  const b = await readJson(req);
+  if (typeof b.name === 'string' && b.name.trim()) app.name = b.name.trim().slice(0, 80);
+  if (typeof b.description === 'string') app.description = b.description.trim().slice(0, 500);
+  if (typeof b.published === 'boolean') app.published = b.published;
   store.save();
-  json(res, { app: appView(app) });
-});
+  json(res, { app: appView(app, acc) });
+}, 'owner');
 
 route('DELETE', /^\/api\/apps\/([a-f0-9]{16})$/, async (req, res, m) => {
   const i = store.apps.findIndex((a) => a.id === m[1]);
@@ -392,18 +670,23 @@ route('DELETE', /^\/api\/apps\/([a-f0-9]{16})$/, async (req, res, m) => {
   await rmQuiet(path.join(dirs.apps, m[1] + '.ipa'));
   await rmQuiet(path.join(dirs.apps, m[1] + '.png'));
   json(res, { ok: true });
-});
+}, 'owner');
 
-route('GET', /^\/api\/apps\/([a-f0-9]{16})\/icon$/, (req, res, m) =>
-  serveFile(req, res, path.join(dirs.apps, m[1] + '.png'), { cache: 'private, max-age=86400' }));
+route('GET', /^\/api\/apps\/([a-f0-9]{16})\/icon$/, (req, res, m, acc) => {
+  const app = visibleApps(acc).find((a) => a.id === m[1]);
+  if (!app) return fail(res, 404, 'Not found');
+  return serveFile(req, res, path.join(dirs.apps, m[1] + '.png'), { cache: 'private, max-age=86400' });
+});
 
 route('GET', /^\/api\/apps\/([a-f0-9]{16})\/download$/, (req, res, m) => {
   const app = store.apps.find((a) => a.id === m[1]);
   if (!app) return fail(res, 404, 'App not found');
   return serveFile(req, res, path.join(dirs.apps, m[1] + '.ipa'), { download: `${app.name} ${app.version}.ipa` });
-});
+}, 'owner');
 
-// ----- certificates -----
+// ----- certificates (each account has its own) -----
+const ownCert = (acc, certId) => store.certs.find((c) => c.id === certId && c.ownerId === acc.id);
+
 async function checkCert(c) {
   const dir = path.join(dirs.certs, c.id);
   const r = await run(ZSIGN, ['-C', path.join(dir, 'cert.p12'), '-p', decrypt(c.password)], { timeout: 30000 });
@@ -412,15 +695,20 @@ async function checkCert(c) {
   return { ...parsed, checkedAt: new Date().toISOString() };
 }
 
-route('POST', /^\/api\/certs$/, async (req, res) => {
+route('POST', /^\/api\/certs$/, async (req, res, m, acc) => {
   const { p12UploadId, provUploadId, password = '', label } = await readJson(req);
-  const p12File = tmpPath(p12UploadId);
-  const provFile = tmpPath(provUploadId);
+  if (!isOwner(acc) && myCerts(acc).length >= 5) return fail(res, 400, 'You can have up to 5 certificates — delete one first');
+  const p12File = tmpPath(p12UploadId, acc);
+  const provFile = tmpPath(provUploadId, acc);
 
-  let profile;
-  try { profile = parseProvision(await fsp.readFile(provFile)); } catch (e) { return fail(res, 400, e.message); }
-  let p12;
-  try { p12 = await parseP12(p12File, String(password)); } catch (e) { return fail(res, 400, e.message); }
+  let profile, p12;
+  try {
+    profile = parseProvision(await fsp.readFile(provFile));
+    p12 = await parseP12(p12File, String(password));
+  } catch (e) {
+    await rmQuiet(p12File); await rmQuiet(provFile);
+    return fail(res, 400, e.message);
+  }
 
   const matches = profile.certs.length ? profile.certs.some((c) => c.sha1 === p12.sha1) : null;
   const certId = id();
@@ -430,63 +718,114 @@ route('POST', /^\/api\/certs$/, async (req, res) => {
   await fsp.rename(provFile, path.join(dir, 'profile.mobileprovision'));
 
   const rec = {
-    id: certId,
+    id: certId, ownerId: acc.id,
     label: String(label || '').trim().slice(0, 60) || profile.teamName || p12.commonName,
     createdAt: new Date().toISOString(),
     password: encrypt(String(password)),
     p12, profile, matches,
   };
   store.certs.push(rec);
-  if (!store.settings.defaultCertId) store.settings.defaultCertId = certId;
+  if (!defaultCertId(acc) || !ownCert(acc, defaultCertId(acc))) setDefaultCert(acc, certId);
   store.save();
 
   rec.check = await checkCert(rec).catch(() => null);
   store.save();
-  json(res, { cert: certView(rec) });
+  json(res, { cert: certView(rec, acc) });
 });
 
-route('POST', /^\/api\/certs\/([a-f0-9]{16})\/check$/, async (req, res, m) => {
-  const c = store.certs.find((x) => x.id === m[1]);
+route('POST', /^\/api\/certs\/([a-f0-9]{16})\/check$/, async (req, res, m, acc) => {
+  const c = ownCert(acc, m[1]);
   if (!c) return fail(res, 404, 'Certificate not found');
   c.check = await checkCert(c);
   store.save();
-  json(res, { cert: certView(c) });
+  json(res, { cert: certView(c, acc) });
 });
 
-route('PATCH', /^\/api\/certs\/([a-f0-9]{16})$/, async (req, res, m) => {
-  const c = store.certs.find((x) => x.id === m[1]);
+route('PATCH', /^\/api\/certs\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
+  const c = ownCert(acc, m[1]);
   if (!c) return fail(res, 404, 'Certificate not found');
   const body = await readJson(req);
   if (typeof body.label === 'string' && body.label.trim()) c.label = body.label.trim().slice(0, 60);
-  if (body.makeDefault) store.settings.defaultCertId = c.id;
+  if (body.makeDefault) setDefaultCert(acc, c.id);
   store.save();
-  json(res, { cert: certView(c) });
+  json(res, { cert: certView(c, acc) });
 });
 
-route('DELETE', /^\/api\/certs\/([a-f0-9]{16})$/, async (req, res, m) => {
-  const i = store.certs.findIndex((x) => x.id === m[1]);
-  if (i < 0) return fail(res, 404, 'Certificate not found');
-  store.certs.splice(i, 1);
-  if (store.settings.defaultCertId === m[1]) store.settings.defaultCertId = store.certs[0] ? store.certs[0].id : null;
+async function deleteCertRecord(c) {
+  const i = store.certs.indexOf(c);
+  if (i >= 0) store.certs.splice(i, 1);
+  await rmQuiet(path.join(dirs.certs, c.id));
+}
+
+route('DELETE', /^\/api\/certs\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
+  const c = ownCert(acc, m[1]);
+  if (!c) return fail(res, 404, 'Certificate not found');
+  await deleteCertRecord(c);
+  if (defaultCertId(acc) === c.id) setDefaultCert(acc, myCerts(acc)[0] ? myCerts(acc)[0].id : null);
   store.save();
-  await rmQuiet(path.join(dirs.certs, m[1]));
   json(res, { ok: true });
 });
 
 // ----- signing -----
-route('POST', /^\/api\/sign$/, async (req, res) => {
-  const b = await readJson(req);
-  const app = store.apps.find((a) => a.id === b.appId);
-  if (!app) return fail(res, 404, 'App not found');
-  const cert = store.certs.find((c) => c.id === (b.certId || store.settings.defaultCertId));
-  if (!cert) return fail(res, 400, 'Add a certificate first');
-  if (!zsignVersion) return fail(res, 500, 'zsign is not installed on the server');
+const KEY_RE = /^[A-Za-z0-9._\-]{1,120}$/;
+function cleanEdits(list, kind) {
+  if (!Array.isArray(list)) return [];
+  return list.slice(0, 40).map((e) => {
+    const key = String(e.key || '').trim();
+    if (!KEY_RE.test(key)) throw httpError(400, `"${key || '(blank)'}" isn't a valid ${kind} key`);
+    const type = ['bool', 'string', 'number', 'delete'].includes(e.type) ? e.type : 'string';
+    let value = e.value;
+    if (type === 'bool') value = value === true || value === 'true' || value === 'YES';
+    else if (type === 'number') { value = Number(value); if (!Number.isFinite(value)) throw httpError(400, `${key} needs a number`); }
+    else if (type === 'string') value = String(value ?? '').slice(0, 500);
+    return { key, type, value };
+  });
+}
+function applyEdits(dict, edits) {
+  for (const e of edits) {
+    if (e.type === 'delete') delete dict[e.key];
+    else dict[e.key] = e.value;
+  }
+  return dict;
+}
 
-  const iconFile = b.iconUploadId ? tmpPath(b.iconUploadId) : null;
-  const dylibFiles = (Array.isArray(b.dylibs) ? b.dylibs : []).slice(0, 20).map((d) => ({
-    file: tmpPath(d.uploadId),
-    name: String(d.name || 'tweak.dylib').replace(/[^\w.\-+]/g, '_').replace(/^\.+/, '') || 'tweak.dylib',
-  }));
+async function prepareModifiedIpa(srcIpa, work, plistEdits, job) {
+  const extract = path.join(work, 'x');
+  await fsp.mkdir(extract, { recursive: true });
+  job.log.push('Unpacking app to edit Info.plist…');
+  if (await runLogged('unzip', ['-qq', '-o', srcIpa, '-d', extract], job) !== 0) throw new Error("Couldn't unpack the app to edit Info.plist");
+  const payload = path.join(extract, 'Payload');
+  const appDir = (await fsp.readdir(payload)).find((n) => n.endsWith('.app'));
+  if (!appDir) throw new Error('No .app found inside the .ipa');
+  const infoPath = path.join(payload, appDir, 'Info.plist');
+  const info = plist.parse(await fsp.readFile(infoPath));
+  applyEdits(info, plistEdits);
+  await fsp.writeFile(infoPath, plist.build(info));
+  job.log.push(`Edited ${plistEdits.length} Info.plist value${plistEdits.length === 1 ? '' : 's'}.`);
+  const out = path.join(work, 'modified.ipa');
+  if (await runLogged('zip', ['-qry', '-0', out, 'Payload'], job, { cwd: extract }) !== 0) throw new Error("Couldn't repack the app");
+  await rmQuiet(extract);
+  return out;
+}
+
+function trimSigned(acc) {
+  if (isOwner(acc)) return;
+  const max = Number(store.settings.maxSignedPerUser) || 10;
+  const mine = mySigned(acc);
+  for (const s of mine.slice(max)) {
+    store.signed.splice(store.signed.indexOf(s), 1);
+    rmQuiet(path.join(dirs.signed, s.id + '.ipa'));
+    rmQuiet(path.join(dirs.signed, s.id + '.png'));
+  }
+}
+
+route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
+  const b = await readJson(req);
+  const app = visibleApps(acc).find((a) => a.id === b.appId);
+  if (!app) return fail(res, 404, 'App not found');
+  const cert = ownCert(acc, b.certId || defaultCertId(acc));
+  if (!cert) return fail(res, 400, 'Add a certificate first');
+  if (!zsignVersion) return fail(res, 500, 'The signing engine is not installed on the server');
 
   const opts = {
     name: String(b.name || '').trim().slice(0, 80),
@@ -497,22 +836,31 @@ route('POST', /^\/api\/sign$/, async (req, res) => {
   if (opts.bundleId && !/^[A-Za-z0-9.\-]+$/.test(opts.bundleId)) return fail(res, 400, 'Bundle ID can only use letters, numbers, dots and dashes');
   if (opts.version && !/^[0-9A-Za-z.\-]+$/.test(opts.version)) return fail(res, 400, 'Version looks invalid');
   if (opts.minOS && !/^\d+(\.\d+){0,2}$/.test(opts.minOS)) return fail(res, 400, 'Minimum iOS should look like 14.0');
+  const entEdits = cleanEdits(b.entitlements, 'entitlement');
+  const plistEdits = cleanEdits(b.plist, 'Info.plist');
 
-  const job = newJob();
+  const iconFile = b.iconUploadId ? tmpPath(b.iconUploadId, acc) : null;
+  const dylibFiles = (Array.isArray(b.dylibs) ? b.dylibs : []).slice(0, 20).map((d) => ({
+    file: tmpPath(d.uploadId, acc),
+    name: String(d.name || 'tweak.dylib').replace(/[^\w.\-+]/g, '_').replace(/^\.+/, '') || 'tweak.dylib',
+  }));
+
+  const job = newJob(acc);
   json(res, { jobId: job.id });
 
-  (async () => {
+  enqueueSign(job, async () => {
     const work = path.join(dirs.work, job.id);
     const signedId = id();
     const out = path.join(dirs.signed, signedId + '.ipa');
     try {
       await fsp.mkdir(work, { recursive: true });
       const certDir = path.join(dirs.certs, cert.id);
+      const provPath = path.join(certDir, 'profile.mobileprovision');
       const args = [
         '-f',
         '-k', path.join(certDir, 'cert.p12'),
         '-p', decrypt(cert.password),
-        '-m', path.join(certDir, 'profile.mobileprovision'),
+        '-m', provPath,
         '-o', out,
         '-t', work,
         '-z', String(Math.min(9, Math.max(0, Number(store.settings.zipLevel ?? 6)))),
@@ -521,6 +869,13 @@ route('POST', /^\/api\/sign$/, async (req, res) => {
       if (opts.name) args.push('-n', opts.name);
       if (opts.version) args.push('-r', opts.version);
       if (opts.minOS) args.push('-M', opts.minOS);
+      if (entEdits.length) {
+        const ent = applyEdits(profileEntitlements(await fsp.readFile(provPath)), entEdits);
+        const entPath = path.join(work, 'entitlements.plist');
+        await fsp.writeFile(entPath, plist.build(ent));
+        args.push('-e', entPath);
+        job.log.push(`Using custom entitlements (${entEdits.map((e) => e.key.split('.').pop()).join(', ')}).`);
+      }
       if (iconFile) {
         const iconPath = path.join(work, 'icon.png');
         await fsp.rename(iconFile, iconPath);
@@ -537,13 +892,16 @@ route('POST', /^\/api\/sign$/, async (req, res) => {
       if (b.removeWatch) args.push('-W');
       if (b.removeUISD) args.push('-U');
       if (b.enableDocs) args.push('-S');
-      args.push(path.join(dirs.apps, app.id + '.ipa'));
+
+      let input = path.join(dirs.apps, app.id + '.ipa');
+      if (plistEdits.length) input = await prepareModifiedIpa(input, work, plistEdits, job);
+      args.push(input);
 
       job.log.push(`Signing ${app.name} with ${cert.label}…`);
       const code = await runLogged(ZSIGN, args, job);
       if (code !== 0 || !fs.existsSync(out)) {
         const last = job.log.filter((l) => /error|fail|invalid|can't|cannot|unable/i.test(l)).pop();
-        throw new Error(last || `zsign exited with code ${code}`);
+        throw new Error(last || `Signing failed (code ${code})`);
       }
 
       job.log.push('Reading signed app…');
@@ -552,12 +910,17 @@ route('POST', /^\/api\/sign$/, async (req, res) => {
       else if (app.hasIcon) await fsp.copyFile(path.join(dirs.apps, app.id + '.png'), path.join(dirs.signed, signedId + '.png'));
 
       const rec = {
-        id: signedId, token: token(), appId: app.id, certId: cert.id, certLabel: cert.label,
+        id: signedId, ownerId: acc.id, token: token(), appId: app.id, certId: cert.id, certLabel: cert.label,
         name: meta.name, bundleId: meta.bundleId, version: meta.version, build: meta.build,
         size: meta.size, hasIcon: !!meta.icon || !!app.hasIcon, signedAt: new Date().toISOString(),
-        expires: cert.profile.expires, options: { ...opts, icon: !!iconFile, dylibs: dylibFiles.map((d) => d.name) },
+        expires: cert.profile.expires,
+        options: {
+          ...opts, icon: !!iconFile, dylibs: dylibFiles.map((d) => d.name),
+          entitlements: entEdits.map((e) => e.key), plist: plistEdits.map((e) => e.key),
+        },
       };
       store.signed.unshift(rec);
+      trimSigned(acc);
       store.save();
       job.result = { signed: signedView(rec, req) };
       job.status = 'done';
@@ -569,40 +932,100 @@ route('POST', /^\/api\/sign$/, async (req, res) => {
     } finally {
       await rmQuiet(work);
     }
-  })();
+  });
 });
 
-route('GET', /^\/api\/jobs\/([a-f0-9]{16})$/, (req, res, m) => {
+route('GET', /^\/api\/jobs\/([a-f0-9]{16})$/, (req, res, m, acc) => {
   const job = jobs.get(m[1]);
-  if (!job) return fail(res, 404, 'Job not found');
+  if (!job || job.owner !== acc.id) return fail(res, 404, 'Job not found');
   json(res, { status: job.status, log: job.log.slice(-30), error: job.error, result: job.result, progress: job.progress ?? null });
 });
 
-route('DELETE', /^\/api\/signed\/([a-f0-9]{16})$/, async (req, res, m) => {
-  const i = store.signed.findIndex((s) => s.id === m[1]);
-  if (i < 0) return fail(res, 404, 'Not found');
-  store.signed.splice(i, 1);
+// ----- signed apps -----
+const ownSigned = (acc, sid) => store.signed.find((s) => s.id === sid && s.ownerId === acc.id);
+
+route('DELETE', /^\/api\/signed\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
+  const s = ownSigned(acc, m[1]);
+  if (!s) return fail(res, 404, 'Not found');
+  store.signed.splice(store.signed.indexOf(s), 1);
   store.save();
-  await rmQuiet(path.join(dirs.signed, m[1] + '.ipa'));
-  await rmQuiet(path.join(dirs.signed, m[1] + '.png'));
+  await rmQuiet(path.join(dirs.signed, s.id + '.ipa'));
+  await rmQuiet(path.join(dirs.signed, s.id + '.png'));
   json(res, { ok: true });
 });
 
-route('POST', /^\/api\/signed\/([a-f0-9]{16})\/relink$/, async (req, res, m) => {
-  const s = store.signed.find((x) => x.id === m[1]);
+route('POST', /^\/api\/signed\/([a-f0-9]{16})\/relink$/, async (req, res, m, acc) => {
+  const s = ownSigned(acc, m[1]);
   if (!s) return fail(res, 404, 'Not found');
   s.token = token();
   store.save();
   json(res, { signed: signedView(s, req) });
 });
 
+// ----- owner: settings, users, invites -----
 route('PATCH', /^\/api\/settings$/, async (req, res) => {
   const b = await readJson(req);
   if (b.zipLevel !== undefined) store.settings.zipLevel = Math.min(9, Math.max(0, Number(b.zipLevel) || 0));
-  if (b.autoInstall !== undefined) store.settings.autoInstall = !!b.autoInstall;
+  if (b.maxSignedPerUser !== undefined) store.settings.maxSignedPerUser = Math.min(100, Math.max(1, Number(b.maxSignedPerUser) || 10));
+  if (b.udidLogin !== undefined) store.settings.udidLogin = !!b.udidLogin;
   store.save();
   json(res, { settings: store.settings });
-});
+}, 'owner');
+
+function inviteCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let s = '';
+  for (const b of crypto.randomBytes(8)) s += chars[b % chars.length];
+  return `${s.slice(0, 4)}-${s.slice(4)}`;
+}
+
+route('POST', /^\/api\/invites$/, async (req, res) => {
+  const b = await readJson(req);
+  const inv = {
+    code: inviteCode(), note: String(b.note || '').trim().slice(0, 60),
+    maxUses: Math.min(1000, Math.max(1, Number(b.maxUses) || 1)), uses: 0, usedBy: [], createdAt: new Date().toISOString(),
+  };
+  store.invites.unshift(inv);
+  store.save();
+  json(res, { invite: inv, signupUrl: `${baseUrl(req)}/?invite=${inv.code}` });
+}, 'owner');
+
+route('DELETE', /^\/api\/invites\/([A-Z0-9-]{4,20})$/, (req, res, m) => {
+  const i = store.invites.findIndex((x) => x.code === m[1]);
+  if (i < 0) return fail(res, 404, 'Invite not found');
+  store.invites.splice(i, 1);
+  store.save();
+  json(res, { ok: true });
+}, 'owner');
+
+route('PATCH', /^\/api\/users\/([a-f0-9]{16})$/, async (req, res, m) => {
+  const u = findUser(m[1]);
+  if (!u) return fail(res, 404, 'User not found');
+  const b = await readJson(req);
+  if (typeof b.disabled === 'boolean') { u.disabled = b.disabled; u.sv = (u.sv || 0) + 1; }
+  if (b.password !== undefined) {
+    if (String(b.password).length < 6) return fail(res, 400, 'Password must be at least 6 characters');
+    Object.assign(u, hashPassword(b.password));
+    u.sv = (u.sv || 0) + 1;
+  }
+  if (b.unlinkDevice) { u.udid = null; u.deviceName = null; }
+  store.save();
+  json(res, { user: userView(u) });
+}, 'owner');
+
+route('DELETE', /^\/api\/users\/([a-f0-9]{16})$/, async (req, res, m) => {
+  const u = findUser(m[1]);
+  if (!u) return fail(res, 404, 'User not found');
+  for (const c of store.certs.filter((x) => x.ownerId === u.id)) await deleteCertRecord(c);
+  for (const s of store.signed.filter((x) => x.ownerId === u.id)) {
+    store.signed.splice(store.signed.indexOf(s), 1);
+    await rmQuiet(path.join(dirs.signed, s.id + '.ipa'));
+    await rmQuiet(path.join(dirs.signed, s.id + '.png'));
+  }
+  store.users.splice(store.users.indexOf(u), 1);
+  store.save();
+  json(res, { ok: true });
+}, 'owner');
 
 // ----- public install endpoints (iOS fetches these without cookies) -----
 const findByToken = (t) => store.signed.find((s) => s.token === t);
@@ -623,34 +1046,36 @@ route('GET', /^\/i\/([\w-]{20,40})\/manifest\.plist$/, (req, res, m) => {
     }],
   });
   send(res, 200, body, { 'Content-Type': 'text/xml; charset=utf-8' });
-}, { open: true });
+}, 'open');
 
 route('GET', /^\/i\/([\w-]{20,40})\/app\.ipa$/, (req, res, m) => {
   const s = findByToken(m[1]);
   if (!s) return fail(res, 404, 'Link expired');
   return serveFile(req, res, path.join(dirs.signed, s.id + '.ipa'), { download: `${s.name}.ipa` });
-}, { open: true });
+}, 'open');
 
 route('GET', /^\/i\/([\w-]{20,40})\/icon\.png$/, (req, res, m) => {
   const s = findByToken(m[1]);
   if (!s) return fail(res, 404, 'Not found');
   return serveFile(req, res, path.join(dirs.signed, s.id + '.png'), { cache: 'public, max-age=86400' });
-}, { open: true });
+}, 'open');
 
 route('GET', /^\/i\/([\w-]{20,40})\/?$/, async (req, res, m) => {
   const s = findByToken(m[1]);
   const tpl = await fsp.readFile(path.join(PUBLIC_DIR, 'install.html'), 'utf8');
   const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
-  if (!s) return send(res, 404, tpl.replace(/{{(\w+)}}/g, (_, k) => esc({ title: 'Link expired', name: 'This link has expired', meta: 'Ask for a new install link.', icon: '/icon-180.png', install: '#', hidden: 'hidden' }[k] || '')), { 'Content-Type': 'text/html; charset=utf-8' });
+  const fill = (vals) => tpl.replace(/{{(\w+)}}/g, (_, k) => esc(vals[k] ?? ''));
+  if (!s) {
+    return send(res, 404, fill({ title: 'Link expired', name: 'This link has expired', meta: 'Ask for a new install link.', icon: '/icon-180.png', install: '#', hidden: 'hidden' }), { 'Content-Type': 'text/html; charset=utf-8' });
+  }
   const v = signedView(s, req);
-  const html = tpl.replace(/{{(\w+)}}/g, (_, k) => esc({
+  send(res, 200, fill({
     title: `Install ${s.name}`, name: s.name,
     meta: `Version ${s.version || '?'} · ${(s.size / 1048576).toFixed(1)} MB`,
     icon: s.hasIcon ? `/i/${s.token}/icon.png` : '/icon-180.png',
     install: v.installUrl, hidden: '',
-  }[k] ?? ''));
-  send(res, 200, html, { 'Content-Type': 'text/html; charset=utf-8' });
-}, { open: true });
+  }), { 'Content-Type': 'text/html; charset=utf-8' });
+}, 'open');
 
 // ----- icons -----
 const iconCache = {};
@@ -658,12 +1083,13 @@ route('GET', /^\/(?:apple-touch-icon(?:-precomposed)?|icon-(\d+))\.png$/, (req, 
   const size = Math.min(1024, Math.max(32, Number(m[1]) || 180));
   iconCache[size] = iconCache[size] || drawAppIcon(size);
   send(res, 200, iconCache[size], { 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=604800' });
-}, { open: true });
+}, 'open');
 
 // ---------- server ----------
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
-  const pathname = decodeURIComponent(url.pathname);
+  let pathname;
+  try { pathname = decodeURIComponent(url.pathname); } catch { return fail(res, 400, 'Bad URL'); }
   req.query = url.searchParams;
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'no-referrer');
@@ -673,8 +1099,13 @@ const server = http.createServer(async (req, res) => {
       if (r.method !== req.method && !(r.method === 'GET' && req.method === 'HEAD')) continue;
       const m = pathname.match(r.pattern);
       if (!m) continue;
-      if (!r.open && !isAuthed(req)) return fail(res, 401, 'Please log in');
-      return await r.handler(req, res, m);
+      let acc = null;
+      if (r.access !== 'open') {
+        acc = getAccount(req);
+        if (!acc) return fail(res, 401, 'Please log in');
+        if (r.access === 'owner' && !isOwner(acc)) return fail(res, 403, 'Only the owner can do that');
+      }
+      return await r.handler(req, res, m, acc);
     }
     if (pathname.startsWith('/api/')) return fail(res, 404, 'Not found');
     if (req.method !== 'GET' && req.method !== 'HEAD') return fail(res, 405, 'Method not allowed');
@@ -698,11 +1129,11 @@ setInterval(async () => {
   for (const f of await fsp.readdir(dirs.tmp).catch(() => [])) {
     const p = path.join(dirs.tmp, f);
     const st = await fsp.stat(p).catch(() => null);
-    if (st && Date.now() - st.mtimeMs > 864e5) await rmQuiet(p);
+    if (st && Date.now() - st.mtimeMs > 864e5) { await rmQuiet(p); uploads.delete(f); }
   }
 }, 60 * 60 * 1000).unref();
 
 server.listen(PORT, () => {
-  console.log(`Mango Signer running on port ${PORT} (data: ${DATA_DIR})`);
-  if (!APP_PASSWORD) console.log('WARNING: APP_PASSWORD is not set — anyone with the link can use your certificates.');
+  console.log(`Mango Signer ${VERSION} running on port ${PORT} (data: ${DATA_DIR})`);
+  if (!APP_PASSWORD) console.log('WARNING: APP_PASSWORD is not set — anyone with the link has owner access.');
 });

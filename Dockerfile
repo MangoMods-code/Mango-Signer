@@ -13,7 +13,7 @@ RUN git init /zsign && cd /zsign \
 # ---- App ----
 FROM node:22-bookworm-slim
 RUN apt-get update \
- && apt-get install -y --no-install-recommends openssl libssl3 ca-certificates \
+ && apt-get install -y --no-install-recommends openssl libssl3 ca-certificates zip unzip \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=zsign /zsign/bin/zsign /usr/local/bin/zsign
 WORKDIR /app
