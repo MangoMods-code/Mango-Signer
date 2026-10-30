@@ -16,7 +16,13 @@ const { parseProvision, profileEntitlements, parseP12, run } = require('./lib/ce
 const { drawAppIcon } = require('./lib/png');
 
 const WHATS_NEW = require('./lib/whats-new');
-const VERSION = WHATS_NEW[0].version;
+const VERSION = WHATS_NEW[0].version; // the real version of this code
+// Changes whenever any app file changes, so open apps know to refresh even if the version label is the same.
+const BUILD_ID = crypto.createHash('sha256')
+  .update([VERSION, ...['server.js', 'public/app.js', 'public/styles.css', 'public/index.html'].map((f) => {
+    try { return fs.readFileSync(path.join(__dirname, f)); } catch { return ''; }
+  })].join('|'))
+  .digest('hex').slice(0, 10);
 const PORT = Number(process.env.PORT) || 3000;
 const DATA_DIR = path.resolve(process.env.DATA_DIR || (fs.existsSync('/data') ? '/data' : './data'));
 const ZSIGN = process.env.ZSIGN_PATH || 'zsign';
@@ -57,6 +63,9 @@ for (const a of store.apps) {
   if (!a.signDefaults) a.signDefaults = {};
 }
 store.save();
+
+const displayVersion = () => VERSION;
+delete store.settings.versionLabel;
 
 // ---------- secrets ----------
 function loadSecret() {
@@ -368,11 +377,11 @@ const route = (method, pattern, handler, access = 'user') => routes.push({ metho
 // ----- session -----
 route('GET', /^\/api\/session$/, (req, res) => {
   const acc = getAccount(req);
-  json(res, { authed: !!acc, account: acc ? accountView(acc) : null, passwordSet: !!APP_PASSWORD, udidLogin: !!store.settings.udidLogin, version: VERSION });
+  json(res, { authed: !!acc, account: acc ? accountView(acc) : null, passwordSet: !!APP_PASSWORD, udidLogin: !!store.settings.udidLogin, version: displayVersion() });
 }, 'open');
 
-route('GET', /^\/api\/version$/, (req, res) => json(res, { version: VERSION }), 'open');
-route('GET', /^\/api\/whats-new$/, (req, res) => json(res, { version: VERSION, versions: WHATS_NEW }), 'open');
+route('GET', /^\/api\/version$/, (req, res) => json(res, { version: displayVersion(), build: BUILD_ID }), 'open');
+route('GET', /^\/api\/whats-new$/, (req, res) => json(res, { version: displayVersion(), codeVersion: VERSION, versions: WHATS_NEW }), 'open');
 
 route('POST', /^\/api\/login$/, async (req, res) => {
   const rl = rateLimited(req);
@@ -593,7 +602,7 @@ route('GET', /^\/api\/state$/, async (req, res, m, acc) => {
     categories: sortedCategories(),
     certs: myCerts(acc).map((c) => certView(c, acc)),
     signed: mySigned(acc).map((s) => signedView(s, req)),
-    server: { baseUrl: base, https: base.startsWith('https://'), version: VERSION },
+    server: { baseUrl: base, https: base.startsWith('https://'), version: displayVersion(), codeVersion: VERSION },
   };
   if (isOwner(acc)) {
     out.settings = store.settings;
@@ -728,7 +737,8 @@ async function replaceAppFile(app, file) {
   const oldVersion = app.version;
   await fsp.rename(file, path.join(dirs.apps, app.id + '.ipa'));
   if (meta.icon) await fsp.writeFile(path.join(dirs.apps, app.id + '.png'), meta.icon);
-  Object.assign(app, metaFields(meta), { updatedAt: new Date().toISOString(), previousVersion: oldVersion });
+  const oldShown = app.versionOverride || oldVersion;
+  Object.assign(app, metaFields(meta), { updatedAt: new Date().toISOString(), previousVersion: oldShown, versionOverride: null });
   if (!app.customIcon) app.hasIcon = !!meta.icon;
   store.save();
   return app;
@@ -842,6 +852,12 @@ route('PATCH', /^\/api\/apps\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
   if (typeof b.published === 'boolean') app.published = b.published;
   if (typeof b.featured === 'boolean') app.featured = b.featured;
   if (typeof b.useIconWhenSigning === 'boolean') app.useIconWhenSigning = b.useIconWhenSigning;
+  if (b.versionOverride !== undefined) {
+    const v = String(b.versionOverride || '').trim();
+    if (v && !/^[\w.\-+ ()]{1,30}$/.test(v)) return fail(res, 400, 'Version can use letters, numbers, dots, dashes and spaces (30 max)');
+    app.versionOverride = v || null;
+  }
+  if (typeof b.useVersionWhenSigning === 'boolean') app.useVersionWhenSigning = b.useVersionWhenSigning;
   if (b.categoryId !== undefined) {
     if (b.categoryId && !store.categories.some((c) => c.id === b.categoryId)) return fail(res, 400, 'Category not found');
     app.categoryId = b.categoryId || null;
@@ -1134,7 +1150,8 @@ route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
       ];
       if (opts.bundleId) args.push('-b', opts.bundleId);
       if (opts.name) args.push('-n', opts.name);
-      if (opts.version) args.push('-r', opts.version);
+      const libVersion = app.versionOverride && app.useVersionWhenSigning !== false && /^[0-9A-Za-z.\-]+$/.test(app.versionOverride) ? app.versionOverride : '';
+      if (opts.version || libVersion) args.push('-r', opts.version || libVersion);
       if (opts.minOS) args.push('-M', opts.minOS);
       if (entEdits.length) {
         const ent = applyEdits(profileEntitlements(await fsp.readFile(provPath)), entEdits);
@@ -1402,7 +1419,7 @@ const server = http.createServer(async (req, res) => {
     const isFile = fs.existsSync(file) && fs.statSync(file).isFile();
     if (isFile && !file.endsWith(path.sep + 'index.html')) return serveFile(req, res, file, { cache: 'no-cache' });
     // The app page carries the version so scripts load fresh after every update.
-    const page = (await fsp.readFile(path.join(PUBLIC_DIR, 'index.html'), 'utf8')).replace(/__VERSION__/g, VERSION);
+    const page = (await fsp.readFile(path.join(PUBLIC_DIR, 'index.html'), 'utf8')).replace(/__VERSION__/g, displayVersion()).replace(/__BUILD__/g, BUILD_ID).replace(/__CODE_VERSION__/g, VERSION);
     return send(res, 200, page, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
   } catch (e) {
     if (!res.headersSent) fail(res, e.status || 500, e.status ? e.message : 'Something went wrong: ' + e.message);
@@ -1422,6 +1439,6 @@ setInterval(async () => {
 }, 60 * 60 * 1000).unref();
 
 server.listen(PORT, () => {
-  console.log(`Mango Signer ${VERSION} running on port ${PORT} (data: ${DATA_DIR})`);
+  console.log(`Mango Signer ${VERSION} (build ${BUILD_ID}) running on port ${PORT} (data: ${DATA_DIR})`);
   if (!APP_PASSWORD) console.log('WARNING: APP_PASSWORD is not set — anyone with the link has owner access.');
 });
