@@ -15,7 +15,8 @@ const plist = require('./lib/plist');
 const { parseProvision, profileEntitlements, parseP12, run } = require('./lib/certs');
 const { drawAppIcon } = require('./lib/png');
 
-const VERSION = '1.2.0';
+const WHATS_NEW = require('./lib/whats-new');
+const VERSION = WHATS_NEW[0].version;
 const PORT = Number(process.env.PORT) || 3000;
 const DATA_DIR = path.resolve(process.env.DATA_DIR || (fs.existsSync('/data') ? '/data' : './data'));
 const ZSIGN = process.env.ZSIGN_PATH || 'zsign';
@@ -369,6 +370,9 @@ route('GET', /^\/api\/session$/, (req, res) => {
   const acc = getAccount(req);
   json(res, { authed: !!acc, account: acc ? accountView(acc) : null, passwordSet: !!APP_PASSWORD, udidLogin: !!store.settings.udidLogin, version: VERSION });
 }, 'open');
+
+route('GET', /^\/api\/version$/, (req, res) => json(res, { version: VERSION }), 'open');
+route('GET', /^\/api\/whats-new$/, (req, res) => json(res, { version: VERSION, versions: WHATS_NEW }), 'open');
 
 route('POST', /^\/api\/login$/, async (req, res) => {
   const rl = rateLimited(req);
@@ -1395,8 +1399,11 @@ const server = http.createServer(async (req, res) => {
     const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
     const file = path.resolve(PUBLIC_DIR, rel);
     if (!file.startsWith(PUBLIC_DIR + path.sep)) return fail(res, 403, 'Forbidden');
-    if (fs.existsSync(file) && fs.statSync(file).isFile()) return serveFile(req, res, file, { cache: 'no-cache' });
-    return serveFile(req, res, path.join(PUBLIC_DIR, 'index.html'), { cache: 'no-cache' });
+    const isFile = fs.existsSync(file) && fs.statSync(file).isFile();
+    if (isFile && !file.endsWith(path.sep + 'index.html')) return serveFile(req, res, file, { cache: 'no-cache' });
+    // The app page carries the version so scripts load fresh after every update.
+    const page = (await fsp.readFile(path.join(PUBLIC_DIR, 'index.html'), 'utf8')).replace(/__VERSION__/g, VERSION);
+    return send(res, 200, page, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
   } catch (e) {
     if (!res.headersSent) fail(res, e.status || 500, e.status ? e.message : 'Something went wrong: ' + e.message);
     if (!e.status) console.error(e);
