@@ -223,3 +223,31 @@ select { appearance: none; -webkit-appearance: none; background-image: linear-gr
 .setting .value { color: var(--muted); text-align: right; overflow-wrap: anywhere; font-size: 15px; }
 .setting select { width: auto; padding: 6px 30px 6px 10px; }
 .footer-note { text-align: center; color: var(--muted); font-size: 13px; margin-top: 26px; }
+
+/* ---------- v1.1 additions ---------- */
+.auth-pane { width: 100%; max-width: 340px; display: grid; gap: 12px; margin-top: 6px; }
+.auth-pane form { margin-top: 4px; }
+.auth-pane .warning { margin: 0; text-align: left; }
+.link-btn { border: 0; background: none; color: var(--mango); font-weight: 600; padding: 8px; cursor: pointer; }
+.center { text-align: center; }
+.tabs { grid-template-columns: repeat(var(--tab-count, 4), 1fr); }
+.row-title .badge { vertical-align: 2px; margin-left: 6px; }
+.desc { color: var(--text); opacity: .85; font-size: 15px; margin: 0 0 14px; white-space: pre-wrap; }
+.editor-row { background: var(--bg-2); border-radius: 12px; padding: 10px; display: grid; gap: 8px; margin-bottom: 8px; }
+.editor-row .split { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; align-items: center; }
+.editor-row input, .editor-row select { padding: 9px 11px; font-size: 15px; background: var(--card); }
+.editor-row .x { border: 0; width: 34px; height: 34px; border-radius: 50%; background: rgba(255, 92, 108, .15); color: var(--red); font-size: 18px; cursor: pointer; }
+.add-key { width: 100%; margin-bottom: 14px; }
+.ent-warn { color: #ff9aa4; font-size: 12px; margin-top: 3px; white-space: normal; }
+.code-box {
+  font: 600 26px/1.2 ui-monospace, "SF Mono", Menlo, monospace; letter-spacing: 2px; text-align: center;
+  background: var(--bg-2); border-radius: 14px; padding: 16px; margin: 6px 0 14px; color: var(--mango);
+}
+.mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 13px; }
+textarea {
+  width: 100%; border: 1px solid var(--line); background: var(--bg-2); border-radius: 12px; padding: 12px 14px;
+  outline: none; font: inherit; font-size: 16px; color: inherit; min-height: 86px; resize: vertical;
+}
+textarea:focus { border-color: var(--mango); }
+.setting .switch { margin-left: auto; }
+.setting + .row, .row + .setting { border-top: 1px solid var(--line); }
