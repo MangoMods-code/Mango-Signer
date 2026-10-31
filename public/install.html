@@ -8,16 +8,25 @@
   <link rel="apple-touch-icon" href="/apple-touch-icon.png">
   <style>
     :root { color-scheme: dark; }
+    * { -webkit-tap-highlight-color: transparent; }
     body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; background: #140c1a; color: #f6eefc;
       font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; text-align: center; padding: 24px; box-sizing: border-box; }
-    .card { width: 100%; max-width: 360px; background: #241830; border-radius: 24px; padding: 30px 22px 24px; }
+    .card { width: 100%; max-width: 360px; background: #241830; border-radius: 24px; padding: 30px 22px 24px; animation: rise .45s cubic-bezier(.2, .9, .3, 1.1); }
     img { width: 96px; height: 96px; border-radius: 22px; box-shadow: 0 10px 40px rgba(255, 159, 28, .2); }
     h1 { font-size: 24px; margin: 16px 0 4px; overflow-wrap: anywhere; }
     p { color: #a898b5; margin: 0 0 22px; font-size: 14px; }
     a.btn { display: block; padding: 15px; border-radius: 15px; font-weight: 700; font-size: 17px; text-decoration: none; color: #1a0d05;
-      background: linear-gradient(135deg, #ff9f1c, #ff7a1a); }
+      background: linear-gradient(135deg, #ff9f1c, #ff7a1a); transition: transform .15s ease, filter .15s ease; }
+    a.btn:active { transform: scale(.97); filter: brightness(.92); }
     .hidden { display: none; }
     small { display: block; margin-top: 16px; color: #a898b5; font-size: 12px; }
+    .status { margin-top: 16px; }
+    .status b { display: block; font-size: 16px; margin-bottom: 4px; }
+    .status span { color: #a898b5; font-size: 13px; }
+    .bar { height: 8px; background: #1d1326; border-radius: 4px; overflow: hidden; margin: 12px 0 6px; }
+    .bar div { height: 100%; width: 0; background: linear-gradient(90deg, #ff9f1c, #ffcf4a); border-radius: 4px; transition: width .5s ease; }
+    @keyframes rise { from { opacity: 0; transform: translateY(16px) scale(.98); } to { opacity: 1; transform: none; } }
+    @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
   </style>
 </head>
 <body>
@@ -25,8 +34,40 @@
     <img src="{{icon}}" alt="">
     <h1>{{name}}</h1>
     <p>{{meta}}</p>
-    <a class="btn {{hidden}}" href="{{install}}">Install</a>
+    <a class="btn {{hidden}}" id="install" href="{{install}}">Install</a>
+    <div class="status hidden" id="status">
+      <div class="bar"><div id="bar"></div></div>
+      <b id="title">Waiting for your iPhone…</b>
+      <span id="sub">A pop-up should appear — tap Install.</span>
+    </div>
     <small>🥭 Shared with Mango Signer · Open in Safari on iPhone<br>© 2026 MangoMods</small>
   </div>
+  <script>
+    (function () {
+      var btn = document.getElementById('install');
+      if (!btn || btn.classList.contains('hidden')) return;
+      var base = location.pathname.replace(/\/$/, '');
+      var size = function (b) { return b < 1048576 ? Math.max(1, Math.round(b / 1024)) + ' KB' : (b / 1048576).toFixed(1) + ' MB'; };
+      var timer = null;
+      btn.addEventListener('click', function () {
+        // Let the tap open the iPhone's install pop-up, then follow along.
+        fetch(base + '/status', { method: 'POST' }).catch(function () {});
+        document.getElementById('status').classList.remove('hidden');
+        btn.textContent = 'Install again';
+        clearTimeout(timer);
+        var tick = function () {
+          fetch(base + '/status').then(function (r) { return r.json(); }).then(function (d) {
+            var s = d.install || {};
+            var t = document.getElementById('title'), sub = document.getElementById('sub'), bar = document.getElementById('bar');
+            if (s.phase === 'confirm') { t.textContent = 'Tap Install on the pop-up'; sub.textContent = 'Your iPhone is asking to install the app.'; bar.style.width = '4%'; }
+            else if (s.phase === 'downloading') { t.textContent = 'Installing… ' + Math.floor(s.progress * 100) + '%'; sub.textContent = size(s.sent) + ' of ' + size(s.size); bar.style.width = (s.progress * 100) + '%'; }
+            else if (s.phase === 'done') { t.textContent = 'Downloaded ✓'; sub.textContent = 'Finishing the install — check your Home Screen.'; bar.style.width = '100%'; return; }
+            timer = setTimeout(tick, 700);
+          }).catch(function () { timer = setTimeout(tick, 1500); });
+        };
+        timer = setTimeout(tick, 500);
+      });
+    })();
+  </script>
 </body>
 </html>

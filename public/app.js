@@ -234,8 +234,15 @@ function toast(msg, isError = false) {
   const t = $('#toast');
   t.textContent = msg;
   t.className = 'toast' + (isError ? ' error' : '');
+  void t.offsetWidth;
+  t.classList.add('show');
   clearTimeout(toast.timer);
-  toast.timer = setTimeout(() => t.classList.add('hidden'), isError ? 4200 : 2400);
+  clearTimeout(toast.hideTimer);
+  toast.timer = setTimeout(() => {
+    t.classList.remove('show');
+    t.classList.add('leaving');
+    toast.hideTimer = setTimeout(() => t.classList.add('hidden'), 260);
+  }, isError ? 4200 : 2400);
 }
 
 function fmtSize(b) {
@@ -270,7 +277,7 @@ function iconHtml(src, name, big = false) {
   const letter = esc((name || '?').trim().charAt(0).toUpperCase());
   const cls = 'app-icon' + (big ? ' big' : '');
   if (!src) return `<div class="${cls}">${letter}</div>`;
-  return `<img class="${cls}" src="${esc(src)}" alt="" loading="lazy" onerror="this.outerHTML='<div class=&quot;${cls}&quot;>${letter}</div>'">`;
+  return `<img class="${cls} fade-img" src="${esc(src)}" alt="" loading="lazy" onload="this.classList.add('loaded')" onerror="this.outerHTML='<div class=&quot;${cls}&quot;>${letter}</div>'">`;
 }
 const appIcon = (a, big) => iconHtml(a.hasIcon || a.customIcon ? `/api/apps/${a.id}/icon?v=${a.iconVersion || 0}` : null, a.name, big);
 const signedIcon = (s, big) => iconHtml(s.hasIcon ? `/i/${s.token}/icon.png` : null, s.name, big);
@@ -325,26 +332,47 @@ function resetSheetPosition() {
   $('#sheetBackdrop').style.opacity = '';
 }
 
+const reducedMotion = () => window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
 function openSheet(html, onMount) {
   const sheet = $('#sheet');
-  const wasOpen = !sheet.classList.contains('hidden');
+  const backdrop = $('#sheetBackdrop');
+  const closing = sheet.classList.contains('closing');
+  const wasOpen = !sheet.classList.contains('hidden') && !closing;
+  clearTimeout(closeSheet.timer);
+  sheet.classList.remove('closing');
+  backdrop.classList.remove('closing');
   resetSheetPosition();
-  $('#sheetBody').innerHTML = html;
+  const body = $('#sheetBody');
+  body.innerHTML = html;
   sheet.classList.toggle('locked', !!closeSheet.locked);
   sheet.classList.remove('hidden');
-  $('#sheetBackdrop').classList.remove('hidden');
-  if (wasOpen) sheet.classList.add('no-anim'); else sheet.classList.remove('no-anim');
+  backdrop.classList.remove('hidden');
+  sheet.classList.toggle('no-anim', wasOpen || closing);
+  // Going from one pop-up to another: fade the new content in instead of sliding the whole sheet again.
+  if (wasOpen || closing) { body.classList.remove('swap'); void body.offsetWidth; body.classList.add('swap'); }
   sheet.scrollTop = 0;
   lockPage();
-  onMount && onMount($('#sheetBody'));
+  onMount && onMount(body);
 }
-function closeSheet() {
+function closeSheet(opts) {
   if (closeSheet.locked) return;
-  resetSheetPosition();
-  $('#sheet').classList.add('hidden');
-  $('#sheetBackdrop').classList.add('hidden');
-  $('#sheetBody').innerHTML = '';
-  unlockPage();
+  const sheet = $('#sheet');
+  const backdrop = $('#sheetBackdrop');
+  if (sheet.classList.contains('hidden') || sheet.classList.contains('closing')) return;
+  const finish = () => {
+    sheet.classList.remove('closing');
+    backdrop.classList.remove('closing');
+    resetSheetPosition();
+    sheet.classList.add('hidden');
+    backdrop.classList.add('hidden');
+    $('#sheetBody').innerHTML = '';
+    unlockPage();
+  };
+  if ((opts && opts.instant) || reducedMotion()) return finish();
+  sheet.classList.add('closing');
+  backdrop.classList.add('closing');
+  closeSheet.timer = setTimeout(finish, 260);
 }
 $('#sheetBackdrop').onclick = closeSheet;
 $('#sheetClose').onclick = closeSheet;
@@ -391,7 +419,7 @@ $('#sheetClose').onclick = closeSheet;
     if (!cancelled && (dy > 120 || (dy > 30 && speed > 0.35))) {
       sheet.style.transform = 'translateY(105%)';
       backdrop.style.opacity = '0';
-      setTimeout(() => { backdrop.style.transition = ''; closeSheet(); }, 210);
+      setTimeout(() => { backdrop.style.transition = ''; closeSheet({ instant: true }); }, 210);
     } else {
       sheet.style.transform = '';
       backdrop.style.opacity = '';
@@ -725,7 +753,7 @@ function renderSigned() {
         <div class="row-sub">${esc(s.version || '—')} · ${esc(s.certLabel)}</div>
         <div class="row-sub">Signed ${ago(s.signedAt)} · ${fmtSize(s.size)}</div>
       </div>
-      ${s.fileAvailable ? `<a class="pill" href="${esc(s.installUrl)}" data-stop>Get</a>` : `<button class="pill dim" data-act="resign" data-id="${s.id}">Re-sign</button>`}
+      ${s.fileAvailable ? `<button class="pill" data-act="install" data-id="${s.id}">Get</button>` : `<button class="pill dim" data-act="resign" data-id="${s.id}">Re-sign</button>`}
     </div>`;
   };
   return `${notes.length ? `<p class="hint" style="margin:0 4px 10px">${notes.join(' ')}</p>` : ''}
@@ -922,6 +950,7 @@ function bindView(view) {
         sign: () => signSheet(idv),
         signed: () => signedSheet(idv),
         resign: () => resignFromSigned(idv),
+        install: () => startInstall(state.signed.find((x) => x.id === idv)),
         'toggle-select-mode': () => { state.lib.select = !state.lib.select; state.lib.selected.clear(); render(); },
         'toggle-select': () => { const s = state.lib.selected; s.has(idv) ? s.delete(idv) : s.add(idv); render(); },
         'manage-cats': manageCategoriesSheet,
@@ -945,11 +974,23 @@ function bindView(view) {
 }
 
 function switchTab(tab) {
+  const keys = tabsFor().map(([k]) => k);
+  const from = keys.indexOf(state.tab);
+  const to = keys.indexOf(tab);
+  const same = tab === state.tab;
   state.tab = tab;
   state.lib.select = false;
   state.lib.selected.clear();
-  render();
   window.scrollTo(0, 0);
+  render();
+  if (same || reducedMotion()) return;
+  // Slide the new page in from the side you tapped toward, and let its rows ripple in.
+  const view = $('#view');
+  view.classList.remove('slide-left', 'slide-right', 'enter');
+  void view.offsetWidth;
+  view.classList.add(to > from ? 'slide-right' : 'slide-left', 'enter');
+  clearTimeout(switchTab.timer);
+  switchTab.timer = setTimeout(() => view.classList.remove('slide-left', 'slide-right', 'enter'), 700);
 }
 
 async function maintenance(action) {
@@ -1469,7 +1510,7 @@ function showSigned(s, opts = {}) {
       <p class="muted small">${esc(s.name)} ${esc(s.version || '')} · ${fmtSize(s.size)}</p>
       ${https ? '' : '<p class="warning bad">Install needs HTTPS. Generate a Railway domain and open the app from it.</p>'}
       <div class="actions" style="margin-top:14px">
-        <a class="btn primary big block" href="${esc(s.installUrl)}">Install</a>
+        <button class="btn primary big block" data-install="${s.id}">Install</button>
         <button class="btn block" id="okShare">Copy install link</button>
         <button class="btn block" id="okDone">Done</button>
       </div>
@@ -1501,7 +1542,7 @@ function signedSheet(sid) {
       ${extras.length ? `<dt>Changes</dt><dd>${esc(extras.join(', '))}</dd>` : ''}
     </dl>
     <div class="actions">
-      ${s.fileAvailable ? `<a class="btn primary big block" href="${esc(s.installUrl)}">Install</a>
+      ${s.fileAvailable ? `<button class="btn primary big block" data-install="${s.id}">Install</button>
       <button class="btn block" id="gShare">Copy install link</button>
       <a class="btn block" href="${esc(s.downloadUrl)}">Download signed .ipa</a>` : ''}
       <button class="btn ${s.fileAvailable ? '' : 'primary big'} block" id="gResign">Sign again</button>
@@ -1521,6 +1562,118 @@ function signedSheet(sid) {
       try { await api('DELETE', `/api/signed/${s.id}`); closeSheet(); toast('Deleted'); await refresh(); } catch (e) { toast(e.message, true); }
     };
   });
+}
+
+// ---------- install progress ----------
+document.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-install]');
+  if (!b) return;
+  e.preventDefault();
+  const s = state.signed.find((x) => x.id === b.dataset.install) || installSheet.last;
+  if (s) startInstall(s);
+});
+
+// Starts the iPhone's install pop-up right away (it has to happen during the tap), then shows live progress.
+function startInstall(s) {
+  if (!s) return;
+  if (!state.server.https) toast('Install needs HTTPS — open Mango Signer from your Railway link', true);
+  location.href = s.installUrl;
+  api('POST', `/api/signed/${s.id}/install`).catch((e) => toast(e.message, true));
+  installSheet(s);
+}
+
+const RING = 2 * Math.PI * 52;
+function installSheet(s) {
+  installSheet.last = s;
+  const token = Symbol('install');
+  installSheet.token = token;
+  const opened = Date.now();
+  let lastSent = 0, lastT = Date.now(), rate = 0, doneSeen = 0;
+
+  openSheet(`
+    <div class="install-wrap">
+      <div class="ring-wrap">
+        <svg class="ring" viewBox="0 0 120 120">
+          <circle class="ring-bg" cx="60" cy="60" r="52"/>
+          <circle class="ring-fg" id="iRing" cx="60" cy="60" r="52" stroke-dasharray="${RING}" stroke-dashoffset="${RING}"/>
+        </svg>
+        <div class="ring-icon">${signedIcon(s, true)}</div>
+        <div class="ring-check hidden" id="iCheck">${ICONS.check}</div>
+      </div>
+      <div class="install-pct" id="iPct"></div>
+      <h2 id="iTitle">Waiting for your iPhone…</h2>
+      <p class="muted" id="iSub">A pop-up should appear — tap <b>Install</b>.</p>
+      <ol class="steps" id="iSteps">
+        <li data-step="confirm">Install pop-up</li>
+        <li data-step="downloading">Downloading</li>
+        <li data-step="done">Finishing on Home Screen</li>
+      </ol>
+      <p class="warning hidden" id="iHint"></p>
+      <div class="actions">
+        <button class="btn block" id="iRetry">Try again</button>
+        <button class="btn primary block" id="iDone">Done</button>
+      </div>
+    </div>`, (el) => {
+    $('#iRetry', el).onclick = () => startInstall(s);
+    $('#iDone', el).onclick = closeSheet;
+  });
+
+  const body = $('#sheetBody');
+  const setStep = (phase) => {
+    const order = ['confirm', 'downloading', 'done'];
+    const at = order.indexOf(phase);
+    body.querySelectorAll('#iSteps li').forEach((li, i) => {
+      li.classList.toggle('on', i <= at);
+      li.classList.toggle('now', i === at && phase !== 'done');
+    });
+  };
+  const hint = (text) => { const h = $('#iHint', body); if (!h) return; h.textContent = text || ''; h.classList.toggle('hidden', !text); };
+
+  const tick = async () => {
+    if (installSheet.token !== token || !$('#iRing')) return;
+    let st;
+    try { st = (await api('GET', `/api/signed/${s.id}/install`)).install; } catch { setTimeout(tick, 1500); return; }
+    if (installSheet.token !== token || !$('#iRing')) return;
+    const ring = $('#iRing', body);
+    const now = Date.now();
+    if (st.phase === 'downloading' || st.phase === 'done') {
+      const dt = (now - lastT) / 1000;
+      if (dt > 0.4) { const inst = (st.sent - lastSent) / dt; rate = rate ? rate * 0.6 + inst * 0.4 : inst; lastSent = st.sent; lastT = now; }
+    }
+    const pct = st.phase === 'done' ? 1 : st.phase === 'downloading' ? st.progress : st.phase === 'confirm' ? 0.04 : 0;
+    ring.style.strokeDashoffset = String(RING * (1 - pct));
+    setStep(st.phase);
+    const title = $('#iTitle', body), sub = $('#iSub', body), pctEl = $('#iPct', body);
+    if (st.phase === 'waiting' || st.phase === 'idle') {
+      title.textContent = 'Waiting for your iPhone…';
+      sub.innerHTML = 'A pop-up should appear — tap <b>Install</b>.';
+      pctEl.textContent = '';
+      hint(now - opened > 15000 ? "Nothing popped up? Tap Try again. If it still doesn't, make sure you opened Mango Signer from your https link in Safari." : '');
+    } else if (st.phase === 'confirm') {
+      title.textContent = 'Tap Install on the pop-up';
+      sub.textContent = `Your iPhone is asking to install ${s.name}.`;
+      pctEl.textContent = '';
+      hint(now - (st.manifestAt || now) > 30000 ? "Tapped Cancel by accident? Tap Try again to bring the pop-up back." : '');
+    } else if (st.phase === 'downloading') {
+      const p = Math.floor(st.progress * 100);
+      title.textContent = 'Installing…';
+      pctEl.textContent = `${p}%`;
+      sub.textContent = `${fmtSize(st.sent)} of ${fmtSize(st.size)}${rate > 1024 ? ` · ${fmtSize(rate)}/s · ${fmtTime((st.size - st.sent) / rate)} left` : ''}`;
+      hint('');
+    } else if (st.phase === 'done') {
+      if (!doneSeen) doneSeen = now;
+      pctEl.textContent = '100%';
+      title.textContent = 'Downloaded ✓';
+      sub.textContent = 'Your iPhone is finishing the install — check your Home Screen.';
+      $('#iCheck', body).classList.remove('hidden');
+      body.querySelector('.ring-wrap').classList.add('complete');
+      hint("If your iPhone says “Unable to Install”, the certificate is revoked or your iPhone isn't in its profile.");
+      $('#iRetry', body).textContent = 'Install again';
+      if (now - doneSeen > 4000) return; // stop checking a little after it finishes
+    }
+    setTimeout(tick, document.visibilityState === 'visible' ? 600 : 2000);
+  };
+  setTimeout(tick, 400);
 }
 
 // ---------- certificates ----------
@@ -1799,6 +1952,7 @@ async function boot() {
   state.account = s.account;
   $('#login').classList.add('hidden');
   $('#app').classList.remove('hidden');
+  $('#app').classList.add('app-in');
   await refresh();
   maybeShowWhatsNew();
 }
