@@ -205,7 +205,7 @@ const MIME = {
   '.ipa': 'application/octet-stream', '.plist': 'text/xml; charset=utf-8',
 };
 
-async function serveFile(req, res, file, { type, download, cache = 'no-store' } = {}) {
+async function serveFile(req, res, file, { type, download, cache = 'no-store', onBytes, onDone } = {}) {
   let st;
   try { st = await fsp.stat(file); } catch { return fail(res, 404, 'Not found'); }
   if (!st.isFile()) return fail(res, 404, 'Not found');
@@ -223,11 +223,14 @@ async function serveFile(req, res, file, { type, download, cache = 'no-store' } 
     if (start > end) { res.writeHead(416, { 'Content-Range': `bytes */${st.size}` }); return res.end(); }
     res.writeHead(206, { ...headers, 'Content-Range': `bytes ${start}-${end}/${st.size}`, 'Content-Length': end - start + 1 });
     if (req.method === 'HEAD') return res.end();
-    return pipeline(fs.createReadStream(file, { start, end }), res).catch(() => {});
+    return pipeline(fs.createReadStream(file, { start, end }), counter(onBytes), res).then(() => onDone && onDone(), () => {});
   }
   res.writeHead(200, { ...headers, 'Content-Length': st.size });
   if (req.method === 'HEAD') return res.end();
-  return pipeline(fs.createReadStream(file), res).catch(() => {});
+  return pipeline(fs.createReadStream(file), counter(onBytes), res).then(() => onDone && onDone(), () => {});
+}
+function counter(onBytes) {
+  return new Transform({ transform(chunk, _enc, cb) { if (onBytes) onBytes(chunk.length); cb(null, chunk); } });
 }
 
 // Temp uploads belong to whoever uploaded them. Chunked uploads track how much has arrived.
@@ -1338,6 +1341,30 @@ route('DELETE', /^\/api\/users\/([a-f0-9]{16})$/, async (req, res, m) => {
 // ----- public install endpoints (iOS fetches these without cookies) -----
 const findByToken = (t) => store.signed.find((s) => s.token === t);
 
+// Live install progress. iOS can't tell a website when an install finishes, but we can see it ask
+// for the install details (after the confirmation pop-up appears) and download the app from us.
+const installs = new Map(); // signed id -> { phase, startedAt, manifestAt, downloadAt, sent, size, doneAt }
+function installState(s) {
+  let st = installs.get(s.id);
+  if (!st) { st = { phase: 'idle', sent: 0, size: s.size }; installs.set(s.id, st); }
+  return st;
+}
+function resetInstall(s) {
+  const st = { phase: 'waiting', startedAt: Date.now(), sent: 0, size: s.size };
+  installs.set(s.id, st);
+  return st;
+}
+function installView(st) {
+  return {
+    phase: st.phase, sent: Math.min(st.sent, st.size || st.sent), size: st.size,
+    progress: st.size ? Math.min(1, st.sent / st.size) : 0,
+    startedAt: st.startedAt || null, manifestAt: st.manifestAt || null, downloadAt: st.downloadAt || null, doneAt: st.doneAt || null,
+  };
+}
+setInterval(() => {
+  for (const [k, v] of installs) if (Date.now() - (v.doneAt || v.downloadAt || v.manifestAt || v.startedAt || 0) > 60 * 60 * 1000) installs.delete(k);
+}, 10 * 60 * 1000).unref();
+
 route('GET', /^\/i\/([\w-]{20,40})\/manifest\.plist$/, (req, res, m) => {
   const s = findByToken(m[1]);
   if (!s || s.fileDeleted) return fail(res, 404, 'Link expired');
@@ -1353,13 +1380,55 @@ route('GET', /^\/i\/([\w-]{20,40})\/manifest\.plist$/, (req, res, m) => {
       metadata: { 'bundle-identifier': s.bundleId, 'bundle-version': s.version || '1.0', kind: 'software', title: s.name },
     }],
   });
+  const st = installState(s);
+  if (st.phase === 'idle' || st.phase === 'done') Object.assign(st, { startedAt: Date.now(), sent: 0, doneAt: null });
+  Object.assign(st, { phase: 'confirm', manifestAt: Date.now() });
   send(res, 200, body, { 'Content-Type': 'text/xml; charset=utf-8' });
 }, 'open');
 
 route('GET', /^\/i\/([\w-]{20,40})\/app\.ipa$/, (req, res, m) => {
   const s = findByToken(m[1]);
   if (!s || s.fileDeleted) return fail(res, 404, 'Link expired');
-  return serveFile(req, res, path.join(dirs.signed, s.id + '.ipa'), { download: `${s.name}.ipa` });
+  if (req.method === 'HEAD') return serveFile(req, res, path.join(dirs.signed, s.id + '.ipa'));
+  const st = installState(s);
+  if (st.phase !== 'downloading') Object.assign(st, { phase: 'downloading', downloadAt: Date.now(), sent: 0, doneAt: null });
+  // A range request continues an earlier download, so count from where it starts.
+  const range = (req.headers.range || '').match(/^bytes=(\d+)-/);
+  if (range) st.sent = Math.max(st.sent, Number(range[1]));
+  return serveFile(req, res, path.join(dirs.signed, s.id + '.ipa'), {
+    download: `${s.name}.ipa`,
+    onBytes: (n) => { st.sent += n; },
+    onDone: () => { if (st.sent >= st.size) Object.assign(st, { phase: 'done', doneAt: Date.now(), sent: st.size }); },
+  });
+}, 'open');
+
+// The app tells us an install is starting, then checks progress.
+route('POST', /^\/api\/signed\/([a-f0-9]{16})\/install$/, (req, res, m, acc) => {
+  const s = store.signed.find((x) => x.id === m[1] && x.ownerId === acc.id);
+  if (!s) return fail(res, 404, 'Not found');
+  if (s.fileDeleted) return fail(res, 410, 'This signed file was cleaned up — sign it again');
+  const cur = installs.get(s.id);
+  // If the iPhone already asked for the app a moment ago, keep that progress instead of resetting it.
+  const fresh = cur && Date.now() - Math.max(cur.manifestAt || 0, cur.downloadAt || 0) < 5000;
+  json(res, { install: installView(fresh ? cur : resetInstall(s)) });
+});
+route('GET', /^\/api\/signed\/([a-f0-9]{16})\/install$/, (req, res, m, acc) => {
+  const s = store.signed.find((x) => x.id === m[1] && x.ownerId === acc.id);
+  if (!s) return fail(res, 404, 'Not found');
+  json(res, { install: installView(installState(s)) });
+});
+// Same for shared install pages (anyone with the link).
+route('POST', /^\/i\/([\w-]{20,40})\/status$/, (req, res, m) => {
+  const s = findByToken(m[1]);
+  if (!s || s.fileDeleted) return fail(res, 404, 'Link expired');
+  const cur = installs.get(s.id);
+  const fresh = cur && Date.now() - Math.max(cur.manifestAt || 0, cur.downloadAt || 0) < 5000;
+  json(res, { install: installView(fresh ? cur : resetInstall(s)) });
+}, 'open');
+route('GET', /^\/i\/([\w-]{20,40})\/status$/, (req, res, m) => {
+  const s = findByToken(m[1]);
+  if (!s || s.fileDeleted) return fail(res, 404, 'Link expired');
+  json(res, { install: installView(installState(s)) });
 }, 'open');
 
 route('GET', /^\/i\/([\w-]{20,40})\/icon\.png$/, (req, res, m) => {
