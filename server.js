@@ -639,17 +639,22 @@ route('POST', /^\/api\/upload$/, async (req, res, m, acc) => {
   json(res, { uploadId: uid, size });
 });
 
-// Resumable uploads: start, send chunks at an offset, ask how much arrived.
+// Resumable, parallel uploads: the file is split into numbered pieces that can arrive in any order,
+// several at once. If the connection drops, the phone asks which pieces are missing and sends just those.
 route('POST', /^\/api\/upload\/start$/, async (req, res, m, acc) => {
-  const { size } = await readJson(req);
+  const { size, chunkSize } = await readJson(req);
   const total = Number(size);
   const limit = isOwner(acc) ? MAX_UPLOAD : MAX_USER_UPLOAD;
   if (!Number.isFinite(total) || total <= 0) return fail(res, 400, 'Empty file');
   if (total > limit) return fail(res, 413, 'File is too large');
+  const piece = Math.min(32, Math.max(1, Math.round(Number(chunkSize) / 1048576) || 8)) * 1048576;
   const uid = id();
-  await fsp.writeFile(path.join(dirs.tmp, uid), Buffer.alloc(0));
-  uploads.set(uid, { owner: acc.id, size: total, received: 0 });
-  json(res, { uploadId: uid, received: 0 });
+  const file = path.join(dirs.tmp, uid);
+  await fsp.writeFile(file, Buffer.alloc(0));
+  await fsp.truncate(file, total); // reserve the full size so pieces can be written anywhere
+  const count = Math.ceil(total / piece);
+  uploads.set(uid, { owner: acc.id, size: total, chunkSize: piece, count, done: new Set(), active: new Set(), received: 0 });
+  json(res, { uploadId: uid, chunkSize: piece, count });
 });
 
 function ownUpload(acc, uid) {
@@ -660,39 +665,40 @@ function ownUpload(acc, uid) {
 
 route('GET', /^\/api\/upload\/([a-f0-9]{16})$/, (req, res, m, acc) => {
   const u = ownUpload(acc, m[1]);
-  json(res, { received: u.received, size: u.size });
+  json(res, { received: u.received, size: u.size, done: [...(u.done || [])] });
 });
 
 route('PUT', /^\/api\/upload\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
   const u = ownUpload(acc, m[1]);
-  const offset = Number(req.query.get('offset'));
-  const reject = async (body) => {
+  const index = Number(req.query.get('index'));
+  const reject = async (status, body) => {
     // Read and throw away the body first, so the phone gets a clean answer instead of a dropped connection.
     req.resume();
     await new Promise((r) => { req.on('end', r); req.on('error', r); req.on('close', r); });
-    json(res, { received: u.received, ...body }, 409);
+    json(res, { received: u.received, ...body }, status);
   };
-  if (offset !== u.received) return reject({ mismatch: true });
-  if (u.busy) return reject({ busy: true });
-  u.busy = true;
+  if (!u.done || !Number.isInteger(index) || index < 0 || index >= u.count) return reject(400, { error: 'Bad piece number' });
+  if (u.done.has(index)) return reject(200, { already: true, done: u.received === u.size });
+  if (u.active.has(index)) return reject(409, { busy: true });
+  u.active.add(index);
+  const start = index * u.chunkSize;
+  const expected = Math.min(u.chunkSize, u.size - start);
   const file = path.join(dirs.tmp, m[1]);
   let got = 0;
   const limiter = new Transform({
     transform(chunk, _enc, cb) {
       got += chunk.length;
-      if (got > 32 * 1024 * 1024 || u.received + got > u.size) return cb(httpError(413, 'Chunk too large'));
+      if (got > expected) return cb(httpError(413, 'Piece too large'));
       cb(null, chunk);
     },
   });
   try {
-    await pipeline(req, limiter, fs.createWriteStream(file, { flags: 'r+', start: offset }));
-    u.received = offset + got;
-  } catch (e) {
-    // Keep only what fully arrived: trim the file back to the last good offset.
-    await fsp.truncate(file, u.received).catch(() => {});
-    throw e;
+    await pipeline(req, limiter, fs.createWriteStream(file, { flags: 'r+', start }));
+    if (got !== expected) throw httpError(400, 'Piece was cut off — sending it again');
+    u.done.add(index);
+    u.received += got;
   } finally {
-    u.busy = false;
+    u.active.delete(index);
   }
   json(res, { received: u.received, done: u.received === u.size });
 });
