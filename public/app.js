@@ -111,7 +111,19 @@ function xhrSend(method, url, body, onProgress) {
   });
 }
 
-// Uploads a file in resumable chunks. If the connection drops it waits and continues where it left off.
+// Upload speed setting (saved on this device): how many pieces are sent at the same time.
+const UPLOAD_MODES = [
+  { streams: 1, label: 'Normal', sub: 'One piece at a time' },
+  { streams: 3, label: 'Fast', sub: '3 pieces at once' },
+  { streams: 6, label: 'Turbo', sub: '6 pieces at once' },
+  { streams: 10, label: 'Max', sub: '10 pieces at once — best on strong Wi-Fi' },
+];
+function uploadStreams() {
+  try { return Number(localStorage.getItem('mango.uploadStreams')) || 6; } catch { return 6; }
+}
+
+// Uploads a file in numbered pieces, several at once. If the connection drops it waits,
+// asks which pieces are missing, and sends only those.
 async function uploadFile(file, onProgress, onStatus) {
   const CHUNK = 8 * 1024 * 1024;
   uploadFile.active = (uploadFile.active || 0) + 1;
@@ -122,35 +134,63 @@ async function uploadFile(file, onProgress, onStatus) {
       onProgress && onProgress(1);
       return data;
     }
-    const { uploadId } = await api('POST', '/api/upload/start', { size: file.size });
-    let received = 0;
+    const { uploadId, chunkSize, count } = await api('POST', '/api/upload/start', { size: file.size, chunkSize: CHUNK });
+    const done = new Set();
+    const inFlight = new Map(); // piece -> bytes sent so far
+    let doneBytes = 0;
     let failures = 0;
+    let next = 0;
     const started = Date.now();
-    while (received < file.size) {
-      const end = Math.min(file.size, received + CHUNK);
-      try {
-        const { status, data } = await xhrSend('PUT', `/api/upload/${uploadId}?offset=${received}`, file.slice(received, end), (n) => {
-          const done = received + n;
-          onProgress && onProgress(done / file.size);
-          if (onStatus) {
-            const secs = (Date.now() - started) / 1000;
-            const rate = done / Math.max(1, secs);
-            const left = (file.size - done) / Math.max(1, rate);
-            onStatus(`${fmtSize(done)} of ${fmtSize(file.size)} · ${fmtSize(rate)}/s · ${fmtTime(left)} left`);
-          }
-        });
-        if (status === 409 && data.busy) { await sleep(1500); continue; }
-        received = data.received;
-        failures = 0;
-      } catch (e) {
-        if (e.fatal) throw e;
-        failures++;
-        if (failures > 30) throw new Error('Upload keeps failing — check your connection and try again');
-        onStatus && onStatus(`Connection dropped — retrying (${failures})…`);
-        await sleep(Math.min(15000, 1000 * failures));
-        try { received = (await api('GET', `/api/upload/${uploadId}`)).received; } catch (err) { if (err.status === 404) throw err; }
+    const pieceSize = (i) => Math.min(chunkSize, file.size - i * chunkSize);
+
+    const report = () => {
+      let sent = doneBytes;
+      for (const n of inFlight.values()) sent += n;
+      onProgress && onProgress(Math.min(1, sent / file.size));
+      if (onStatus && failures === 0) {
+        const secs = Math.max(1, (Date.now() - started) / 1000);
+        const rate = sent / secs;
+        onStatus(`${fmtSize(sent)} of ${fmtSize(file.size)} · ${fmtSize(rate)}/s · ${fmtTime((file.size - sent) / Math.max(1, rate))} left`);
       }
-    }
+    };
+    const takePiece = () => {
+      while (next < count && (done.has(next) || inFlight.has(next))) next++;
+      if (next < count) return next++;
+      for (let i = 0; i < count; i++) if (!done.has(i) && !inFlight.has(i)) return i; // retry missed pieces
+      return -1;
+    };
+
+    const worker = async () => {
+      for (;;) {
+        const i = takePiece();
+        if (i < 0) return;
+        inFlight.set(i, 0);
+        try {
+          const start = i * chunkSize;
+          const { status, data } = await xhrSend('PUT', `/api/upload/${uploadId}?index=${i}`, file.slice(start, start + pieceSize(i)), (n) => { inFlight.set(i, n); report(); });
+          inFlight.delete(i);
+          if (status === 409 && data.busy) { await sleep(1500); continue; }
+          if (!done.has(i)) { done.add(i); doneBytes += pieceSize(i); }
+          failures = 0;
+          report();
+        } catch (e) {
+          inFlight.delete(i);
+          if (e.fatal) throw e;
+          failures++;
+          if (failures > 40) throw new Error('Upload keeps failing — check your connection and try again');
+          onStatus && onStatus(`Connection dropped — retrying (${failures})…`);
+          await sleep(Math.min(15000, 800 * failures));
+          try {
+            const st = await api('GET', `/api/upload/${uploadId}`);
+            for (const d of st.done || []) if (!done.has(d)) { done.add(d); doneBytes += pieceSize(d); }
+          } catch (err) { if (err.status === 404) throw err; }
+        }
+      }
+    };
+
+    const streams = Math.max(1, Math.min(uploadStreams(), count));
+    await Promise.all(Array.from({ length: streams }, worker));
+    if (done.size < count) throw new Error('Upload didn\'t finish — try again');
     onProgress && onProgress(1);
     return { uploadId, size: file.size };
   } finally {
@@ -778,6 +818,8 @@ function accountSection() {
   return `
     <div class="section-title">Account</div>
     <div class="list">
+      <div class="setting"><span>Upload speed<br><span class="hint">Saved on this device</span></span>
+        <select data-act="upload-speed">${UPLOAD_MODES.map((m) => `<option value="${m.streams}" ${m.streams === uploadStreams() ? 'selected' : ''}>${m.label}</option>`).join('')}</select></div>
       <button class="row" data-act="whats-new"><span class="row-main" style="font-weight:600">✨ What's New</span><span class="value muted">V${esc(CLIENT_VERSION || state.server.version || '')} ›</span></button>
       <div class="setting"><span>Username</span><span class="value">${esc(a.username)}</span></div>
       <div class="setting"><span>iPhone</span><span class="value">${a.udid ? `${esc(a.deviceName || 'iPhone')}<br><span class="mono">${esc(shortUdid(a.udid))}</span>` : 'Not linked'}</span></div>
@@ -858,6 +900,14 @@ function bindView(view) {
     const saveSetting = (body, msg = 'Saved') => api('PATCH', '/api/settings', body).then((d) => { state.settings = d.settings; toast(msg); }).catch((e) => toast(e.message, true));
     if (act === 'zip-level') { el.onchange = () => saveSetting({ zipLevel: Number(el.value) }); return; }
     if (act === 'max-signed') { el.onchange = () => saveSetting({ maxSignedPerUser: Number(el.value) }); return; }
+    if (act === 'upload-speed') {
+      el.onchange = () => {
+        try { localStorage.setItem('mango.uploadStreams', el.value); } catch { /* */ }
+        const m = UPLOAD_MODES.find((x) => String(x.streams) === el.value);
+        toast(`Upload speed: ${m.label} (${m.sub.toLowerCase()})`);
+      };
+      return;
+    }
     if (act === 'retention') { el.onchange = () => saveSetting({ signedRetentionDays: Number(el.value) }); return; }
     if (act === 'udid-login') { el.onchange = () => saveSetting({ udidLogin: el.checked }, el.checked ? 'iPhone sign-in on' : 'iPhone sign-in off'); return; }
     if (el.tagName === 'A') return;
