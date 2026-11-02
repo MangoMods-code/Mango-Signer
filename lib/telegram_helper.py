@@ -214,9 +214,36 @@ def friendly(e):
 
 
 # ---------- file streaming ----------
+# Messages are cached for a few minutes: reading one app's info takes several small reads of the same file,
+# and fetching the post again for each one was slow. A stale file reference is refreshed automatically.
+msg_cache = {}
+
+
+async def get_post(ref, msg_id, fresh=False):
+    key = (str(ref).lower(), msg_id)
+    hit = msg_cache.get(key)
+    if hit and not fresh and time.time() - hit[1] < 600:
+        return hit[0]
+    msg = await client.get_messages(await entity(ref), ids=msg_id)
+    msg_cache[key] = (msg, time.time())
+    if len(msg_cache) > 2000:
+        for k in sorted(msg_cache, key=lambda k: msg_cache[k][1])[:500]:
+            msg_cache.pop(k, None)
+    return msg
+
+
+def piece_size(length):
+    """Small reads (reading app info) ask Telegram for small pieces instead of 512 KB each."""
+    size = 65536
+    while size < length and size < PART:
+        size *= 2
+    return size
+
+
 async def stream_file(writer, q, headers):
-    e = await entity(q.get("ref", [""])[0])
-    msg = await client.get_messages(e, ids=int(q.get("msg", ["0"])[0]))  # fresh file reference every time
+    ref = q.get("ref", [""])[0]
+    msg_id = int(q.get("msg", ["0"])[0])
+    msg = await get_post(ref, msg_id)
     if not msg or not msg.document:
         return await send_json(writer, 404, {"error": "That post or file is gone from the channel"})
     size = msg.file.size or 0
@@ -252,20 +279,32 @@ async def stream_file(writer, q, headers):
     await writer.drain()
     if not length:
         return
-    aligned = start - (start % PART)
+    piece = piece_size(length)
+    aligned = start - (start % piece)
     skip = start - aligned
     left = length
-    async for chunk in client.iter_download(msg.document, offset=aligned, request_size=PART, file_size=size):
-        if skip:
-            chunk = chunk[skip:]
-            skip = 0
-        if len(chunk) > left:
-            chunk = chunk[:left]
-        writer.write(chunk)
-        await writer.drain()
-        left -= len(chunk)
-        if left <= 0:
+    sent_any = False
+    for attempt in range(2):
+        try:
+            async for chunk in client.iter_download(msg.document, offset=aligned, request_size=piece, file_size=size):
+                if skip:
+                    chunk = chunk[skip:]
+                    skip = 0
+                if len(chunk) > left:
+                    chunk = chunk[:left]
+                writer.write(chunk)
+                sent_any = True
+                await writer.drain()
+                left -= len(chunk)
+                if left <= 0:
+                    break
             break
+        except Exception as e:
+            # Old file reference: get the post again and retry, as long as nothing was sent yet.
+            if attempt == 0 and not sent_any and "FileReference" in type(e).__name__:
+                msg = await get_post(ref, msg_id, fresh=True)
+                continue
+            raise
 
 
 # ---------- tiny HTTP server ----------
