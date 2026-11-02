@@ -1444,8 +1444,13 @@ function addSourceSheet(prefill = '') {
       const old = btn.textContent;
       btn.textContent = 'Reading source…';
       try {
-        const { source, result } = await api('POST', '/api/sources', { url, showInLibrary: $('#srcShow', el).checked });
+        const { source, result, jobId, waitingFor } = await api('POST', '/api/sources', { url, showInLibrary: $('#srcShow', el).checked });
         await refresh();
+        if (jobId) {
+          // Another check was running: the source is added and its apps come in when it's this one's turn.
+          toast(`Added ${source.name}. Its apps come in after ${waitingFor ? waitingFor[0] : 'the current check'} finishes.`);
+          return tgRunSheet(`Checking ${source.name}…`, jobId, () => sourceSheet(source.id));
+        }
         toast(`Added ${source.name}: ${result.added} app${result.added === 1 ? '' : 's'}`);
         sourceSheet(source.id);
       } catch (e) {
@@ -1494,7 +1499,7 @@ function sourceSheet(sid) {
       <dt>Last refresh</dt><dd>${src.lastSync ? ago(src.lastSync) : 'never'}</dd>
       <dt>Link</dt><dd class="mono small-break">${esc(src.url)}</dd>
     </dl>
-    <p class="hint" style="margin:8px 4px 0">Refreshes by itself every ${src.kind === 'ghrepo' ? '3 hours: each new GitHub release with an .ipa becomes the new version, and older ones stay downloadable' : '6 hours'}. New versions show as UPDATED in the library. Anything you edit on an app (name, category, description…) is kept when it refreshes.</p>
+    <p class="hint" style="margin:8px 4px 0">Refreshes by itself every hour${src.kind === 'ghrepo' ? ': each new GitHub release with an .ipa becomes the new version, and older ones stay downloadable' : ''}. New versions show as UPDATED in the library. Anything you edit on an app (name, category, description…) is kept when it refreshes.</p>
     <div class="group" style="margin-top:12px">${toggle('srcShow', 'Show its apps to everyone', 'Off = only you can see them', src.showInLibrary !== false)}</div>
     <div class="field" style="margin-top:12px"><label>Name in your library</label><input type="text" id="srcName" value="${esc(src.name)}" maxlength="60"></div>
     <div class="actions">
@@ -1517,12 +1522,10 @@ function sourceSheet(sid) {
       const b = e.currentTarget;
       b.disabled = true; b.textContent = 'Refreshing…';
       try {
-        const { result: r } = await api('POST', `/api/sources/${sid}/sync`);
-        await refresh();
-        const bits = [r.added && `${r.added} new`, r.updated && `${r.updated} updated`, r.removed && `${r.removed} removed`].filter(Boolean);
-        toast(bits.length ? bits.join(' · ') : 'Already up to date');
-      } catch (err) { await refresh().catch(() => {}); toast(err.message, true); }
-      sourceSheet(sid);
+        const r = await api('POST', `/api/sources/${sid}/sync`);
+        if (r.waitingFor) toast(`Waiting for ${r.waitingFor[0]} to finish first — it starts right after`);
+        tgRunSheet(`Checking ${src.name}…`, r.jobId, () => sourceSheet(sid));
+      } catch (err) { await refresh().catch(() => {}); toast(err.message, true); sourceSheet(sid); }
     };
     if ($('#srcBrowse', el)) $('#srcBrowse', el).onclick = () => { closeSheet(); state.lib.cat = `src:${src.name}`; state.lib.q = ''; switchTab('library'); };
     $('#srcDel', el).onclick = async () => {
@@ -1596,7 +1599,7 @@ function telegramSheet(step) {
         <span class="row-sub">${c.lastError ? `<span style="color:var(--red)">⚠ ${esc(c.lastError)}</span>` : `${c.apps} app${c.apps === 1 ? '' : 's'} · ${c.lastSync ? 'checked ' + ago(c.lastSync) : 'not checked yet'}${c.options && c.options.storage === 'github' ? ' · GitHub copies' : ''}`}</span></span>
         <span class="value muted">›</span></button>`).join('')}</div>` : ''}
     <button class="file-btn" id="tgAdd" style="margin-top:12px">${ICONS.plus}<div class="row-main"><div class="row-title">Add a channel</div><div class="row-sub">Its @username or t.me link</div></div></button>
-    <p class="hint" style="margin:10px 4px 0">Channels are checked every 10 minutes. Only posts with an .ipa file are looked at.</p>
+    <p class="hint" style="margin:10px 4px 0">Channels, GitHub repos and sources are checked every hour, one at a time. Only posts with an .ipa file are looked at.</p>
     <div class="actions"><button class="btn block danger" id="tgOff">Disconnect Telegram</button></div>`, (el) => {
     el.querySelectorAll('[data-ch]').forEach((b) => { b.onclick = () => tgChannelSheet(b.dataset.ch); });
     $('#tgAdd', el).onclick = () => tgChannelSheet(null);
@@ -1620,7 +1623,7 @@ function tgOptionsHtml(o = {}, src = {}) {
       ${toggle('tcMine', 'Update apps I added myself', 'If the channel posts a newer version of an app you uploaded, replace yours with it', !!o.updateMine)}
       ${toggle('tcName', 'Also match by app name', 'For channels that change the bundle ID between builds', !!o.matchName)}
       ${toggle('tcNotes', 'Use the post\'s text as “What\'s new”', 'Promo lines (Tap Here, links, @mentions) are left out', o.captionNotes !== false)}
-      ${toggle('tcAuto', 'Check automatically', 'Every 10 minutes', o.autoSync !== false)}
+      ${toggle('tcAuto', 'Check automatically', 'Every hour', o.autoSync !== false)}
       ${toggle('tcShow', 'Show its apps to everyone', 'Off = only you can see them until you turn it on', src.showInLibrary !== false)}
     </div>
     <div class="field" style="margin-top:12px"><label>Only import posts that mention</label><input type="text" id="tcWords" value="${esc(o.keywords || '')}" placeholder="Optional, e.g. mortal kombat, youtube" autocapitalize="off"><div class="hint">Comma-separated. Leave empty to import every .ipa.</div></div>
@@ -1650,6 +1653,9 @@ function tgRunSheet(title, jobId, back) {
     if (j.counter) $('#trCount', body).textContent = `${j.counter.done.toLocaleString()}${j.counter.total ? ' / ' + j.counter.total.toLocaleString() : ''} ${j.counter.label}`;
     const log = $('#trLog', body);
     log.textContent = j.log.join('\n'); log.scrollTop = log.scrollHeight;
+    // Waiting in line behind another check.
+    if (j.status === 'queued') { $('#trTitle', body).textContent = 'Waiting its turn…'; $('#trSub', body).textContent = 'Only one channel, repo or source is checked at a time. This starts by itself when the one ahead finishes.'; }
+    else if (j.status === 'running' && $('#trTitle', body).textContent === 'Waiting its turn…') { $('#trTitle', body).textContent = title; $('#trSub', body).textContent = 'This can take a while for big files'; }
     if (j.progress != null) { $('#trBar', body).classList.remove('hidden'); $('#trBar > div', body).style.width = `${Math.round(j.progress * 100)}%`; } else $('#trBar', body).classList.add('hidden');
   }).then(async (r) => {
     if (tgRunSheet.detached === jobId) return refresh().catch(() => {});
@@ -1688,7 +1694,8 @@ function tgScanSheet(src) {
     $('#dsBack', el).onclick = () => tgChannelSheet(src.id);
     $('#dsGo', el).onclick = async () => {
       try {
-        const { jobId } = await api('POST', `/api/sources/${src.id}/scan`, { count: Number($('#dsCount', el).value), quick: $('#dsQuick', el).checked, recheck: $('#dsRecheck', el).checked });
+        const { jobId, waitingFor } = await api('POST', `/api/sources/${src.id}/scan`, { count: Number($('#dsCount', el).value), quick: $('#dsQuick', el).checked, recheck: $('#dsRecheck', el).checked });
+        if (waitingFor) toast(`Waiting for ${waitingFor[0]} to finish first — it starts right after`);
         tgRunSheet(`Scanning ${src.name}…`, jobId, () => tgChannelSheet(src.id));
       } catch (e) { toast(e.message, true); }
     };
@@ -1749,7 +1756,11 @@ function tgChannelSheet(sid) {
     bindExcluded(el, src, () => tgChannelSheet(sid));
     $('#tcBackBtn', el).onclick = () => telegramSheet();
     $('#tcSync', el).onclick = async () => {
-      try { const { jobId } = await api('POST', `/api/sources/${src.id}/sync`); tgRunSheet(`Checking ${src.name}…`, jobId, () => tgChannelSheet(src.id)); } catch (e) { toast(e.message, true); }
+      try {
+        const { jobId, waitingFor } = await api('POST', `/api/sources/${src.id}/sync`);
+        if (waitingFor) toast(`Waiting for ${waitingFor[0]} to finish first — it starts right after`);
+        tgRunSheet(`Checking ${src.name}…`, jobId, () => tgChannelSheet(src.id));
+      } catch (e) { toast(e.message, true); }
     };
     if ($('#tcDelMissing', el)) $('#tcDelMissing', el).onclick = () => deleteRemovedApps(sid, tcMissing);
     $('#tcDeep', el).onclick = () => tgScanSheet(src);
@@ -2120,7 +2131,7 @@ function tasksSheet(redraw) {
           <div class="row-sub">${esc(j.error || j.last || '')}</div>
           <div class="row-sub muted small">started ${ago(new Date(j.started).toISOString())}</div>
         </div>
-        ${j.cancellable && j.status === 'running' ? `<button class="pill danger-pill" data-stop="${j.id}">Stop</button>` : ''}
+        ${j.cancellable && ['running', 'queued'].includes(j.status) ? `<button class="pill danger-pill" data-stop="${j.id}">${j.status === 'queued' ? 'Cancel' : 'Stop'}</button>` : ''}
       </div>`).join('') || '<p class="hint">Nothing running right now.</p>'}</div>`;
   if (redraw === true && $('#sheetBody .tasks-list')) { $('#sheetBody').innerHTML = html; bindTasks($('#sheetBody')); return; }
   openSheet(html, bindTasks);
