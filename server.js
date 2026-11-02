@@ -394,12 +394,105 @@ const storageFullMessage = () => {
 };
 const isNoSpace = (e) => e && (e.code === 'ENOSPC' || e.code === 'EDQUOT' || /ENOSPC|no space left/i.test(String(e.message)));
 
+// ----- signed apps kept on GitHub -----
+// With GitHub storage connected (private repo), every signed app is also saved to a "Mango Signed" release.
+// The copy on this server is used for the first install and then removed; after that installs stream from
+// GitHub. The signed app stays in the Signed tab until it's deleted (which deletes it from GitHub too),
+// or until its certificate expires and it couldn't be installed anyway.
+const SIGNED_TAG = 'mango-signed';
+function signedToGithubOn() {
+  const g = ghSettings();
+  return !!(g && g.private && g.signedToGithub !== false && ghClient());
+}
+const signedReady = (s) => !s.fileDeleted || !!(s.gh && ghClient());
+const archiveFailedForGood = (s) => (s.archiveTries || 0) >= 5;
+async function signedRelease(gh) {
+  const g = ghSettings();
+  let r = g.signedRelease;
+  // A GitHub release holds up to 1,000 files, so start a new one (mango-signed-2, -3…) before that.
+  if (!r || r.count >= 950) {
+    const n = r ? (r.n || 1) + 1 : 1;
+    const tag = n === 1 ? SIGNED_TAG : `${SIGNED_TAG}-${n}`;
+    const rel = await gh.ensureRelease(tag, { name: n === 1 ? 'Mango Signed' : `Mango Signed ${n}`, body: 'Signed apps from Mango Signer. Managed automatically: deleting an app from the Signed tab deletes it here.' });
+    const count = n === 1 && !r ? (await gh.listAssets(rel.id).catch(() => [])).length : 0;
+    r = g.signedRelease = { id: rel.id, tag, n, count };
+    store.save();
+    if (count >= 950) return signedRelease(gh);
+  }
+  return r;
+}
+let archiving = false;
+// Uploads signed apps that aren't on GitHub yet, one at a time, in the background.
+async function archiveSigned() {
+  if (archiving || !signedToGithubOn()) return;
+  archiving = true;
+  try {
+    for (;;) {
+      const s = store.signed.find((x) => !x.gh && !x.fileDeleted && !archiveFailedForGood(x) && !(x.expires && new Date(x.expires) < Date.now()) && (!x.archiveAfter || Date.now() > x.archiveAfter));
+      if (!s || !signedToGithubOn()) break;
+      const file = path.join(dirs.signed, s.id + '.ipa');
+      const st = await fsp.stat(file).catch(() => null);
+      if (!st) { s.archiveTries = 5; continue; }
+      const gh = ghClient();
+      try {
+        const rel = await signedRelease(gh);
+        const name = `signed-${normName(s.name).slice(0, 40) || 'app'}-${(s.version || 'v').replace(/[^\w.]/g, '')}-${s.id}.ipa`;
+        const asset = await gh.uploadStream(rel.id, name, Readable.toWeb(fs.createReadStream(file)), st.size, null);
+        ghSettings().signedRelease.count++;
+        if (!store.signed.includes(s)) { await gh.deleteAsset(asset.id).catch(() => {}); continue; } // deleted while uploading
+        s.gh = { assetId: asset.id, releaseId: rel.id };
+        delete s.archiveTries; delete s.archiveAfter;
+        store.save();
+      } catch (e) {
+        s.archiveTries = (s.archiveTries || 0) + 1;
+        s.archiveAfter = Date.now() + 5 * 60_000 * s.archiveTries;
+        store.save();
+        console.error(`Saving ${s.name} to GitHub failed:`, e.message);
+        break;
+      }
+    }
+  } finally { archiving = false; }
+}
+setInterval(() => archiveSigned().catch(() => {}), 10 * 60_000).unref();
+setTimeout(() => archiveSigned().catch(() => {}), 60_000).unref();
+async function dropSignedCopy(s) {
+  if (!s.gh) return;
+  const gh = ghClient();
+  const assetId = s.gh.assetId;
+  s.gh = null;
+  if (gh) await gh.deleteAsset(assetId);
+  const r = ghSettings() && ghSettings().signedRelease;
+  if (r && r.count > 0) r.count--;
+  store.save();
+}
+// Streams a signed app from GitHub to the iPhone (Range requests pass through, so resumed downloads work).
+async function serveSignedFromGithub(req, res, s, onBytes) {
+  const gh = ghClient();
+  let link;
+  try { link = await gh.directLink(s.gh.assetId); } catch (e) {
+    if (e.status === 404) { s.gh = null; store.save(); }
+    return fail(res, e.status === 404 ? 404 : 502, e.status === 404 ? 'This signed app is gone from GitHub. Sign it again.' : "Couldn't get the app from GitHub. Try again.");
+  }
+  const idle = idleSignal(null, 60_000);
+  let r;
+  try { r = await fetch(link, { headers: req.headers.range ? { Range: req.headers.range } : {}, signal: idle.signal }); } catch { idle.done(); return fail(res, 502, "Couldn't get the app from GitHub. Try again."); }
+  if (!r.ok || !r.body) { idle.done(); return fail(res, 502, `Couldn't get the app from GitHub (HTTP ${r.status})`); }
+  const headers = { 'Content-Type': 'application/octet-stream', 'Accept-Ranges': 'bytes', 'Cache-Control': 'no-store', 'Content-Disposition': `attachment; filename="${`${s.name}.ipa`.replace(/[^\w.\- ]/g, '_')}"` };
+  for (const h of ['content-length', 'content-range']) if (r.headers.get(h)) headers[h.replace(/(^|-)\w/g, (c) => c.toUpperCase())] = r.headers.get(h);
+  res.writeHead(r.status, headers);
+  if (req.method === 'HEAD') { idle.done(); r.body.cancel().catch(() => {}); return res.end(); }
+  const body = Readable.fromWeb(r.body);
+  body.on('data', (c) => { idle.kick(); if (onBytes) onBytes(c.length); });
+  return pipeline(body, res).catch(() => {}).finally(() => idle.done());
+}
+
 // Deletes a signed copy (file, icon and record).
 async function removeSigned(s) {
   const i = store.signed.indexOf(s);
   if (i >= 0) store.signed.splice(i, 1);
   await rmQuiet(path.join(dirs.signed, s.id + '.ipa'));
   await rmQuiet(path.join(dirs.signed, s.id + '.png'));
+  dropSignedCopy(s).catch(() => {});
 }
 
 // Each person keeps only one signed copy of each app — the newest one.
@@ -548,7 +641,9 @@ function signedView(s, req) {
   const manifest = `${base}/i/${s.token}/manifest.plist`;
   return {
     ...s,
-    fileAvailable: !s.fileDeleted,
+    fileAvailable: signedReady(s),
+    savedOnGithub: !!s.gh,
+    gh: undefined, archiveTries: undefined,
     onPhone: !!(s.appId && ((store.data.myApps[s.ownerId] || {})[s.appId] || {}).signedId === s.id),
     installUrl: `itms-services://?action=download-manifest&url=${encodeURIComponent(manifest)}`,
     shareUrl: `${base}/i/${s.token}`,
@@ -858,11 +953,16 @@ setInterval(() => trimCache().catch(() => {}), 30 * 60 * 1000).unref();
 async function cleanupSignedFiles(maxAgeDays = Number(store.settings.signedRetentionDays)) {
   let n = 0;
   for (const s of store.signed) {
+    // A copy on GitHub is only useful while its certificate works. After that, remove it to keep the repo tidy.
+    if (s.gh && s.expires && Date.now() - new Date(s.expires) > 864e5) { await dropSignedCopy(s).catch(() => {}); n++; }
     if (s.fileDeleted) continue;
     // Once an app finished installing, its signed file isn't needed any more (kept 15 minutes in case iOS retries).
     const installedLongEnough = store.settings.deleteAfterInstall && s.installedAt && Date.now() - new Date(s.installedAt) > 15 * 60 * 1000;
     const tooOld = maxAgeDays && Date.now() - new Date(s.signedAt) >= maxAgeDays * 864e5;
-    if (!installedLongEnough && !tooOld) continue;
+    // Saved on GitHub: the copy here is just for a quick first install, so it goes after a few hours.
+    const backedUp = s.gh && Date.now() - new Date(s.signedAt) > 6 * 3600_000;
+    if (!installedLongEnough && !tooOld && !backedUp) continue;
+    if (signedToGithubOn() && !s.gh && !archiveFailedForGood(s) && !(s.expires && new Date(s.expires) < Date.now())) continue; // wait until it's saved
     await rmQuiet(path.join(dirs.signed, s.id + '.ipa'));
     s.fileDeleted = true;
     n++;
@@ -903,7 +1003,7 @@ route('GET', /^\/api\/state$/, async (req, res, m, acc) => {
     out.securityLog = store.securityLog.slice(-200).reverse();
     out.server = { ...out.server, zsign: zsignVersion, passwordSet: !!APP_PASSWORD, storage: await storageUsed(), storageBreakdown: await storageBreakdown(), disk: diskInfo() };
   } else {
-    out.settings = { maxSignedPerUser: store.settings.maxSignedPerUser, signedRetentionDays: store.settings.signedRetentionDays, signsPerDay: signLimitFor(acc), signsToday: signsToday(acc.id) };
+    out.settings = { maxSignedPerUser: store.settings.maxSignedPerUser, signedRetentionDays: store.settings.signedRetentionDays, signedOnGithub: signedToGithubOn(), signsPerDay: signLimitFor(acc), signsToday: signsToday(acc.id) };
   }
   json(res, out);
 });
@@ -1668,6 +1768,8 @@ const ghView = () => {
   return {
     connected: !!(g.tokenEnc && g.releaseId), owner: g.owner, repo: g.repo, tag: g.tag, private: g.private,
     lastSync: g.lastSync || null, lastError: g.lastError || null, storeUploads: g.storeUploads !== false,
+    signedToGithub: !!g.private && g.signedToGithub !== false, signedSaved: store.signed.filter((x) => x.gh).length,
+    signedTag: (g.signedRelease && g.signedRelease.tag) || SIGNED_TAG,
     apps: store.apps.filter((a) => a.remote && a.remote.kind === 'github').length,
   };
 };
@@ -1752,6 +1854,11 @@ route('PATCH', /^\/api\/github$/, async (req, res) => {
   if (!g) return fail(res, 400, 'Connect GitHub storage first');
   const b = await readJson(req);
   if (typeof b.storeUploads === 'boolean') g.storeUploads = b.storeUploads;
+  if (typeof b.signedToGithub === 'boolean') {
+    if (b.signedToGithub && !g.private) return fail(res, 400, "Your repo is public, so anyone could download your signed apps (and install them with your certificate). Make the repo private on GitHub, then tap Change repo or token › Save.");
+    g.signedToGithub = b.signedToGithub;
+    if (b.signedToGithub) setTimeout(() => archiveSigned().catch(() => {}), 1000);
+  }
   store.save();
   json(res, { github: ghView() });
 }, 'owner');
@@ -3322,11 +3429,7 @@ function trimSigned(acc) {
   if (isOwner(acc)) return;
   const max = Number(store.settings.maxSignedPerUser) || 10;
   const mine = mySigned(acc);
-  for (const s of mine.slice(max)) {
-    store.signed.splice(store.signed.indexOf(s), 1);
-    rmQuiet(path.join(dirs.signed, s.id + '.ipa'));
-    rmQuiet(path.join(dirs.signed, s.id + '.png'));
-  }
+  for (const s of mine.slice(max)) removeSigned(s).catch(() => {});
 }
 
 route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
@@ -3493,6 +3596,7 @@ route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
       job.result = { signed: signedView(rec, req), replaced: true };
       job.status = 'done';
       job.log.push('Done!');
+      if (signedToGithubOn()) setTimeout(() => archiveSigned().catch(() => {}), 20_000); // after the first install has a head start
     } catch (e) {
       await rmQuiet(out);
       const full = isNoSpace(e) || job.log.some((l) => /no space left|ENOSPC/i.test(l));
@@ -3643,11 +3747,7 @@ route('DELETE', /^\/api\/users\/([a-f0-9]{16})$/, async (req, res, m) => {
   const u = findUser(m[1]);
   if (!u) return fail(res, 404, 'User not found');
   for (const c of store.certs.filter((x) => x.ownerId === u.id)) await deleteCertRecord(c);
-  for (const s of store.signed.filter((x) => x.ownerId === u.id)) {
-    store.signed.splice(store.signed.indexOf(s), 1);
-    await rmQuiet(path.join(dirs.signed, s.id + '.ipa'));
-    await rmQuiet(path.join(dirs.signed, s.id + '.png'));
-  }
+  for (const s of store.signed.filter((x) => x.ownerId === u.id)) await removeSigned(s);
   store.users.splice(store.users.indexOf(u), 1);
   delete store.data.myApps[u.id];
   for (const a of store.apps) if (a.votes) delete a.votes[u.id];
@@ -3685,7 +3785,7 @@ setInterval(() => {
 
 route('GET', /^\/i\/([\w-]{20,40})\/manifest\.plist$/, (req, res, m) => {
   const s = findByToken(m[1]);
-  if (!s || s.fileDeleted) return fail(res, 404, 'Link expired');
+  if (!s || !signedReady(s)) return fail(res, 404, 'Link expired');
   const base = baseUrl(req);
   const assets = [{ kind: 'software-package', url: `${base}/i/${s.token}/app.ipa` }];
   if (s.hasIcon) {
@@ -3704,27 +3804,28 @@ route('GET', /^\/i\/([\w-]{20,40})\/manifest\.plist$/, (req, res, m) => {
   send(res, 200, body, { 'Content-Type': 'text/xml; charset=utf-8' });
 }, 'open');
 
-route('GET', /^\/i\/([\w-]{20,40})\/app\.ipa$/, (req, res, m) => {
+route('GET', /^\/i\/([\w-]{20,40})\/app\.ipa$/, async (req, res, m) => {
   const s = findByToken(m[1]);
-  if (!s || s.fileDeleted) return fail(res, 404, 'Link expired');
-  if (req.method === 'HEAD') return serveFile(req, res, path.join(dirs.signed, s.id + '.ipa'));
+  if (!s || !signedReady(s)) return fail(res, 404, 'Link expired');
+  const local = path.join(dirs.signed, s.id + '.ipa');
+  const fromGithub = s.gh && !fs.existsSync(local);
+  if (req.method === 'HEAD') return fromGithub ? serveSignedFromGithub(req, res, s) : serveFile(req, res, local);
   const st = installState(s);
   // A range request continues an earlier download; a plain request starts from zero.
   const range = (req.headers.range || '').match(/^bytes=(\d+)-/);
   if (st.phase !== 'downloading' || !range) Object.assign(st, { phase: 'downloading', downloadAt: Date.now(), sent: 0, doneAt: null });
   if (range) st.sent = Math.max(st.sent, Number(range[1]));
-  return serveFile(req, res, path.join(dirs.signed, s.id + '.ipa'), {
-    download: `${s.name}.ipa`,
-    // Done as soon as the last byte goes out. (Waiting for the stream to close is unreliable:
-    // iPhones often hang up the moment they have the whole file.)
-    onBytes: (n) => {
-      st.sent += n;
-      if (st.sent >= st.size && st.phase !== 'done') {
-        Object.assign(st, { phase: 'done', doneAt: Date.now(), sent: st.size });
-        try { recordInstall(s, st); } catch (e) { console.error('install tracking:', e); }
-      }
-    },
-  });
+  // Done as soon as the last byte goes out. (Waiting for the stream to close is unreliable:
+  // iPhones often hang up the moment they have the whole file.)
+  const onBytes = (n) => {
+    st.sent += n;
+    if (st.sent >= st.size && st.phase !== 'done') {
+      Object.assign(st, { phase: 'done', doneAt: Date.now(), sent: st.size });
+      try { recordInstall(s, st); } catch (e) { console.error('install tracking:', e); }
+    }
+  };
+  if (fromGithub) return serveSignedFromGithub(req, res, s, onBytes);
+  return serveFile(req, res, local, { download: `${s.name}.ipa`, onBytes });
 }, 'open');
 
 function recordInstall(s, st = {}) {
@@ -3758,7 +3859,7 @@ function recordInstall(s, st = {}) {
 route('POST', /^\/api\/signed\/([a-f0-9]{16})\/install$/, (req, res, m, acc) => {
   const s = store.signed.find((x) => x.id === m[1] && x.ownerId === acc.id);
   if (!s) return fail(res, 404, 'Not found');
-  if (s.fileDeleted) return fail(res, 410, 'This signed file was cleaned up — sign it again');
+  if (!signedReady(s)) return fail(res, 410, 'This signed file was cleaned up — sign it again');
   const cur = installs.get(s.id);
   // If the iPhone already asked for the app a moment ago, keep that progress instead of resetting it.
   const fresh = cur && Date.now() - Math.max(cur.manifestAt || 0, cur.downloadAt || 0) < 5000;
@@ -3774,7 +3875,7 @@ route('GET', /^\/api\/signed\/([a-f0-9]{16})\/install$/, (req, res, m, acc) => {
 // Same for shared install pages (anyone with the link).
 route('POST', /^\/i\/([\w-]{20,40})\/status$/, (req, res, m) => {
   const s = findByToken(m[1]);
-  if (!s || s.fileDeleted) return fail(res, 404, 'Link expired');
+  if (!s || !signedReady(s)) return fail(res, 404, 'Link expired');
   const cur = installs.get(s.id);
   const fresh = cur && Date.now() - Math.max(cur.manifestAt || 0, cur.downloadAt || 0) < 5000;
   const st = fresh ? cur : resetInstall(s);
@@ -3783,7 +3884,7 @@ route('POST', /^\/i\/([\w-]{20,40})\/status$/, (req, res, m) => {
 }, 'open');
 route('GET', /^\/i\/([\w-]{20,40})\/status$/, (req, res, m) => {
   const s = findByToken(m[1]);
-  if (!s || s.fileDeleted) return fail(res, 404, 'Link expired');
+  if (!s || !signedReady(s)) return fail(res, 404, 'Link expired');
   json(res, { install: installView(installState(s)) });
 }, 'open');
 
@@ -3798,7 +3899,7 @@ route('GET', /^\/i\/([\w-]{20,40})\/?$/, async (req, res, m) => {
   const tpl = await fsp.readFile(path.join(PUBLIC_DIR, 'install.html'), 'utf8');
   const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
   const fill = (vals) => tpl.replace(/{{(\w+)}}/g, (_, k) => esc(vals[k] ?? ''));
-  if (!s || s.fileDeleted) {
+  if (!s || !signedReady(s)) {
     return send(res, 404, fill({ title: 'Link expired', name: 'This link has expired', meta: 'Ask for a new install link.', icon: '/icon-180.png', install: '#', hidden: 'hidden' }), { 'Content-Type': 'text/html; charset=utf-8' });
   }
   const v = signedView(s, req);
