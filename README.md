@@ -9,6 +9,8 @@ Upload an `.ipa`, add a `.p12` + `.mobileprovision`, tap **Sign**, then **Instal
 - **App Library** – the owner uploads apps (or imports from a link); invited users browse, search, sign and install them
 - **Organization** – categories with emoji, featured apps, search, sorting, bulk select, full app editing, Update IPA, and default sign settings per app
 - **Cloud Library** – add AltStore/SideStore/ESign-style sources, link-only apps, or keep your own IPAs in a (private) GitHub repo's release, so app files don't sit on your Railway volume. Files are downloaded only while signing and deleted right after. Older versions from sources can be picked when signing
+- **Tweaks** – a tweaks library (jailbreak `.deb` or `.dylib`), per-app default tweaks, automatic CydiaSubstrate/ElleKit bundling for tweaks that need it
+- **Presets & batch signing** – save sign settings as presets, select several apps and Get them all at once, import certificates from a `.zip`
 - **Big files** – resumable uploads that survive dropped connections; old signed files are cleaned up automatically
 - **Accounts** – invite codes, username + password login, or sign in with your iPhone (UDID)
 - **Certificates** – each account adds its own `.p12` + `.mobileprovision`; shows type, expiry, revoke status, cert/profile mismatch, and whether your iPhone is in the profile
@@ -50,7 +52,7 @@ Mango creates a release tagged `mango-library` and keeps each app as a release a
 
 ## How it works
 - `server.js` – web server and API (no npm dependencies)
-- `lib/` – zip (local and HTTP range), plist, PNG (Apple CgBI icon), certificate, source and GitHub helpers
+- `lib/` – zip (local and HTTP range), plist, PNG (Apple CgBI icon), Mach-O, .deb, certificate, source and GitHub helpers
 - `public/` – the iPhone web app
 - Signing is done by [zsign](https://github.com/zhlynn/zsign) (MIT License, by zhlynn), compiled in the Docker build.
 

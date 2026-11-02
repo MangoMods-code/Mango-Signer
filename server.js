@@ -18,6 +18,9 @@ const { drawAppIcon } = require('./lib/png');
 const { qrSvg } = require('./lib/qr');
 const sources = require('./lib/sources');
 const github = require('./lib/github');
+const macho = require('./lib/macho');
+const deb = require('./lib/deb');
+const zipLib = require('./lib/zip');
 
 const WHATS_NEW = require('./lib/whats-new');
 const VERSION = WHATS_NEW[0].version; // the real version of this code
@@ -42,6 +45,7 @@ const dirs = {
   signed: path.join(DATA_DIR, 'signed'),
   tmp: path.join(DATA_DIR, 'tmp'),
   work: path.join(DATA_DIR, 'work'),
+  tweaks: path.join(DATA_DIR, 'tweaks'),
 };
 for (const d of Object.values(dirs)) fs.mkdirSync(d, { recursive: true });
 fs.rmSync(dirs.work, { recursive: true, force: true });
@@ -653,7 +657,7 @@ async function dirSize(dir) {
 const storageUsed = () => dirSize(DATA_DIR);
 async function storageBreakdown() {
   return {
-    library: await dirSize(dirs.apps),
+    library: (await dirSize(dirs.apps)) + (await dirSize(dirs.tweaks)),
     signed: await dirSize(dirs.signed),
     certs: await dirSize(dirs.certs),
     temp: (await dirSize(dirs.tmp)) + (await dirSize(dirs.work)),
@@ -690,6 +694,9 @@ route('GET', /^\/api\/state$/, async (req, res, m, acc) => {
     collections: sortedCollections().filter((c) => isOwner(acc) || c.appIds.some((aid) => visibleApps(acc).some((a) => a.id === aid))),
     requests: (isOwner(acc) ? store.requests : store.requests.filter((r) => r.ownerId === acc.id)).slice(-200).reverse(),
     installs: store.installLog.filter((l) => l.ownerId === acc.id).slice(-60).reverse(),
+    tweaks: visibleTweaks(acc).map((t) => tweakView(t, acc)),
+    presets: store.presets.filter((p) => p.ownerId === acc.id).map(({ ownerId, ...p }) => p),
+    substrate: substrateView(),
     announcement: store.settings.announcement && store.settings.announcement.text ? store.settings.announcement : null,
     server: { baseUrl: base, https: base.startsWith('https://'), version: displayVersion(), codeVersion: VERSION },
   };
@@ -987,6 +994,7 @@ function cleanSignDefaults(d) {
     if (d[k] !== undefined) out[k] = !!d[k];
   }
   if (typeof d.minOS === 'string' && /^(\d+(\.\d+){0,2})?$/.test(d.minOS.trim())) out.minOS = d.minOS.trim();
+  if (Array.isArray(d.tweakIds)) out.tweakIds = d.tweakIds.filter((x) => store.tweaks.some((t) => t.id === x)).slice(0, 20);
   return out;
 }
 
@@ -1491,6 +1499,233 @@ route('POST', /^\/api\/github\/move$/, async (req, res, m, acc) => {
   })();
 }, 'owner');
 
+// ----- tweaks library -----
+// Tweaks are small (.dylib files, usually under 1 MB), so they're kept on the server.
+const SUBSTRATE_DIR = () => path.join(dirs.tweaks, '_substrate', 'CydiaSubstrate.framework');
+const substrateInstalled = () => fs.existsSync(path.join(SUBSTRATE_DIR(), 'CydiaSubstrate'));
+const substrateView = () => {
+  const s = store.settings.substrate;
+  return substrateInstalled() ? { installed: true, name: (s && s.name) || 'CydiaSubstrate', size: (s && s.size) || 0, addedAt: s && s.addedAt } : { installed: false };
+};
+
+function tweakView(t, acc) {
+  const base = {
+    id: t.id, name: t.name, version: t.version, author: t.author, description: t.description, package: t.package,
+    files: t.files.map((f) => ({ name: f.name, size: f.size, needsSubstrate: f.needsSubstrate, missing: f.missing })),
+    warnings: t.warnings || [], addedAt: t.addedAt, published: t.published !== false,
+  };
+  return isOwner(acc) ? base : { ...base, package: undefined };
+}
+const visibleTweaks = (acc) => store.tweaks.filter((t) => isOwner(acc) || t.published !== false);
+
+function tweakWarnings(files, extra = {}) {
+  const w = [];
+  if (files.some((f) => f.needsSubstrate) && !substrateInstalled()) w.push('Needs CydiaSubstrate. Add a Substrate framework in the Tweaks library, or the app will crash on launch.');
+  const missing = [...new Set(files.flatMap((f) => f.missing || []))];
+  if (missing.length) w.push(`Needs ${missing.join(', ')}, which only exists on jailbroken phones. It may not work.`);
+  if (extra.bundles && extra.bundles.length) w.push(`Comes with ${extra.bundles.join(', ')} (images/settings). Those aren't added to the app, so some icons or settings may be missing.`);
+  if (extra.hasPrefs) w.push('Its Settings page only works on jailbroken phones.');
+  return w;
+}
+
+// Reads a .deb or .dylib upload into a list of { name, buf, info } plus package details.
+async function readTweakUpload(file, fileName, work) {
+  if (/\.deb$/i.test(fileName)) {
+    const pkg = await deb.unpack(file, path.join(work, 'deb'));
+    const hookOnly = pkg.tweaks.length && pkg.tweaks.every((t) => /ellekit|substrate|substitute|libhooker/i.test(t.name));
+    if (!pkg.tweaks.length || hookOnly) {
+      const err = new Error(pkg.substrateFramework || hookOnly ? 'This package is a Substrate framework, not a tweak. Add it under "Substrate" instead.' : 'No tweak (.dylib) found inside this .deb');
+      err.status = 400;
+      throw err;
+    }
+    const files = [];
+    for (const t of pkg.tweaks.slice(0, 10)) {
+      const buf = await fsp.readFile(t.file);
+      const info = macho.inspectTweak(buf);
+      if (info.ok) files.push({ name: t.name, buf, info });
+    }
+    if (!files.length) throw httpError(400, "The .dylib files in this .deb aren't iOS libraries");
+    return { files, control: pkg.control, bundles: pkg.bundles, hasPrefs: pkg.hasPrefs };
+  }
+  const buf = await fsp.readFile(file);
+  const info = macho.inspectTweak(buf);
+  if (!info.ok) throw httpError(400, info.error);
+  return { files: [{ name: fileName, buf, info }], control: {}, bundles: [], hasPrefs: false };
+}
+
+const safeDylibName = (n) => (String(n || 'tweak.dylib').replace(/[^\w.\-+]/g, '_').replace(/^\.+/, '') || 'tweak').replace(/(\.dylib)?$/i, '.dylib');
+
+route('POST', /^\/api\/tweaks$/, async (req, res, m, acc) => {
+  const { uploadId, fileName } = await readJson(req);
+  const file = tmpPath(uploadId, acc);
+  const name = String(fileName || 'tweak.dylib').slice(0, 120);
+  if (!/\.(deb|dylib)$/i.test(name)) { await rmQuiet(file); return fail(res, 400, 'Pick a .deb or .dylib file'); }
+  const work = path.join(dirs.work, 'tw-' + id());
+  try {
+    const up = await readTweakUpload(file, name, work);
+    const tid = id();
+    const dir = path.join(dirs.tweaks, tid);
+    await fsp.mkdir(dir, { recursive: true });
+    const files = [];
+    for (const f of up.files) {
+      const fname = safeDylibName(f.name);
+      await fsp.writeFile(path.join(dir, fname), f.buf);
+      files.push({ name: fname, size: f.buf.length, needsSubstrate: f.info.needsSubstrate, missing: f.info.missing });
+    }
+    const c = up.control;
+    const rec = {
+      id: tid, name: (c.name || name.replace(/\.(deb|dylib)$/i, '')).slice(0, 80), version: (c.version || '').slice(0, 40),
+      author: (c.author || '').slice(0, 80), description: (c.description || '').slice(0, 600), package: c.package || '',
+      files, extra: { bundles: up.bundles, hasPrefs: up.hasPrefs }, published: true, addedAt: new Date().toISOString(),
+    };
+    rec.warnings = tweakWarnings(files, rec.extra);
+    store.tweaks.unshift(rec);
+    store.save();
+    json(res, { tweak: tweakView(rec, acc) });
+  } catch (e) {
+    fail(res, e.status || 400, e.message);
+  } finally {
+    await rmQuiet(file);
+    await fsp.rm(work, { recursive: true, force: true });
+  }
+}, 'owner');
+
+route('PATCH', /^\/api\/tweaks\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
+  const t = store.tweaks.find((x) => x.id === m[1]);
+  if (!t) return fail(res, 404, 'Tweak not found');
+  const b = await readJson(req);
+  if (typeof b.name === 'string' && b.name.trim()) t.name = b.name.trim().slice(0, 80);
+  if (typeof b.description === 'string') t.description = b.description.slice(0, 600);
+  if (typeof b.published === 'boolean') t.published = b.published;
+  store.save();
+  json(res, { tweak: tweakView(t, acc) });
+}, 'owner');
+
+route('DELETE', /^\/api\/tweaks\/([a-f0-9]{16})$/, async (req, res, m) => {
+  const i = store.tweaks.findIndex((x) => x.id === m[1]);
+  if (i < 0) return fail(res, 404, 'Tweak not found');
+  store.tweaks.splice(i, 1);
+  for (const a of store.apps) if (a.signDefaults && Array.isArray(a.signDefaults.tweakIds)) a.signDefaults.tweakIds = a.signDefaults.tweakIds.filter((x) => x !== m[1]);
+  for (const p of store.presets) if (p.options && Array.isArray(p.options.tweakIds)) p.options.tweakIds = p.options.tweakIds.filter((x) => x !== m[1]);
+  store.save();
+  await fsp.rm(path.join(dirs.tweaks, m[1]), { recursive: true, force: true });
+  json(res, { ok: true });
+}, 'owner');
+
+const FRAMEWORK_PLIST = () => plist.build({
+  CFBundleDevelopmentRegion: 'en', CFBundleExecutable: 'CydiaSubstrate', CFBundleIdentifier: 'com.saurik.substrate',
+  CFBundleInfoDictionaryVersion: '6.0', CFBundleName: 'CydiaSubstrate', CFBundlePackageType: 'FMWK',
+  CFBundleShortVersionString: '1.0', CFBundleVersion: '1', CFBundleSupportedPlatforms: ['iPhoneOS'], MinimumOSVersion: '12.0',
+});
+
+// The hooking framework most tweaks need (CydiaSubstrate, or ElleKit which acts like it).
+route('PUT', /^\/api\/substrate$/, async (req, res, m, acc) => {
+  const { uploadId, fileName } = await readJson(req);
+  const file = tmpPath(uploadId, acc);
+  const name = String(fileName || '').slice(0, 120);
+  const work = path.join(dirs.work, 'sub-' + id());
+  const dest = SUBSTRATE_DIR();
+  const staging = dest + '.new';
+  try {
+    await fsp.rm(staging, { recursive: true, force: true });
+    if (/\.dylib$/i.test(name) || (!/\.(deb|zip)$/i.test(name) && macho.isMachO(await fsp.readFile(file)))) {
+      const buf = await fsp.readFile(file);
+      if (!macho.isMachO(buf)) throw httpError(400, "That file isn't an iOS library");
+      await fsp.mkdir(staging, { recursive: true });
+      await fsp.writeFile(path.join(staging, 'CydiaSubstrate'), buf);
+    } else {
+      let root, fw;
+      if (/\.deb$/i.test(name)) {
+        const pkg = await deb.unpack(file, path.join(work, 'deb'));
+        root = path.join(work, 'deb');
+        fw = pkg.substrateFramework;
+        if (!fw) {
+          const lib = pkg.tweaks.find((t) => /ellekit|substrate|substitute|hooker/i.test(t.name)) || null;
+          if (!lib) throw httpError(400, 'No CydiaSubstrate.framework or ElleKit library found in this .deb');
+          await fsp.mkdir(staging, { recursive: true });
+          await fsp.copyFile(lib.file, path.join(staging, 'CydiaSubstrate'));
+        }
+      } else if (/\.zip$/i.test(name)) {
+        root = path.join(work, 'zip');
+        await fsp.mkdir(root, { recursive: true });
+        if (await deb.run('unzip', ['-qq', '-o', file, '-d', root]).then((r) => r.code) !== 0) throw httpError(400, "Couldn't open that .zip");
+        const find = async (dir, depth = 0) => {
+          for (const ent of await fsp.readdir(dir, { withFileTypes: true })) {
+            const p = path.join(dir, ent.name);
+            if (ent.isDirectory() && /^CydiaSubstrate\.framework$/i.test(ent.name)) return p;
+            if (ent.isDirectory() && depth < 6) { const r = await find(p, depth + 1); if (r) return r; }
+          }
+          return null;
+        };
+        fw = await find(root);
+        if (!fw) throw httpError(400, 'No CydiaSubstrate.framework folder found in this .zip');
+      } else {
+        throw httpError(400, 'Pick a .deb, .zip or .dylib file');
+      }
+      if (fw) await deb.copyFramework(root, fw, staging);
+    }
+    const bin = path.join(staging, 'CydiaSubstrate');
+    if (!fs.existsSync(bin) || !macho.isMachO(await fsp.readFile(bin))) throw httpError(400, "The framework's CydiaSubstrate file is missing or isn't an iOS library");
+    if (!fs.existsSync(path.join(staging, 'Info.plist'))) await fsp.writeFile(path.join(staging, 'Info.plist'), FRAMEWORK_PLIST());
+    await fsp.rm(path.join(staging, '_CodeSignature'), { recursive: true, force: true });
+    await fsp.rm(dest, { recursive: true, force: true });
+    await fsp.mkdir(path.dirname(dest), { recursive: true });
+    await fsp.rename(staging, dest);
+    store.settings.substrate = { name: name.replace(/\.(deb|zip|dylib)$/i, '') || 'CydiaSubstrate', size: (await fsp.stat(path.join(dest, 'CydiaSubstrate'))).size, addedAt: new Date().toISOString() };
+    for (const t of store.tweaks) t.warnings = tweakWarnings(t.files, t.extra);
+    store.save();
+    json(res, { substrate: substrateView() });
+  } catch (e) {
+    await fsp.rm(staging, { recursive: true, force: true });
+    fail(res, e.status || 400, e.message);
+  } finally {
+    await rmQuiet(file);
+    await fsp.rm(work, { recursive: true, force: true });
+  }
+}, 'owner');
+
+route('DELETE', /^\/api\/substrate$/, async (req, res) => {
+  await fsp.rm(path.dirname(SUBSTRATE_DIR()), { recursive: true, force: true });
+  delete store.settings.substrate;
+  for (const t of store.tweaks) t.warnings = tweakWarnings(t.files, t.extra);
+  store.save();
+  json(res, { substrate: substrateView() });
+}, 'owner');
+
+// ----- presets (saved sign settings, per account) -----
+function cleanPresetOptions(o = {}) {
+  const pick = (k) => !!o[k];
+  return {
+    minOS: /^\d+(\.\d+){0,2}$/.test(String(o.minOS || '')) ? String(o.minOS) : '',
+    entitlements: Array.isArray(o.entitlements) ? o.entitlements.slice(0, 40) : [],
+    plist: Array.isArray(o.plist) ? o.plist.slice(0, 40) : [],
+    removeExtensions: pick('removeExtensions'), removeWatch: pick('removeWatch'), removeUISD: pick('removeUISD'), enableDocs: pick('enableDocs'),
+    weakDylibs: pick('weakDylibs'), injectExtensions: pick('injectExtensions'),
+    tweakIds: Array.isArray(o.tweakIds) ? o.tweakIds.filter((x) => /^[a-f0-9]{16}$/.test(x)).slice(0, 20) : [],
+  };
+}
+route('POST', /^\/api\/presets$/, async (req, res, m, acc) => {
+  const b = await readJson(req);
+  const name = String(b.name || '').trim().slice(0, 40);
+  if (!name) return fail(res, 400, 'Give the preset a name');
+  const mine = store.presets.filter((p) => p.ownerId === acc.id);
+  if (mine.length >= 30) return fail(res, 400, 'You can have up to 30 presets');
+  // Same name replaces the old one, so "Save" can be used to update a preset.
+  const existing = mine.find((p) => p.name.toLowerCase() === name.toLowerCase());
+  const rec = existing || { id: id(), ownerId: acc.id, createdAt: new Date().toISOString() };
+  Object.assign(rec, { name, options: cleanPresetOptions(b.options), updatedAt: new Date().toISOString() });
+  if (!existing) store.presets.push(rec);
+  store.save();
+  json(res, { preset: rec, replaced: !!existing });
+});
+route('DELETE', /^\/api\/presets\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
+  const i = store.presets.findIndex((p) => p.id === m[1] && p.ownerId === acc.id);
+  if (i < 0) return fail(res, 404, 'Preset not found');
+  store.presets.splice(i, 1);
+  store.save();
+  json(res, { ok: true });
+});
+
 // ----- screenshots -----
 const IMG_TYPES = [
   { ext: 'png', type: 'image/png', test: (b) => b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) },
@@ -1687,28 +1922,21 @@ async function checkCert(c) {
   return { ...parsed, checkedAt: new Date().toISOString() };
 }
 
-route('POST', /^\/api\/certs$/, async (req, res, m, acc) => {
-  const { p12UploadId, provUploadId, password = '', label } = await readJson(req);
-  if (!isOwner(acc) && myCerts(acc).length >= 5) return fail(res, 400, 'You can have up to 5 certificates — delete one first');
-  const p12File = tmpPath(p12UploadId, acc);
-  const provFile = tmpPath(provUploadId, acc);
-
+// Saves a .p12 + .mobileprovision pair as a certificate. Throws a 400 with a friendly message if they don't work.
+async function addCert(acc, p12File, provFile, password, label) {
   let profile, p12;
   try {
     profile = parseProvision(await fsp.readFile(provFile));
     p12 = await parseP12(p12File, String(password));
   } catch (e) {
-    await rmQuiet(p12File); await rmQuiet(provFile);
-    return fail(res, 400, e.message);
+    throw httpError(400, e.message);
   }
-
   const matches = profile.certs.length ? profile.certs.some((c) => c.sha1 === p12.sha1) : null;
   const certId = id();
   const dir = path.join(dirs.certs, certId);
   await fsp.mkdir(dir, { recursive: true });
-  await fsp.rename(p12File, path.join(dir, 'cert.p12'));
-  await fsp.rename(provFile, path.join(dir, 'profile.mobileprovision'));
-
+  await fsp.copyFile(p12File, path.join(dir, 'cert.p12'));
+  await fsp.copyFile(provFile, path.join(dir, 'profile.mobileprovision'));
   const rec = {
     id: certId, ownerId: acc.id,
     label: String(label || '').trim().slice(0, 60) || profile.teamName || p12.commonName,
@@ -1719,10 +1947,80 @@ route('POST', /^\/api\/certs$/, async (req, res, m, acc) => {
   store.certs.push(rec);
   if (!defaultCertId(acc) || !ownCert(acc, defaultCertId(acc))) setDefaultCert(acc, certId);
   store.save();
-
   rec.check = await checkCert(rec).catch(() => null);
   store.save();
-  json(res, { cert: certView(rec, acc) });
+  return rec;
+}
+const certLimitHit = (acc) => !isOwner(acc) && myCerts(acc).length >= 5;
+
+route('POST', /^\/api\/certs$/, async (req, res, m, acc) => {
+  const { p12UploadId, provUploadId, password = '', label } = await readJson(req);
+  if (certLimitHit(acc)) return fail(res, 400, 'You can have up to 5 certificates — delete one first');
+  const p12File = tmpPath(p12UploadId, acc);
+  const provFile = tmpPath(provUploadId, acc);
+  try {
+    const rec = await addCert(acc, p12File, provFile, password, label);
+    json(res, { cert: certView(rec, acc) });
+  } catch (e) {
+    fail(res, e.status || 400, e.message);
+  } finally {
+    await rmQuiet(p12File); await rmQuiet(provFile);
+  }
+});
+
+// One .zip with the .p12, the .mobileprovision and (often) a password .txt — how most cert sellers send them.
+route('POST', /^\/api\/certs\/zip$/, async (req, res, m, acc) => {
+  const { uploadId, password, label } = await readJson(req);
+  if (certLimitHit(acc)) return fail(res, 400, 'You can have up to 5 certificates — delete one first');
+  const zipFile = tmpPath(uploadId, acc);
+  const work = path.join(dirs.work, 'cz-' + id());
+  try {
+    let entries;
+    try { entries = await zipLib.listEntries(zipFile); } catch { throw httpError(400, "That isn't a .zip file"); }
+    entries = entries.filter((e) => !/(^|\/)(__MACOSX|\.)/.test(e.name) && e.size < 5 * 1048576);
+    const p12s = entries.filter((e) => /\.p12$/i.test(e.name));
+    const provs = entries.filter((e) => /\.mobileprovision$/i.test(e.name));
+    if (!p12s.length) throw httpError(400, 'No .p12 file found in the .zip');
+    if (!provs.length) throw httpError(400, 'No .mobileprovision file found in the .zip');
+    await fsp.mkdir(work, { recursive: true });
+    // Password ideas: what you typed, then anything that looks like a password in the text files, then none.
+    const guesses = [];
+    if (password) guesses.push(String(password));
+    for (const t of entries.filter((e) => /\.(txt|md|rtf)$/i.test(e.name) || /pass/i.test(e.name)).slice(0, 6)) {
+      const text = (await zipLib.readEntry(zipFile, t, 65536)).toString('utf8').replace(/\r/g, '');
+      for (const line of text.split('\n')) {
+        const mm = line.match(/pass(?:word|code)?\s*(?:is)?\s*[:=\-–]\s*(.+)$/i);
+        if (mm) guesses.push(mm[1].trim().replace(/^["'`]|["'`]$/g, ''));
+      }
+      const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
+      if (lines.length === 1) guesses.push(lines[0]);
+      const base = path.basename(t.name).replace(/\.(txt|md|rtf)$/i, '');
+      if (/pass/i.test(t.name) === false && base.length < 40) guesses.push(base);
+    }
+    for (const e of [...p12s, ...provs]) {
+      const name = path.basename(e.name).replace(/\.(p12|mobileprovision)$/i, '');
+      if (/pass/i.test(name)) { const mm = name.match(/pass(?:word)?[\s_\-:=]*(.+)$/i); if (mm) guesses.push(mm[1]); }
+    }
+    guesses.push('', '1', '123', '1234', '123456');
+    const tries = [...new Set(guesses.filter((g) => g.length <= 128))];
+    const provFile = path.join(work, 'profile.mobileprovision');
+    await fsp.writeFile(provFile, await zipLib.readEntry(zipFile, provs[0]));
+    for (const p of p12s.slice(0, 4)) {
+      const p12File = path.join(work, 'cert.p12');
+      await fsp.writeFile(p12File, await zipLib.readEntry(zipFile, p));
+      for (const pw of tries) {
+        try { await parseP12(p12File, pw); } catch { continue; }
+        const rec = await addCert(acc, p12File, provFile, pw, label);
+        return json(res, { cert: certView(rec, acc), passwordFound: pw !== String(password || '') });
+      }
+    }
+    throw httpError(400, password ? "That password didn't open the .p12. Check it and try again." : "Couldn't find the .p12 password. Type it in and try again.");
+  } catch (e) {
+    fail(res, e.status || 400, e.message);
+  } finally {
+    await rmQuiet(zipFile);
+    await fsp.rm(work, { recursive: true, force: true });
+  }
 });
 
 route('POST', /^\/api\/certs\/([a-f0-9]{16})\/check$/, async (req, res, m, acc) => {
@@ -1781,19 +2079,76 @@ function applyEdits(dict, edits) {
   return dict;
 }
 
-async function prepareModifiedIpa(srcIpa, work, plistEdits, job) {
+// Gathers tweak .dylibs into the work folder, points Substrate links at the bundled framework,
+// and says which frameworks need adding to the app.
+async function collectTweaks(uploads, libTweaks, work, job) {
+  const dir = path.join(work, 'tweaks');
+  await fsp.mkdir(dir, { recursive: true });
+  const items = [];
+  for (const u of uploads) {
+    if (/\.deb$/i.test(u.name)) {
+      const pkg = await deb.unpack(u.file, path.join(work, 'deb-' + items.length)).catch((e) => { throw new Error(`${u.name}: ${e.message}`); });
+      if (!pkg.tweaks.length) throw new Error(`${u.name}: no tweak (.dylib) inside`);
+      for (const t of pkg.tweaks.slice(0, 10)) items.push({ name: t.name, buf: await fsp.readFile(t.file), from: u.name });
+      if (pkg.bundles.length) job.log.push(`Note: ${u.name} has resource bundles that aren't added (some images may be missing).`);
+    } else {
+      items.push({ name: u.name, buf: await fsp.readFile(u.file), from: u.name });
+    }
+    await rmQuiet(u.file);
+  }
+  for (const t of libTweaks) {
+    for (const f of t.files) items.push({ name: f.name, buf: await fsp.readFile(path.join(dirs.tweaks, t.id, f.name)), from: t.name });
+  }
+  const files = [];
+  const used = new Set();
+  let needsSubstrate = false;
+  for (const it of items) {
+    const info = macho.inspectTweak(it.buf);
+    if (!info.ok) throw new Error(`${it.from}: ${info.error}`);
+    if (info.needsSubstrate) {
+      needsSubstrate = true;
+      const r = macho.patchForSubstrate(it.buf);
+      if (r.skipped.length) job.log.push(`Note: couldn't relink ${it.name} to the bundled Substrate.`);
+    }
+    if (info.missing.length) job.log.push(`Note: ${it.name} needs ${info.missing.join(', ')} (jailbreak-only), so it may not work.`);
+    let name = safeDylibName(it.name);
+    while (used.has(name.toLowerCase())) name = name.replace(/(\d*)\.dylib$/i, (_m, n) => `${(Number(n) || 1) + 1}.dylib`);
+    used.add(name.toLowerCase());
+    const p = path.join(dir, name);
+    await fsp.writeFile(p, it.buf);
+    files.push(p);
+  }
+  const frameworks = [];
+  if (needsSubstrate) {
+    if (substrateInstalled()) frameworks.push(SUBSTRATE_DIR());
+    else job.log.push('Warning: a tweak needs CydiaSubstrate but none is set up in the Tweaks library, so the app may crash on launch.');
+  }
+  if (files.length) job.log.push(`Injecting ${files.length} tweak${files.length === 1 ? '' : 's'}: ${files.map((f) => path.basename(f)).join(', ')}`);
+  return { files, frameworks };
+}
+
+async function prepareModifiedIpa(srcIpa, work, plistEdits, job, frameworks = []) {
   const extract = path.join(work, 'x');
   await fsp.mkdir(extract, { recursive: true });
-  job.log.push('Unpacking app to edit Info.plist…');
-  if (await runLogged('unzip', ['-qq', '-o', srcIpa, '-d', extract], job) !== 0) throw new Error("Couldn't unpack the app to edit Info.plist");
+  job.log.push(plistEdits.length ? 'Unpacking app to edit Info.plist…' : 'Unpacking app to add tweak support…');
+  if (await runLogged('unzip', ['-qq', '-o', srcIpa, '-d', extract], job) !== 0) throw new Error("Couldn't unpack the app");
   const payload = path.join(extract, 'Payload');
   const appDir = (await fsp.readdir(payload)).find((n) => n.endsWith('.app'));
   if (!appDir) throw new Error('No .app found inside the .ipa');
-  const infoPath = path.join(payload, appDir, 'Info.plist');
-  const info = plist.parse(await fsp.readFile(infoPath));
-  applyEdits(info, plistEdits);
-  await fsp.writeFile(infoPath, plist.build(info));
-  job.log.push(`Edited ${plistEdits.length} Info.plist value${plistEdits.length === 1 ? '' : 's'}.`);
+  if (plistEdits.length) {
+    const infoPath = path.join(payload, appDir, 'Info.plist');
+    const info = plist.parse(await fsp.readFile(infoPath));
+    applyEdits(info, plistEdits);
+    await fsp.writeFile(infoPath, plist.build(info));
+    job.log.push(`Edited ${plistEdits.length} Info.plist value${plistEdits.length === 1 ? '' : 's'}.`);
+  }
+  for (const fw of frameworks) {
+    const dest = path.join(payload, appDir, 'Frameworks', path.basename(fw));
+    await fsp.rm(dest, { recursive: true, force: true });
+    await fsp.mkdir(path.dirname(dest), { recursive: true });
+    await fsp.cp(fw, dest, { recursive: true });
+    job.log.push(`Added ${path.basename(fw)} so tweaks can run.`);
+  }
   const out = path.join(work, 'modified.ipa');
   if (await runLogged('zip', ['-qry', '-0', out, 'Payload'], job, { cwd: extract }) !== 0) throw new Error("Couldn't repack the app");
   await rmQuiet(extract);
@@ -1838,6 +2193,8 @@ route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
     file: tmpPath(d.uploadId, acc),
     name: String(d.name || 'tweak.dylib').replace(/[^\w.\-+]/g, '_').replace(/^\.+/, '') || 'tweak.dylib',
   }));
+  const libTweaks = (Array.isArray(b.tweakIds) ? b.tweakIds : []).slice(0, 20)
+    .map((tid) => visibleTweaks(acc).find((t) => t.id === tid)).filter(Boolean);
 
   // Already signing this app for you? Follow that job instead of starting a second copy.
   const runKey = `${acc.id}:${app.id}`;
@@ -1905,13 +2262,11 @@ route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
         await fsp.copyFile(path.join(dirs.apps, app.id + '-custom.png'), iconPath);
         args.push('-I', iconPath);
       }
-      for (const d of dylibFiles) {
-        const p = path.join(work, d.name);
-        await fsp.rename(d.file, p);
-        args.push('-l', p);
-      }
-      if (dylibFiles.length && b.weakDylibs) args.push('-w');
-      if (dylibFiles.length && b.injectExtensions) args.push('-P');
+      // Tweaks: your uploaded .dylib/.deb files plus any picked from the Tweaks library.
+      const inject = await collectTweaks(dylibFiles, libTweaks, work, job);
+      for (const p of inject.files) args.push('-l', p);
+      if (inject.files.length && b.weakDylibs) args.push('-w');
+      if (inject.files.length && b.injectExtensions) args.push('-P');
       if (b.removeExtensions) args.push('-E');
       if (b.removeWatch) args.push('-W');
       if (b.removeUISD) args.push('-U');
@@ -1924,7 +2279,7 @@ route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
         await fetchToFile(dl.url, dl.headers, input, job, `Downloading ${app.name}${dl.version ? ' ' + dl.version : ''}…`);
         job.progress = null;
       }
-      if (plistEdits.length) input = await prepareModifiedIpa(input, work, plistEdits, job);
+      if (plistEdits.length || inject.frameworks.length) input = await prepareModifiedIpa(input, work, plistEdits, job, inject.frameworks);
       args.push(input);
 
       job.log.push(`Signing ${app.name} with ${cert.label}…`);
@@ -1945,7 +2300,7 @@ route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
         size: meta.size, hasIcon: !!meta.icon || fs.existsSync(path.join(dirs.signed, signedId + '.png')), signedAt: new Date().toISOString(),
         expires: cert.profile.expires,
         options: {
-          ...opts, icon: !!iconFile, dylibs: dylibFiles.map((d) => d.name), versionIndex: versionIndex || 0,
+          ...opts, icon: !!iconFile, dylibs: dylibFiles.map((d) => d.name), tweaks: libTweaks.map((t) => t.name), tweakIds: libTweaks.map((t) => t.id), versionIndex: versionIndex || 0,
           entitlements: entEdits.map((e) => e.key), plist: plistEdits.map((e) => e.key),
         },
       };
