@@ -1492,7 +1492,7 @@ function tgRunSheet(title, jobId, back) {
   }).then(async (r) => {
     closeSheet.locked = false; $('#sheet').classList.remove('locked');
     await refresh().catch(() => {});
-    const bits = [r.added && `${r.added} new`, r.updated && `${r.updated} updated`, r.removed && `${r.removed} removed`, r.failed && `${r.failed} failed`].filter(Boolean);
+    const bits = [r.added && `${r.added} new`, r.updated && `${r.updated} updated`, r.same && `${r.same} already had`, r.older && `${r.older} older skipped`, r.removed && `${r.removed} removed`, r.failed && `${r.failed} failed`].filter(Boolean);
     toast(bits.length ? bits.join(' · ') : 'Nothing new', !!r.failed && !r.added && !r.updated);
     back();
   }).catch(async (e) => {
@@ -1501,6 +1501,29 @@ function tgRunSheet(title, jobId, back) {
     if (e.cancelled) { toast('Stopped. Apps that finished importing were kept.'); return back(); }
     toast(e.message, true);
     back();
+  });
+}
+
+// Go further back in a channel's history than the first import did. Nothing you already have is removed.
+function tgScanSheet(src) {
+  const sizes = [[25, 'Last 25 .ipa posts'], [50, 'Last 50'], [100, 'Last 100'], [250, 'Last 250'], [500, 'Last 500'], [1000, 'Last 1,000'], [0, 'Everything (the whole channel)']];
+  openSheet(`
+    <h2>🔍 Scan older posts</h2>
+    <p class="muted small" style="margin-top:-6px">Looks back through ${esc(src.name)}'s history for .ipa files and adds any apps you don't have yet. Apps already in your library stay exactly as they are, and an older post never replaces a newer version.</p>
+    <div class="field"><label>How far back</label>
+      <select id="dsCount">${sizes.map(([n, l]) => `<option value="${n}" ${n === 100 ? 'selected' : ''}>${l}</option>`).join('')}</select>
+      <div class="hint">${src.deepest ? `Last deep scan went back ${src.deepest} posts. ` : ''}Bigger scans take longer, and you can stop any time. Apps found so far are kept.</div></div>
+    ${src.options && src.options.keywords ? `<p class="hint">Only posts that mention: ${esc(src.options.keywords)} (change this in the channel's settings).</p>` : ''}
+    ${src.options && src.options.storage === 'github' ? '<p class="warning">This channel copies files to GitHub, so a big scan can take a long time. Switch it to "On Telegram" in the channel settings first if you want it fast.</p>' : ''}
+    <button class="btn primary big block" id="dsGo">Start scanning</button>
+    <button class="link-btn block" id="dsBack" type="button">Back</button>`, (el) => {
+    $('#dsBack', el).onclick = () => tgChannelSheet(src.id);
+    $('#dsGo', el).onclick = async () => {
+      try {
+        const { jobId } = await api('POST', `/api/sources/${src.id}/scan`, { count: Number($('#dsCount', el).value) });
+        tgRunSheet(`Scanning ${src.name}…`, jobId, () => tgChannelSheet(src.id));
+      } catch (e) { toast(e.message, true); }
+    };
   });
 }
 
@@ -1548,7 +1571,7 @@ function tgChannelSheet(sid) {
     <div class="field"><label>Name in your library</label><input type="text" id="tcNameIn" value="${esc(src.name)}" maxlength="60"></div>
     <div class="actions">
       <button class="btn primary block" id="tcSave">Save settings</button>
-      <button class="btn block" id="tcRescan">Re-scan recent posts</button>
+      <button class="btn block" id="tcDeep">🔍 Scan older posts</button>
       <button class="btn block" id="tcBackBtn">Back</button>
       <button class="btn block danger" id="tcDel">Remove channel</button>
     </div>`, (el) => {
@@ -1556,10 +1579,7 @@ function tgChannelSheet(sid) {
     $('#tcSync', el).onclick = async () => {
       try { const { jobId } = await api('POST', `/api/sources/${src.id}/sync`); tgRunSheet(`Checking ${src.name}…`, jobId, () => tgChannelSheet(src.id)); } catch (e) { toast(e.message, true); }
     };
-    $('#tcRescan', el).onclick = async () => {
-      if (!confirm('Look through the recent posts again? Apps you already have are skipped unless the post is a newer version.')) return;
-      try { const { jobId } = await api('POST', `/api/sources/${src.id}/sync?rescan=1`); tgRunSheet(`Re-scanning ${src.name}…`, jobId, () => tgChannelSheet(src.id)); } catch (e) { toast(e.message, true); }
-    };
+    $('#tcDeep', el).onclick = () => tgScanSheet(src);
     if ($('#tcBrowse', el)) $('#tcBrowse', el).onclick = () => { closeSheet(); state.lib.cat = `src:${src.name}`; state.lib.q = ''; switchTab('library'); };
     $('#tcSave', el).onclick = async () => {
       try {
