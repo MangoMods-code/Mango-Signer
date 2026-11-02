@@ -14,7 +14,7 @@ const Store = require('./lib/store');
 const ipa = require('./lib/ipa');
 const plist = require('./lib/plist');
 const { parseProvision, profileEntitlements, parseP12, run } = require('./lib/certs');
-const { drawAppIcon } = require('./lib/png');
+const { drawAppIcon, shrinkPng } = require('./lib/png');
 const { qrSvg } = require('./lib/qr');
 const sources = require('./lib/sources');
 const github = require('./lib/github');
@@ -1129,7 +1129,9 @@ route('PATCH', /^\/api\/apps\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
     const f = tmpPath(b.iconUploadId, acc);
     const head = await fsp.readFile(f).then((x) => x.subarray(0, 8)).catch(() => Buffer.alloc(0));
     if (!head.equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) { await rmQuiet(f); return fail(res, 400, 'Icon must be a PNG image'); }
-    await fsp.rename(f, path.join(dirs.apps, app.id + '-custom.png'));
+    const iconBuf = await fsp.readFile(f);
+    await fsp.writeFile(path.join(dirs.apps, app.id + '-custom.png'), shrinkPng(iconBuf, 512));
+    await rmQuiet(f);
     app.customIcon = true;
     app.iconVersion = Date.now();
   }
@@ -1740,6 +1742,39 @@ function storageAlert() {
 setTimeout(() => { certAlerts().catch(() => {}); storageAlert(); }, 20_000);
 setInterval(() => { certAlerts().catch(() => {}); storageAlert(); }, 3 * 3600_000);
 setInterval(() => certAlerts({ checkRevoked: true }).catch(() => {}), 12 * 3600_000);
+
+// Older versions kept each app's full-size icon (often 1024px and over 1 MB). Shrinks any big
+// icon still on disk down to 180px (custom icons to 512px, since they go into signed apps).
+// Runs in the background a few seconds after start; files that are already small are skipped.
+async function shrinkIcons() {
+  let saved = 0;
+  let count = 0;
+  for (const dir of [dirs.apps, dirs.signed]) {
+    const names = await fsp.readdir(dir).catch(() => []);
+    for (const name of names) {
+      if (!/\.png$/i.test(name)) continue;
+      const file = path.join(dir, name);
+      const st = await fsp.stat(file).catch(() => null);
+      if (!st || !st.isFile() || st.size < 60 * 1024) continue;
+      try {
+        const buf = await fsp.readFile(file);
+        const out = shrinkPng(buf, /-custom\.png$/i.test(name) ? 512 : 180);
+        if (out !== buf && out.length < buf.length) {
+          await fsp.writeFile(file + '.tmp', out);
+          await fsp.rename(file + '.tmp', file);
+          saved += buf.length - out.length;
+          count++;
+        }
+      } catch { /* leave it */ }
+      await new Promise((r) => setTimeout(r, 15)); // let requests through
+    }
+  }
+  if (count) {
+    console.log(`Shrunk ${count} icons, freed ${(saved / 1024 ** 2).toFixed(1)} MB`);
+    if (saved > 20 * 1024 ** 2) addAlert('owner', 'storage', `🧹 Freed ${gb(saved)} of icon space`, `${count} app icons were saved at full size by older versions. They've been shrunk — nothing else changed.`);
+  }
+}
+setTimeout(() => shrinkIcons().catch(() => {}), 15_000);
 
 // ----- owner tools: stats, activity, broadcast, backup -----
 const nameOf = (uid) => (uid === 'owner' ? 'you' : (findUser(uid) || {}).username || 'deleted user');
