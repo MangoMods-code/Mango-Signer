@@ -6,6 +6,7 @@ const fsp = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
+const zlib = require('zlib');
 const { pipeline } = require('stream/promises');
 const { Readable, Transform } = require('stream');
 
@@ -14,6 +15,9 @@ const ipa = require('./lib/ipa');
 const plist = require('./lib/plist');
 const { parseProvision, profileEntitlements, parseP12, run } = require('./lib/certs');
 const { drawAppIcon } = require('./lib/png');
+const { qrSvg } = require('./lib/qr');
+const sources = require('./lib/sources');
+const github = require('./lib/github');
 
 const WHATS_NEW = require('./lib/whats-new');
 const VERSION = WHATS_NEW[0].version; // the real version of this code
@@ -52,6 +56,7 @@ for (const a of store.apps) if (a.published === undefined) a.published = true;
 if (store.settings.maxSignedPerUser === undefined) store.settings.maxSignedPerUser = 10;
 if (store.settings.udidLogin === undefined) store.settings.udidLogin = true;
 if (store.settings.signedRetentionDays === undefined) store.settings.signedRetentionDays = 7;
+if (store.settings.deleteAfterInstall === undefined) store.settings.deleteAfterInstall = true;
 if (!store.categories.length && !store.settings.categoriesSeeded) {
   [['🎮', 'Games'], ['🕹️', 'Emulators'], ['💬', 'Social'], ['🎵', 'Music & Video'], ['🧰', 'Utilities'], ['✨', 'Tweaked']]
     .forEach(([emoji, name], i) => store.categories.push({ id: crypto.randomBytes(8).toString('hex'), name, emoji, order: i }));
@@ -61,6 +66,10 @@ for (const a of store.apps) {
   if (a.categoryId === undefined) a.categoryId = null;
   if (a.featured === undefined) a.featured = false;
   if (!a.signDefaults) a.signDefaults = {};
+  if (!Array.isArray(a.tags)) a.tags = [];
+  if (!Array.isArray(a.screenshots)) a.screenshots = [];
+  if (!a.votes || typeof a.votes !== 'object') a.votes = {};
+  if (typeof a.installCount !== 'number') a.installCount = 0;
 }
 store.save();
 
@@ -170,10 +179,19 @@ function baseUrl(req) {
 
 function send(res, status, body, headers = {}) {
   const isBuf = Buffer.isBuffer(body);
-  const data = isBuf || typeof body === 'string' ? body : JSON.stringify(body);
+  let data = isBuf || typeof body === 'string' ? body : JSON.stringify(body);
+  const extra = {};
+  // Big JSON (a library with whole app sources in it) is gzipped — about 20x smaller over cell data.
+  const req = res.req;
+  if (!isBuf && typeof body !== 'string' && data.length > 8192 && req && /\bgzip\b/.test(req.headers['accept-encoding'] || '')) {
+    data = zlib.gzipSync(data, { level: 6 });
+    extra['Content-Encoding'] = 'gzip';
+    extra.Vary = 'Accept-Encoding';
+  }
   res.writeHead(status, {
     'Content-Type': isBuf ? 'application/octet-stream' : typeof body === 'string' ? 'text/plain; charset=utf-8' : 'application/json',
     'Cache-Control': 'no-store',
+    ...extra,
     ...headers,
   });
   res.end(data);
@@ -223,14 +241,21 @@ async function serveFile(req, res, file, { type, download, cache = 'no-store', o
     if (start > end) { res.writeHead(416, { 'Content-Range': `bytes */${st.size}` }); return res.end(); }
     res.writeHead(206, { ...headers, 'Content-Range': `bytes ${start}-${end}/${st.size}`, 'Content-Length': end - start + 1 });
     if (req.method === 'HEAD') return res.end();
-    return pipeline(fs.createReadStream(file, { start, end }), counter(onBytes), res).then(() => onDone && onDone(), () => {});
+    return pipeline(fs.createReadStream(file, { start, end }), counter(onBytes, onDone), res).catch(() => {});
   }
   res.writeHead(200, { ...headers, 'Content-Length': st.size });
   if (req.method === 'HEAD') return res.end();
-  return pipeline(fs.createReadStream(file), counter(onBytes), res).then(() => onDone && onDone(), () => {});
+  return pipeline(fs.createReadStream(file), counter(onBytes, onDone), res).catch(() => {});
 }
-function counter(onBytes) {
-  return new Transform({ transform(chunk, _enc, cb) { if (onBytes) onBytes(chunk.length); cb(null, chunk); } });
+// Counts bytes as they're sent, and reports when the whole file has been handed to the connection.
+function counter(onBytes, onEnd) {
+  return new Transform({
+    transform(chunk, _enc, cb) { if (onBytes) onBytes(chunk.length); cb(null, chunk); },
+    flush(cb) {
+      try { if (onEnd) onEnd(); } catch (e) { console.error('install tracking:', e); }
+      cb();
+    },
+  });
 }
 
 // Temp uploads belong to whoever uploaded them. Chunked uploads track how much has arrived.
@@ -290,6 +315,41 @@ function parseCheckOutput(text) {
   return { status, ocsp, fields };
 }
 
+// ---------- disk space ----------
+// Railway volumes have a fixed size (5 GB on Hobby), so check free space before big jobs.
+function diskInfo() {
+  try {
+    const st = fs.statfsSync(DATA_DIR);
+    return { total: st.blocks * st.bsize, free: st.bavail * st.bsize };
+  } catch { return null; }
+}
+const gb = (b) => (b >= 1024 ** 3 ? `${(b / 1024 ** 3).toFixed(2)} GB` : `${Math.max(1, Math.round(b / 1048576))} MB`);
+const storageFullMessage = () => {
+  const d = diskInfo();
+  return `Your server's storage is full${d ? ` (${gb(d.total - d.free)} of ${gb(d.total)} used)` : ''}. Delete old signed apps or library apps in Settings › Storage, then try again.`;
+};
+const isNoSpace = (e) => e && (e.code === 'ENOSPC' || e.code === 'EDQUOT' || /ENOSPC|no space left/i.test(String(e.message)));
+
+// Deletes a signed copy (file, icon and record).
+async function removeSigned(s) {
+  const i = store.signed.indexOf(s);
+  if (i >= 0) store.signed.splice(i, 1);
+  await rmQuiet(path.join(dirs.signed, s.id + '.ipa'));
+  await rmQuiet(path.join(dirs.signed, s.id + '.png'));
+}
+
+// Each person keeps only one signed copy of each app — the newest one.
+async function dedupeSigned() {
+  const seen = new Set();
+  let removed = 0;
+  for (const s of [...store.signed].sort((a, b) => String(b.signedAt).localeCompare(String(a.signedAt)))) {
+    const key = `${s.ownerId}:${s.appId}`;
+    if (seen.has(key)) { await removeSigned(s); removed++; } else seen.add(key);
+  }
+  if (removed) { store.save(); console.log(`Removed ${removed} duplicate signed cop${removed === 1 ? 'y' : 'ies'}`); }
+}
+dedupeSigned().catch((e) => console.error('dedupe:', e));
+
 // ---------- jobs (with a small signing queue) ----------
 const jobs = new Map();
 function newJob(account) {
@@ -333,10 +393,29 @@ function certView(c, acc) {
   };
 }
 function appView(a, acc) {
-  if (isOwner(acc)) return { ...a };
-  const { fileName, source, ...rest } = a;
-  return rest;
+  const votes = Object.values(a.votes || {});
+  const mine = [...store.installLog].reverse().find((l) => l.ownerId === acc.id && l.appId === a.id);
+  const extra = {
+    likes: votes.filter((v) => v > 0).length,
+    dislikes: votes.filter((v) => v < 0).length,
+    myVote: (a.votes || {})[acc.id] || 0,
+    installed: mine ? { version: mine.shownVersion || mine.version, at: mine.at } : null,
+  };
+  const { votes: _v, remote, ...base } = a;
+  if (remote) {
+    const src = remote.sourceId && store.sources.find((x) => x.id === remote.sourceId);
+    extra.cloud = remote.kind; // 'link' | 'source' | 'github'
+    extra.sourceName = src ? src.name : null;
+    extra.missing = !!remote.missing;
+    extra.versions = (remote.versions || []).map((v) => ({ version: v.version, date: v.date, size: v.size, notes: (v.notes || '').slice(0, 400), channel: v.channel }));
+    extra.remoteScreens = remote.screenshots || [];
+    if (isOwner(acc)) extra.remoteUrl = remote.kind === 'github' ? null : remote.url;
+  }
+  if (isOwner(acc)) return { ...base, ...extra };
+  const { fileName, source, ...rest } = base;
+  return { ...rest, ...extra };
 }
+const shownAppVersion = (a) => a.versionOverride || a.version || '';
 function signedView(s, req) {
   const base = baseUrl(req);
   const manifest = `${base}/i/${s.token}/manifest.plist`;
@@ -370,7 +449,7 @@ function setDefaultCert(acc, certId) {
 }
 const myCerts = (acc) => store.certs.filter((c) => c.ownerId === acc.id);
 const mySigned = (acc) => store.signed.filter((s) => s.ownerId === acc.id);
-const visibleApps = (acc) => (isOwner(acc) ? store.apps : store.apps.filter((a) => a.published));
+const visibleApps = (acc) => (isOwner(acc) ? store.apps : store.apps.filter((a) => a.published && !(a.remote && a.remote.missing)));
 
 // ---------- routing ----------
 // access: 'open' (anyone), 'user' (any logged-in account), 'owner'
@@ -584,10 +663,13 @@ async function storageBreakdown() {
 // Signed .ipa files are only needed to install, so old ones are deleted to save space.
 // The record stays so people can see it and tap "Sign again".
 async function cleanupSignedFiles(maxAgeDays = Number(store.settings.signedRetentionDays)) {
-  if (!maxAgeDays) return 0;
   let n = 0;
   for (const s of store.signed) {
-    if (s.fileDeleted || Date.now() - new Date(s.signedAt) < maxAgeDays * 864e5) continue;
+    if (s.fileDeleted) continue;
+    // Once an app finished installing, its signed file isn't needed any more (kept 15 minutes in case iOS retries).
+    const installedLongEnough = store.settings.deleteAfterInstall && s.installedAt && Date.now() - new Date(s.installedAt) > 15 * 60 * 1000;
+    const tooOld = maxAgeDays && Date.now() - new Date(s.signedAt) >= maxAgeDays * 864e5;
+    if (!installedLongEnough && !tooOld) continue;
     await rmQuiet(path.join(dirs.signed, s.id + '.ipa'));
     s.fileDeleted = true;
     n++;
@@ -595,7 +677,7 @@ async function cleanupSignedFiles(maxAgeDays = Number(store.settings.signedReten
   if (n) store.save();
   return n;
 }
-setInterval(() => cleanupSignedFiles().catch(() => {}), 60 * 60 * 1000).unref();
+setInterval(() => cleanupSignedFiles().catch(() => {}), 5 * 60 * 1000).unref();
 
 route('GET', /^\/api\/state$/, async (req, res, m, acc) => {
   const base = baseUrl(req);
@@ -605,13 +687,20 @@ route('GET', /^\/api\/state$/, async (req, res, m, acc) => {
     categories: sortedCategories(),
     certs: myCerts(acc).map((c) => certView(c, acc)),
     signed: mySigned(acc).map((s) => signedView(s, req)),
+    collections: sortedCollections().filter((c) => isOwner(acc) || c.appIds.some((aid) => visibleApps(acc).some((a) => a.id === aid))),
+    requests: (isOwner(acc) ? store.requests : store.requests.filter((r) => r.ownerId === acc.id)).slice(-200).reverse(),
+    installs: store.installLog.filter((l) => l.ownerId === acc.id).slice(-60).reverse(),
+    announcement: store.settings.announcement && store.settings.announcement.text ? store.settings.announcement : null,
     server: { baseUrl: base, https: base.startsWith('https://'), version: displayVersion(), codeVersion: VERSION },
   };
   if (isOwner(acc)) {
-    out.settings = store.settings;
+    const { github: _gh, ...ownerSettings } = store.settings; // the GitHub token never leaves the server, even encrypted
+    out.settings = ownerSettings;
     out.users = store.users.map(userView);
     out.invites = store.invites;
-    out.server = { ...out.server, zsign: zsignVersion, passwordSet: !!APP_PASSWORD, storage: await storageUsed(), storageBreakdown: await storageBreakdown() };
+    out.sources = store.sources.map(sourceView);
+    out.github = ghView();
+    out.server = { ...out.server, zsign: zsignVersion, passwordSet: !!APP_PASSWORD, storage: await storageUsed(), storageBreakdown: await storageBreakdown(), disk: diskInfo() };
   } else {
     out.settings = { maxSignedPerUser: store.settings.maxSignedPerUser, signedRetentionDays: store.settings.signedRetentionDays };
   }
@@ -650,6 +739,10 @@ route('POST', /^\/api\/upload\/start$/, async (req, res, m, acc) => {
   const limit = isOwner(acc) ? MAX_UPLOAD : MAX_USER_UPLOAD;
   if (!Number.isFinite(total) || total <= 0) return fail(res, 400, 'Empty file');
   if (total > limit) return fail(res, 413, 'File is too large');
+  const disk = diskInfo();
+  if (disk && total + 64 * 1048576 > disk.free) {
+    return fail(res, 507, `Not enough space on your server for this file (it's ${gb(total)}, ${gb(disk.free)} is free). Delete old signed apps or library apps in Settings › Storage first.`);
+  }
   const piece = Math.min(32, Math.max(1, Math.round(Number(chunkSize) / 1048576) || 8)) * 1048576;
   const uid = id();
   const file = path.join(dirs.tmp, uid);
@@ -734,6 +827,7 @@ async function addAppFromFile(file, fileName, source) {
     name: meta.name, originalName: meta.name, ...metaFields(meta),
     published: true, featured: false, categoryId: null, description: '', notes: '', developer: '',
     customIcon: false, useIconWhenSigning: true, signDefaults: {},
+    tags: [], screenshots: [], votes: {}, installCount: 0,
   };
   store.apps.unshift(rec);
   store.save();
@@ -789,7 +883,19 @@ function parseLink(url) {
 route('POST', /^\/api\/apps$/, async (req, res, m, acc) => {
   const { uploadId, fileName } = await readJson(req);
   const rec = await addAppFromFile(tmpPath(uploadId, acc), String(fileName || '').slice(0, 200), 'upload');
-  json(res, { app: appView(rec, acc) });
+  const g = ghSettings();
+  if (!g || g.storeUploads === false || !ghClient()) return json(res, { app: appView(rec, acc) });
+  // GitHub storage is on: send the file there and free the space on this server.
+  const job = newJob(acc);
+  json(res, { jobId: job.id });
+  try {
+    await moveToGithub(rec, job);
+    job.log.push('Saved to GitHub ✓');
+  } catch (e) {
+    job.log.push(`Couldn't send it to GitHub (${e.message}), so it's kept on the server.`);
+  }
+  job.result = { app: appView(rec, acc) };
+  job.status = 'done';
 }, 'owner');
 
 route('POST', /^\/api\/apps\/import$/, async (req, res, m, acc) => {
@@ -806,7 +912,7 @@ route('POST', /^\/api\/apps\/import$/, async (req, res, m, acc) => {
       job.result = { app: appView(rec, acc) };
       job.status = 'done';
     } catch (e) {
-      job.error = e.message;
+      job.error = isNoSpace(e) ? storageFullMessage() : e.message;
       job.status = 'error';
     }
   })();
@@ -815,19 +921,53 @@ route('POST', /^\/api\/apps\/import$/, async (req, res, m, acc) => {
 route('POST', /^\/api\/apps\/([a-f0-9]{16})\/replace$/, async (req, res, m, acc) => {
   const app = store.apps.find((a) => a.id === m[1]);
   if (!app) return fail(res, 404, 'App not found');
-  const { uploadId, url } = await readJson(req);
+  const { uploadId, url, linkOnly } = await readJson(req);
+  if (app.remote && app.remote.kind === 'source') return fail(res, 400, 'Apps from a source update themselves when the source does');
   if (uploadId) {
-    await replaceAppFile(app, tmpPath(uploadId, acc));
+    const oldRemote = app.remote;
+    delete app.remote;
+    try { await replaceAppFile(app, tmpPath(uploadId, acc)); } catch (e) { if (oldRemote) app.remote = oldRemote; throw e; }
+    if (oldRemote && oldRemote.kind === 'github') { const gh = ghClient(); if (gh) gh.deleteAsset(oldRemote.assetId).catch(() => {}); }
+    const g = ghSettings();
+    if (g && g.storeUploads !== false && ghClient()) {
+      const job = newJob(acc);
+      json(res, { jobId: job.id });
+      try { await moveToGithub(app, job); } catch (e) { job.log.push(`Kept on the server (${e.message})`); }
+      job.result = { app: appView(app, acc) };
+      job.status = 'done';
+      return;
+    }
     return json(res, { app: appView(app, acc) });
   }
   const u = parseLink(url);
+  if (linkOnly === true || (linkOnly === undefined && app.remote && app.remote.kind === 'link')) {
+    const job = newJob(acc);
+    json(res, { jobId: job.id });
+    (async () => {
+      try {
+        const meta = await inspectLink(u.toString(), null, job);
+        const oldShown = app.versionOverride || app.version;
+        Object.assign(app, metaFields(meta), { updatedAt: new Date().toISOString(), previousVersion: oldShown, versionOverride: null });
+        if (meta.icon && !app.customIcon) await fsp.writeFile(path.join(dirs.apps, app.id + '.png'), meta.icon);
+        await rmQuiet(path.join(dirs.apps, app.id + '.ipa'));
+        app.remote = { kind: 'link', url: u.toString() };
+        store.save();
+        job.result = { app: appView(app, acc) };
+        job.status = 'done';
+      } catch (e) { job.error = e.message; job.status = 'error'; }
+    })();
+    return;
+  }
   const job = newJob(acc);
   json(res, { jobId: job.id });
   (async () => {
     try {
       const dest = await downloadToTmp(u, job);
       job.log.push('Reading app info…');
-      await replaceAppFile(app, dest);
+      const oldRemote = app.remote;
+      delete app.remote;
+      try { await replaceAppFile(app, dest); } catch (e) { if (oldRemote) app.remote = oldRemote; throw e; }
+      if (oldRemote && oldRemote.kind === 'github') { const gh = ghClient(); if (gh) gh.deleteAsset(oldRemote.assetId).catch(() => {}); }
       job.result = { app: appView(app, acc) };
       job.status = 'done';
     } catch (e) {
@@ -854,6 +994,11 @@ route('PATCH', /^\/api\/apps\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
   const app = store.apps.find((a) => a.id === m[1]);
   if (!app) return fail(res, 404, 'App not found');
   const b = await readJson(req);
+  if (app.remote && app.remote.kind === 'source') {
+    // Remember what you changed so the next source sync doesn't undo it.
+    const changed = ['name', 'description', 'developer', 'notes', 'published', 'categoryId'].filter((k) => b[k] !== undefined && b[k] !== app[k]);
+    if (changed.length) lockFields(app, changed);
+  }
   if (typeof b.name === 'string' && b.name.trim()) app.name = b.name.trim().slice(0, 80);
   if (typeof b.description === 'string') app.description = b.description.trim().slice(0, 1500);
   if (typeof b.notes === 'string') app.notes = b.notes.trim().slice(0, 1500);
@@ -867,6 +1012,9 @@ route('PATCH', /^\/api\/apps\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
     app.versionOverride = v || null;
   }
   if (typeof b.useVersionWhenSigning === 'boolean') app.useVersionWhenSigning = b.useVersionWhenSigning;
+  if (Array.isArray(b.tags)) {
+    app.tags = [...new Set(b.tags.map((t) => String(t).trim().slice(0, 24)).filter(Boolean))].slice(0, 10);
+  }
   if (b.categoryId !== undefined) {
     if (b.categoryId && !store.categories.some((c) => c.id === b.categoryId)) return fail(res, 400, 'Category not found');
     app.categoryId = b.categoryId || null;
@@ -890,11 +1038,18 @@ route('PATCH', /^\/api\/apps\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
   json(res, { app: appView(app, acc) });
 }, 'owner');
 
-async function deleteApp(appId) {
+async function deleteApp(appId, { keepRemote = false } = {}) {
   const i = store.apps.findIndex((a) => a.id === appId);
   if (i < 0) return false;
+  const app = store.apps[i];
+  if (!keepRemote && app.remote && app.remote.kind === 'github') {
+    const gh = ghClient();
+    if (gh) await gh.deleteAsset(app.remote.assetId).catch((e) => console.error('GitHub delete:', e.message));
+  }
   store.apps.splice(i, 1);
   for (const suffix of ['.ipa', '.png', '-custom.png']) await rmQuiet(path.join(dirs.apps, appId + suffix));
+  await rmQuiet(path.join(dirs.apps, appId + '-shots'));
+  for (const c of store.collections) c.appIds = c.appIds.filter((x) => x !== appId);
   return true;
 }
 
@@ -926,13 +1081,558 @@ route('GET', /^\/api\/apps\/([a-f0-9]{16})\/icon$/, (req, res, m, acc) => {
   const app = visibleApps(acc).find((a) => a.id === m[1]);
   if (!app) return fail(res, 404, 'Not found');
   const file = app.customIcon ? path.join(dirs.apps, m[1] + '-custom.png') : path.join(dirs.apps, m[1] + '.png');
+  if (!app.customIcon && app.iconURL && !fs.existsSync(file)) {
+    res.writeHead(302, { Location: app.iconURL, 'Cache-Control': 'private, max-age=3600' });
+    return res.end();
+  }
   return serveFile(req, res, file, { cache: 'private, max-age=86400' });
 });
 
-route('GET', /^\/api\/apps\/([a-f0-9]{16})\/download$/, (req, res, m) => {
+route('GET', /^\/api\/apps\/([a-f0-9]{16})\/download$/, async (req, res, m) => {
   const app = store.apps.find((a) => a.id === m[1]);
   if (!app) return fail(res, 404, 'App not found');
+  if (app.remote) {
+    const dl = remoteDownload(app);
+    if (!dl.headers) { res.writeHead(302, { Location: dl.url }); return res.end(); }
+    // Private GitHub file: pass it through so the token stays on the server.
+    const r = await fetchAuthed(dl.url, dl.headers);
+    if (!r.ok || !r.body) return fail(res, 502, `Couldn't get the file (HTTP ${r.status})`);
+    res.writeHead(200, {
+      'Content-Type': 'application/octet-stream',
+      'Content-Disposition': `attachment; filename="${`${app.name} ${app.version}.ipa`.replace(/[^\w.\- ]/g, '_')}"`,
+      ...(r.headers.get('content-length') ? { 'Content-Length': r.headers.get('content-length') } : {}),
+    });
+    return pipeline(Readable.fromWeb(r.body), res).catch(() => {});
+  }
   return serveFile(req, res, path.join(dirs.apps, m[1] + '.ipa'), { download: `${app.name} ${app.version}.ipa` });
+}, 'owner');
+
+// ----- cloud library: link-only apps, sources and GitHub storage -----
+// Link-only apps keep just a download link (and a small icon). The .ipa is fetched only while signing.
+function remoteDownload(app, versionIndex = 0) {
+  const r = app.remote;
+  if (r.kind === 'github') {
+    const gh = ghClient();
+    if (!gh) throw httpError(400, 'GitHub storage is not connected. Reconnect it in Settings › GitHub storage.');
+    return { ...gh.download(r.assetId), size: app.size, version: app.version };
+  }
+  if (r.kind === 'source' && Array.isArray(r.versions) && r.versions.length) {
+    const v = r.versions[Math.min(versionIndex, r.versions.length - 1)];
+    return { url: v.url, headers: null, size: v.size || (versionIndex ? 0 : app.size), version: v.version };
+  }
+  return { url: r.url, headers: null, size: app.size, version: app.version };
+}
+
+// Fetches a link that may need a login header. The header is only sent to the first address:
+// if it redirects (GitHub sends you to a short-lived download link), the next hop gets no token.
+async function fetchAuthed(url, headers) {
+  if (!headers) return fetch(url, { headers: { 'User-Agent': 'Mango-Signer' }, redirect: 'follow' });
+  const first = await fetch(url, { headers: { 'User-Agent': 'Mango-Signer', ...headers }, redirect: 'manual' });
+  if (first.status >= 300 && first.status < 400 && first.headers.get('location')) {
+    first.body && first.body.cancel().catch(() => {});
+    return fetch(new URL(first.headers.get('location'), url), { headers: { 'User-Agent': 'Mango-Signer' }, redirect: 'follow' });
+  }
+  return first;
+}
+
+async function fetchToFile(url, headers, dest, job, label) {
+  if (job && label) job.log.push(label);
+  const r = await fetchAuthed(url, headers);
+  if (!r.ok || !r.body) throw new Error(`Download failed (HTTP ${r.status}). The link may have moved or expired.`);
+  if (/text\/html/i.test(r.headers.get('content-type') || '')) {
+    r.body.cancel().catch(() => {});
+    throw new Error('That link opens a web page, not an app file. Use a direct download link.');
+  }
+  const total = Number(r.headers.get('content-length')) || 0;
+  let got = 0;
+  let lastLog = 0;
+  const body = Readable.fromWeb(r.body);
+  body.on('data', (c) => {
+    got += c.length;
+    if (job) {
+      job.progress = total ? got / total : null;
+      if (total && Date.now() - lastLog > 3000) { lastLog = Date.now(); job.log.push(`Downloaded ${Math.floor((100 * got) / total)}%`); }
+    }
+    if (got > MAX_UPLOAD) body.destroy(new Error('File is too large'));
+  });
+  try {
+    await pipeline(body, fs.createWriteStream(dest));
+  } catch (e) {
+    await rmQuiet(dest);
+    throw e;
+  }
+  return got;
+}
+
+// Reads app info from a link without downloading the whole file (falls back to a full download if the server can't do that).
+async function inspectLink(url, headers, job) {
+  try {
+    return await ipa.inspect({ url, headers: headers || undefined });
+  } catch (e) {
+    if (!e.noRange) throw e;
+    const tmp = path.join(dirs.tmp, id());
+    try {
+      await fetchToFile(url, headers, tmp, job, "This link can't be read in parts — downloading it once to read the app info…");
+      return await ipa.inspect(tmp);
+    } finally { await rmQuiet(tmp); }
+  }
+}
+
+function newLibraryRecord(meta, extra = {}) {
+  const now = new Date().toISOString();
+  return {
+    id: id(), addedAt: now, updatedAt: now,
+    name: meta.name, originalName: meta.name,
+    bundleId: meta.bundleId || '', version: meta.version || '', build: meta.build || '', minOS: meta.minOS || '',
+    extensions: meta.extensions || 0, hasWatch: !!meta.hasWatch, size: meta.size || 0, hasIcon: !!meta.icon,
+    published: true, featured: false, categoryId: null, description: '', notes: '', developer: '',
+    customIcon: false, useIconWhenSigning: true, signDefaults: {},
+    tags: [], screenshots: [], votes: {}, installCount: 0,
+    ...extra,
+  };
+}
+
+// Owner edits "lock" a field so syncing a source never overwrites it.
+function lockFields(app, fields) {
+  app.locked = [...new Set([...(app.locked || []), ...fields])];
+}
+
+route('POST', /^\/api\/apps\/link$/, async (req, res, m, acc) => {
+  const { url } = await readJson(req);
+  const u = parseLink(url);
+  const job = newJob(acc);
+  json(res, { jobId: job.id });
+  (async () => {
+    try {
+      job.log.push(`Reading app info from ${u.hostname}…`);
+      const meta = await inspectLink(u.toString(), null, job);
+      const rec = newLibraryRecord(meta, { fileName: decodeURIComponent(path.basename(u.pathname)) || 'app.ipa', source: 'link', remote: { kind: 'link', url: u.toString() } });
+      if (meta.icon) await fsp.writeFile(path.join(dirs.apps, rec.id + '.png'), meta.icon);
+      store.apps.unshift(rec);
+      store.save();
+      job.result = { app: appView(rec, acc) };
+      job.status = 'done';
+    } catch (e) {
+      job.error = isNoSpace(e) ? storageFullMessage() : e.message;
+      job.status = 'error';
+    }
+  })();
+}, 'owner');
+
+// ----- sources -----
+async function fetchJson(url) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 30000);
+  try {
+    const r = await fetch(url, { headers: { 'User-Agent': 'Mango-Signer', Accept: 'application/json' }, redirect: 'follow', signal: ctrl.signal });
+    if (!r.ok) throw new Error(`Couldn't load the source (HTTP ${r.status})`);
+    const len = Number(r.headers.get('content-length')) || 0;
+    if (len > 25 * 1048576) throw new Error('That source is too big');
+    const text = await r.text();
+    if (text.length > 25 * 1048576) throw new Error('That source is too big');
+    try { return JSON.parse(text); } catch { throw new Error("That link isn't a source (it isn't JSON)"); }
+  } catch (e) {
+    if (e.name === 'AbortError') throw new Error('The source took too long to load');
+    throw e;
+  } finally { clearTimeout(t); }
+}
+
+function categoryIdFor(name) {
+  const c = sources.categoryFor(name);
+  if (!c) return null;
+  let cat = store.categories.find((x) => x.name.toLowerCase() === c.name.toLowerCase());
+  if (!cat) {
+    cat = { id: id(), name: c.name.slice(0, 30), emoji: c.emoji || '📁', order: store.categories.length };
+    store.categories.push(cat);
+  }
+  return cat.id;
+}
+
+async function syncSource(src) {
+  const parsed = sources.parseSource(await fetchJson(src.url));
+  const mine = store.apps.filter((a) => a.remote && a.remote.kind === 'source' && a.remote.sourceId === src.id);
+  const byKey = new Map(mine.map((a) => [a.remote.key, a]));
+  const seen = new Set();
+  let added = 0, updated = 0;
+  for (const s of parsed.apps) {
+    seen.add(s.key);
+    const v = s.versions[0];
+    const fields = {
+      name: s.name, developer: s.developer, description: s.description,
+      bundleId: s.bundleId, version: v.version, size: v.size, minOS: v.minOS,
+    };
+    const remote = { kind: 'source', sourceId: src.id, key: s.key, url: v.url, versions: s.versions, screenshots: s.screenshots };
+    let app = byKey.get(s.key);
+    if (!app) {
+      app = newLibraryRecord({ name: s.name, bundleId: s.bundleId, version: v.version, minOS: v.minOS, size: v.size }, {
+        source: 'source', remote, developer: s.developer, description: s.description,
+        iconURL: s.iconURL || '', hasIcon: !!s.iconURL, published: src.showInLibrary !== false,
+        categoryId: categoryIdFor(s.category), notes: v.notes || '',
+      });
+      store.apps.push(app);
+      added++;
+      continue;
+    }
+    const locked = new Set(app.locked || []);
+    const oldVersion = app.version;
+    for (const [k, val] of Object.entries(fields)) if (!locked.has(k) && val !== undefined && val !== '' && val !== 0) app[k] = val;
+    if (!locked.has('notes') && v.notes) app.notes = v.notes;
+    app.iconURL = s.iconURL || app.iconURL;
+    app.hasIcon = app.hasIcon || !!app.iconURL;
+    app.remote = remote;
+    if (oldVersion && v.version && oldVersion !== v.version) {
+      app.previousVersion = app.versionOverride || oldVersion;
+      app.updatedAt = new Date().toISOString();
+      updated++;
+    }
+  }
+  let removed = 0;
+  for (const a of mine) {
+    if (!seen.has(a.remote.key)) { if (!a.remote.missing) removed++; a.remote.missing = true; } else delete a.remote.missing;
+  }
+  Object.assign(src, {
+    name: src.customName || parsed.name, iconURL: parsed.iconURL, subtitle: parsed.subtitle,
+    appCount: parsed.apps.length, lastSync: new Date().toISOString(), lastError: null,
+  });
+  store.save();
+  return { added, updated, removed, total: parsed.apps.length };
+}
+
+const sourceView = (src) => ({ ...src, apps: store.apps.filter((a) => a.remote && a.remote.sourceId === src.id && !a.remote.missing).length });
+
+route('POST', /^\/api\/sources$/, async (req, res) => {
+  const b = await readJson(req);
+  let url;
+  try { url = sources.normalizeSourceUrl(b.url); } catch (e) { return fail(res, 400, e.message); }
+  if (store.sources.some((x) => x.url === url)) return fail(res, 400, 'That source is already added');
+  const src = { id: id(), url, name: 'Source', showInLibrary: b.showInLibrary !== false, addedAt: new Date().toISOString() };
+  try {
+    store.sources.push(src);
+    const result = await syncSource(src);
+    json(res, { source: sourceView(src), result });
+  } catch (e) {
+    store.sources.splice(store.sources.indexOf(src), 1);
+    store.save();
+    fail(res, 400, e.message);
+  }
+}, 'owner');
+
+route('POST', /^\/api\/sources\/([a-f0-9]{16})\/sync$/, async (req, res, m) => {
+  const src = store.sources.find((x) => x.id === m[1]);
+  if (!src) return fail(res, 404, 'Source not found');
+  try {
+    const result = await syncSource(src);
+    json(res, { source: sourceView(src), result });
+  } catch (e) {
+    src.lastError = e.message;
+    store.save();
+    fail(res, 502, e.message);
+  }
+}, 'owner');
+
+route('PATCH', /^\/api\/sources\/([a-f0-9]{16})$/, async (req, res, m) => {
+  const src = store.sources.find((x) => x.id === m[1]);
+  if (!src) return fail(res, 404, 'Source not found');
+  const b = await readJson(req);
+  if (typeof b.showInLibrary === 'boolean') {
+    src.showInLibrary = b.showInLibrary;
+    for (const a of store.apps) if (a.remote && a.remote.sourceId === src.id && !(a.locked || []).includes('published')) a.published = b.showInLibrary;
+  }
+  if (typeof b.name === 'string' && b.name.trim()) { src.customName = b.name.trim().slice(0, 60); src.name = src.customName; }
+  store.save();
+  json(res, { source: sourceView(src) });
+}, 'owner');
+
+route('DELETE', /^\/api\/sources\/([a-f0-9]{16})$/, async (req, res, m) => {
+  const i = store.sources.findIndex((x) => x.id === m[1]);
+  if (i < 0) return fail(res, 404, 'Source not found');
+  for (const a of store.apps.filter((x) => x.remote && x.remote.sourceId === m[1])) await deleteApp(a.id);
+  store.sources.splice(i, 1);
+  store.save();
+  json(res, { ok: true });
+}, 'owner');
+
+// Keep sources fresh: check them every 6 hours.
+setInterval(async () => {
+  for (const src of store.sources) {
+    try { await syncSource(src); } catch (e) { src.lastError = e.message; store.save(); }
+  }
+}, 6 * 60 * 60 * 1000).unref();
+
+// ----- GitHub storage -----
+function ghSettings() { return store.settings.github || null; }
+function ghClient() {
+  const g = ghSettings();
+  if (!g || !g.tokenEnc || !g.owner || !g.repo) return null;
+  try { return github.client({ owner: g.owner, repo: g.repo, token: decrypt(g.tokenEnc) }); } catch { return null; }
+}
+const ghView = () => {
+  const g = ghSettings();
+  if (!g) return { connected: false };
+  return {
+    connected: !!(g.tokenEnc && g.releaseId), owner: g.owner, repo: g.repo, tag: g.tag, private: g.private,
+    lastSync: g.lastSync || null, lastError: g.lastError || null, storeUploads: g.storeUploads !== false,
+    apps: store.apps.filter((a) => a.remote && a.remote.kind === 'github').length,
+  };
+};
+
+async function ghSync() {
+  const g = ghSettings();
+  const gh = ghClient();
+  if (!gh || !g.releaseId) throw httpError(400, 'Connect GitHub storage first');
+  const assets = (await gh.listAssets(g.releaseId)).filter((x) => /\.ipa$/i.test(x.name));
+  const existing = store.apps.filter((a) => a.remote && a.remote.kind === 'github');
+  const byAsset = new Map(existing.map((a) => [String(a.remote.assetId), a]));
+  let added = 0, failed = [];
+  for (const asset of assets) {
+    if (byAsset.has(String(asset.id))) { byAsset.delete(String(asset.id)); continue; }
+    try {
+      const dl = gh.download(asset.id);
+      const meta = await inspectLink(dl.url, dl.headers);
+      const rec = newLibraryRecord({ ...meta, size: asset.size }, { fileName: asset.name, source: 'github', remote: { kind: 'github', assetId: asset.id, name: asset.name } });
+      if (meta.icon) await fsp.writeFile(path.join(dirs.apps, rec.id + '.png'), meta.icon);
+      store.apps.unshift(rec);
+      added++;
+    } catch (e) { failed.push(`${asset.name}: ${e.message}`); }
+  }
+  // Files deleted from GitHub disappear from the library too.
+  let removed = 0;
+  for (const app of byAsset.values()) { await deleteApp(app.id, { keepRemote: true }); removed++; }
+  g.lastSync = new Date().toISOString();
+  g.lastError = failed.length ? failed.slice(0, 3).join('; ') : null;
+  store.save();
+  return { added, removed, failed: failed.length, total: assets.length };
+}
+
+// Sends a local .ipa to the GitHub release and turns the library app into a link-only one.
+async function moveToGithub(app, job) {
+  const g = ghSettings();
+  const gh = ghClient();
+  if (!gh || !g.releaseId) throw new Error('Connect GitHub storage first');
+  const file = path.join(dirs.apps, app.id + '.ipa');
+  if (!fs.existsSync(file)) throw new Error('No local file to move');
+  const size = (await fsp.stat(file)).size;
+  const safe = `${(app.originalName || app.name).replace(/[^\w.\-]+/g, '_')}-${app.version || 'app'}-${app.id.slice(0, 6)}.ipa`;
+  if (job) job.log.push(`Sending ${app.name} to GitHub…`);
+  const asset = await gh.uploadAsset(g.releaseId, safe, file, size, (p) => { if (job) job.progress = p; });
+  app.remote = { kind: 'github', assetId: asset.id, name: asset.name };
+  app.size = size;
+  store.save();
+  await rmQuiet(file);
+  return app;
+}
+
+route('PUT', /^\/api\/github$/, async (req, res) => {
+  const b = await readJson(req);
+  const owner = String(b.owner || '').trim();
+  const repo = String(b.repo || '').trim().replace(/\.git$/, '');
+  const tag = String(b.tag || 'mango-library').trim() || 'mango-library';
+  const prev = ghSettings() || {};
+  const token = String(b.token || '').trim() || (prev.tokenEnc ? decrypt(prev.tokenEnc) : '');
+  if (!/^[\w.-]+$/.test(owner) || !/^[\w.-]+$/.test(repo)) return fail(res, 400, 'Enter the repo as owner and name, e.g. MangoMods-code and mango-ipas');
+  if (!token) return fail(res, 400, 'Paste your GitHub token');
+  if (!/^[\w.-]+$/.test(tag)) return fail(res, 400, 'Release tag can only use letters, numbers, dots and dashes');
+  const gh = github.client({ owner, repo, token });
+  try {
+    const info = await gh.getRepo();
+    const rel = await gh.ensureRelease(tag);
+    store.settings.github = {
+      ...prev, owner, repo, tag, tokenEnc: encrypt(token), releaseId: rel.id, private: !!info.private,
+      storeUploads: prev.storeUploads !== false, lastError: null,
+    };
+    store.save();
+    const result = await ghSync().catch((e) => ({ error: e.message }));
+    json(res, { github: ghView(), result });
+  } catch (e) {
+    fail(res, 400, e.message);
+  }
+}, 'owner');
+
+route('PATCH', /^\/api\/github$/, async (req, res) => {
+  const g = ghSettings();
+  if (!g) return fail(res, 400, 'Connect GitHub storage first');
+  const b = await readJson(req);
+  if (typeof b.storeUploads === 'boolean') g.storeUploads = b.storeUploads;
+  store.save();
+  json(res, { github: ghView() });
+}, 'owner');
+
+route('DELETE', /^\/api\/github$/, (req, res) => {
+  delete store.settings.github;
+  store.save();
+  json(res, { github: ghView() });
+}, 'owner');
+
+route('POST', /^\/api\/github\/sync$/, async (req, res) => {
+  try { json(res, { github: ghView(), result: await ghSync() }); } catch (e) { fail(res, e.status || 502, e.message); }
+}, 'owner');
+
+route('POST', /^\/api\/github\/move$/, async (req, res, m, acc) => {
+  const { ids } = await readJson(req);
+  const list = store.apps.filter((a) => !a.remote && (!Array.isArray(ids) || ids.includes(a.id)));
+  if (!ghClient()) return fail(res, 400, 'Connect GitHub storage first');
+  if (!list.length) return fail(res, 400, 'Nothing to move — every app is already off the server');
+  const job = newJob(acc);
+  json(res, { jobId: job.id, count: list.length });
+  (async () => {
+    let moved = 0, freed = 0;
+    const errors = [];
+    for (const [i, app] of list.entries()) {
+      try {
+        job.log.push(`(${i + 1}/${list.length}) ${app.name}`);
+        const size = app.size;
+        await moveToGithub(app, job);
+        moved++; freed += size;
+      } catch (e) { errors.push(`${app.name}: ${e.message}`); job.log.push(`✕ ${app.name}: ${e.message}`); }
+    }
+    job.result = { moved, freed, errors };
+    job.status = moved || !errors.length ? 'done' : 'error';
+    if (job.status === 'error') job.error = errors[0];
+  })();
+}, 'owner');
+
+// ----- screenshots -----
+const IMG_TYPES = [
+  { ext: 'png', type: 'image/png', test: (b) => b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) },
+  { ext: 'jpg', type: 'image/jpeg', test: (b) => b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff },
+  { ext: 'webp', type: 'image/webp', test: (b) => b.toString('latin1', 0, 4) === 'RIFF' && b.toString('latin1', 8, 12) === 'WEBP' },
+];
+route('POST', /^\/api\/apps\/([a-f0-9]{16})\/screenshots$/, async (req, res, m, acc) => {
+  const app = store.apps.find((a) => a.id === m[1]);
+  if (!app) return fail(res, 404, 'App not found');
+  if ((app.screenshots || []).length >= 8) return fail(res, 400, 'Up to 8 screenshots per app');
+  const { uploadId } = await readJson(req);
+  const f = tmpPath(uploadId, acc);
+  const head = await fsp.readFile(f).then((x) => x.subarray(0, 16));
+  const kind = IMG_TYPES.find((t) => t.test(head));
+  if (!kind) { await rmQuiet(f); return fail(res, 400, 'Screenshots must be PNG, JPEG or WebP images'); }
+  if ((await fsp.stat(f)).size > 15 * 1024 * 1024) { await rmQuiet(f); return fail(res, 400, 'Screenshots must be under 15 MB'); }
+  const dir = path.join(dirs.apps, app.id + '-shots');
+  await fsp.mkdir(dir, { recursive: true });
+  const sid = id();
+  await fsp.rename(f, path.join(dir, `${sid}.${kind.ext}`));
+  app.screenshots = [...(app.screenshots || []), { id: sid, ext: kind.ext }];
+  store.save();
+  json(res, { app: appView(app, acc) });
+}, 'owner');
+
+route('DELETE', /^\/api\/apps\/([a-f0-9]{16})\/screenshots\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
+  const app = store.apps.find((a) => a.id === m[1]);
+  const shot = app && (app.screenshots || []).find((x) => x.id === m[2]);
+  if (!shot) return fail(res, 404, 'Screenshot not found');
+  app.screenshots = app.screenshots.filter((x) => x.id !== m[2]);
+  await rmQuiet(path.join(dirs.apps, app.id + '-shots', `${shot.id}.${shot.ext}`));
+  store.save();
+  json(res, { app: appView(app, acc) });
+}, 'owner');
+
+route('POST', /^\/api\/apps\/([a-f0-9]{16})\/screenshots\/order$/, async (req, res, m, acc) => {
+  const app = store.apps.find((a) => a.id === m[1]);
+  if (!app) return fail(res, 404, 'App not found');
+  const { ids = [] } = await readJson(req);
+  app.screenshots = [...(app.screenshots || [])].sort((x, y) => ids.indexOf(x.id) - ids.indexOf(y.id));
+  store.save();
+  json(res, { app: appView(app, acc) });
+}, 'owner');
+
+route('GET', /^\/api\/apps\/([a-f0-9]{16})\/screenshots\/([a-f0-9]{16})$/, (req, res, m, acc) => {
+  const app = visibleApps(acc).find((a) => a.id === m[1]);
+  const shot = app && (app.screenshots || []).find((x) => x.id === m[2]);
+  if (!shot) return fail(res, 404, 'Not found');
+  const kind = IMG_TYPES.find((t) => t.ext === shot.ext);
+  return serveFile(req, res, path.join(dirs.apps, app.id + '-shots', `${shot.id}.${shot.ext}`), { type: kind && kind.type, cache: 'private, max-age=604800' });
+});
+
+// ----- ratings -----
+route('POST', /^\/api\/apps\/([a-f0-9]{16})\/vote$/, async (req, res, m, acc) => {
+  const app = visibleApps(acc).find((a) => a.id === m[1]);
+  if (!app) return fail(res, 404, 'App not found');
+  const { value } = await readJson(req);
+  const v = Number(value) > 0 ? 1 : Number(value) < 0 ? -1 : 0;
+  app.votes = app.votes || {};
+  if (v) app.votes[acc.id] = v; else delete app.votes[acc.id];
+  store.save();
+  json(res, { app: appView(app, acc) });
+});
+
+// ----- collections -----
+const sortedCollections = () => [...store.collections].sort((a, b) => a.order - b.order);
+function cleanCollection(b, c = {}) {
+  if (typeof b.name === 'string') c.name = b.name.trim().slice(0, 40);
+  if (typeof b.emoji === 'string' && b.emoji.trim()) c.emoji = b.emoji.trim().slice(0, 8);
+  if (typeof b.description === 'string') c.description = b.description.trim().slice(0, 500);
+  if (Array.isArray(b.appIds)) c.appIds = [...new Set(b.appIds.filter((x) => store.apps.some((a) => a.id === x)))].slice(0, 30);
+  return c;
+}
+route('POST', /^\/api\/collections$/, async (req, res) => {
+  const c = cleanCollection(await readJson(req), { id: id(), emoji: '📦', description: '', appIds: [], order: store.collections.length });
+  if (!c.name) return fail(res, 400, 'Give the collection a name');
+  store.collections.push(c);
+  store.save();
+  json(res, { collection: c });
+}, 'owner');
+route('PATCH', /^\/api\/collections\/([a-f0-9]{16})$/, async (req, res, m) => {
+  const c = store.collections.find((x) => x.id === m[1]);
+  if (!c) return fail(res, 404, 'Collection not found');
+  cleanCollection(await readJson(req), c);
+  if (!c.name) c.name = 'Collection';
+  store.save();
+  json(res, { collection: c });
+}, 'owner');
+route('DELETE', /^\/api\/collections\/([a-f0-9]{16})$/, (req, res, m) => {
+  const i = store.collections.findIndex((x) => x.id === m[1]);
+  if (i < 0) return fail(res, 404, 'Collection not found');
+  store.collections.splice(i, 1);
+  sortedCollections().forEach((c, n) => { c.order = n; });
+  store.save();
+  json(res, { ok: true });
+}, 'owner');
+
+// ----- app requests -----
+route('POST', /^\/api\/requests$/, async (req, res, m, acc) => {
+  const b = await readJson(req);
+  const name = String(b.name || '').trim().slice(0, 80);
+  if (!name) return fail(res, 400, 'Which app do you want?');
+  const open = store.requests.filter((r) => r.ownerId === acc.id && r.status === 'pending');
+  if (!isOwner(acc) && open.length >= 10) return fail(res, 400, 'You have 10 open requests — wait for some to be answered');
+  const r = {
+    id: id(), ownerId: acc.id, username: acc.username, name,
+    link: String(b.link || '').trim().slice(0, 500), note: String(b.note || '').trim().slice(0, 500),
+    status: 'pending', reply: '', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+  };
+  store.requests.push(r);
+  if (store.requests.length > 1000) store.requests.splice(0, store.requests.length - 1000);
+  store.save();
+  json(res, { request: r });
+});
+route('PATCH', /^\/api\/requests\/([a-f0-9]{16})$/, async (req, res, m) => {
+  const r = store.requests.find((x) => x.id === m[1]);
+  if (!r) return fail(res, 404, 'Request not found');
+  const b = await readJson(req);
+  if (['pending', 'added', 'declined'].includes(b.status)) r.status = b.status;
+  if (typeof b.reply === 'string') r.reply = b.reply.trim().slice(0, 300);
+  if (typeof b.appId === 'string' && store.apps.some((a) => a.id === b.appId)) r.appId = b.appId;
+  r.updatedAt = new Date().toISOString();
+  store.save();
+  json(res, { request: r });
+}, 'owner');
+route('DELETE', /^\/api\/requests\/([a-f0-9]{16})$/, (req, res, m, acc) => {
+  const i = store.requests.findIndex((x) => x.id === m[1] && (isOwner(acc) || (x.ownerId === acc.id && x.status === 'pending')));
+  if (i < 0) return fail(res, 404, 'Request not found');
+  store.requests.splice(i, 1);
+  store.save();
+  json(res, { ok: true });
+});
+
+// ----- announcement -----
+route('PUT', /^\/api\/announcement$/, async (req, res) => {
+  const b = await readJson(req);
+  const text = String(b.text || '').trim().slice(0, 400);
+  store.settings.announcement = text
+    ? { id: id(), text, style: ['info', 'success', 'warning', 'party'].includes(b.style) ? b.style : 'info', at: new Date().toISOString() }
+    : null;
+  store.save();
+  json(res, { announcement: store.settings.announcement });
 }, 'owner');
 
 // ----- categories -----
@@ -1130,6 +1830,8 @@ route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
   if (opts.minOS && !/^\d+(\.\d+){0,2}$/.test(opts.minOS)) return fail(res, 400, 'Minimum iOS should look like 14.0');
   const entEdits = cleanEdits(b.entitlements, 'entitlement');
   const plistEdits = cleanEdits(b.plist, 'Info.plist');
+  const versionIndex = Math.max(0, Math.min(14, Number(b.versionIndex) || 0));
+  if (app.remote && app.remote.missing) return fail(res, 410, 'This app was removed from its source');
 
   const iconFile = b.iconUploadId ? tmpPath(b.iconUploadId, acc) : null;
   const dylibFiles = (Array.isArray(b.dylibs) ? b.dylibs : []).slice(0, 20).map((d) => ({
@@ -1137,14 +1839,39 @@ route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
     name: String(d.name || 'tweak.dylib').replace(/[^\w.\-+]/g, '_').replace(/^\.+/, '') || 'tweak.dylib',
   }));
 
+  // Already signing this app for you? Follow that job instead of starting a second copy.
+  const runKey = `${acc.id}:${app.id}`;
+  const running = signingNow.get(runKey);
+  if (running && jobs.has(running) && ['running', 'queued'].includes(jobs.get(running).status)) {
+    for (const f of [iconFile, ...dylibFiles.map((d) => d.file)].filter(Boolean)) await rmQuiet(f);
+    return json(res, { jobId: running, alreadyRunning: true });
+  }
+
   const job = newJob(acc);
+  signingNow.set(runKey, job.id);
   json(res, { jobId: job.id });
 
   enqueueSign(job, async () => {
     const work = path.join(dirs.work, job.id);
+    const previous = () => store.signed.filter((x) => x.ownerId === acc.id && x.appId === app.id);
     const signedId = id();
     const out = path.join(dirs.signed, signedId + '.ipa');
     try {
+      // Signing unpacks the app and writes a new copy, so it needs roughly twice the app's size free
+      // (three times for link-only apps, which are downloaded first).
+      const dl = app.remote ? remoteDownload(app, versionIndex) : null;
+      const appSize = (dl && dl.size) || app.size || 0;
+      const need = Math.round(appSize * (dl ? 3.3 : 2.3)) + 64 * 1048576;
+      let disk = diskInfo();
+      if (disk && disk.free < need && previous().length) {
+        job.log.push('Making room: replacing your previous signed copy first…');
+        for (const old of previous()) await removeSigned(old);
+        store.save();
+        disk = diskInfo();
+      }
+      if (disk && disk.free < need) {
+        throw new Error(`Not enough space on your server to sign this app (it needs about ${gb(need)} free, ${gb(disk.free)} is free). Delete old signed apps or library apps in Settings › Storage, then try again.`);
+      }
       await fsp.mkdir(work, { recursive: true });
       const certDir = path.join(dirs.certs, cert.id);
       const provPath = path.join(certDir, 'profile.mobileprovision');
@@ -1191,6 +1918,12 @@ route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
       if (b.enableDocs) args.push('-S');
 
       let input = path.join(dirs.apps, app.id + '.ipa');
+      if (dl) {
+        // Link-only app: download it just for this signing. It's deleted with the work folder afterwards.
+        input = path.join(work, 'original.ipa');
+        await fetchToFile(dl.url, dl.headers, input, job, `Downloading ${app.name}${dl.version ? ' ' + dl.version : ''}…`);
+        job.progress = null;
+      }
       if (plistEdits.length) input = await prepareModifiedIpa(input, work, plistEdits, job);
       args.push(input);
 
@@ -1204,33 +1937,38 @@ route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
       job.log.push('Reading signed app…');
       const meta = await ipa.inspect(out);
       if (meta.icon) await fsp.writeFile(path.join(dirs.signed, signedId + '.png'), meta.icon);
-      else if (app.hasIcon) await fsp.copyFile(path.join(dirs.apps, app.id + '.png'), path.join(dirs.signed, signedId + '.png'));
+      else if (app.hasIcon) await fsp.copyFile(path.join(dirs.apps, app.id + '.png'), path.join(dirs.signed, signedId + '.png')).catch(() => {});
 
       const rec = {
         id: signedId, ownerId: acc.id, token: token(), appId: app.id, certId: cert.id, certLabel: cert.label,
         name: meta.name, bundleId: meta.bundleId, version: meta.version, build: meta.build,
-        size: meta.size, hasIcon: !!meta.icon || !!app.hasIcon, signedAt: new Date().toISOString(),
+        size: meta.size, hasIcon: !!meta.icon || fs.existsSync(path.join(dirs.signed, signedId + '.png')), signedAt: new Date().toISOString(),
         expires: cert.profile.expires,
         options: {
-          ...opts, icon: !!iconFile, dylibs: dylibFiles.map((d) => d.name),
+          ...opts, icon: !!iconFile, dylibs: dylibFiles.map((d) => d.name), versionIndex: versionIndex || 0,
           entitlements: entEdits.map((e) => e.key), plist: plistEdits.map((e) => e.key),
         },
       };
       store.signed.unshift(rec);
+      // Replace any older signed copy of this app (only one copy per app per person).
+      for (const old of previous().filter((x) => x.id !== rec.id)) await removeSigned(old);
       trimSigned(acc);
       store.save();
-      job.result = { signed: signedView(rec, req) };
+      job.result = { signed: signedView(rec, req), replaced: true };
       job.status = 'done';
       job.log.push('Done!');
     } catch (e) {
       await rmQuiet(out);
-      job.error = e.message;
+      const full = isNoSpace(e) || job.log.some((l) => /no space left|ENOSPC/i.test(l));
+      job.error = full ? storageFullMessage() : e.message;
       job.status = 'error';
     } finally {
       await rmQuiet(work);
+      if (signingNow.get(runKey) === job.id) signingNow.delete(runKey);
     }
   });
 });
+const signingNow = new Map(); // "owner:app" -> job id
 
 route('GET', /^\/api\/jobs\/([a-f0-9]{16})$/, (req, res, m, acc) => {
   const job = jobs.get(m[1]);
@@ -1244,10 +1982,8 @@ const ownSigned = (acc, sid) => store.signed.find((s) => s.id === sid && s.owner
 route('DELETE', /^\/api\/signed\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
   const s = ownSigned(acc, m[1]);
   if (!s) return fail(res, 404, 'Not found');
-  store.signed.splice(store.signed.indexOf(s), 1);
+  await removeSigned(s);
   store.save();
-  await rmQuiet(path.join(dirs.signed, s.id + '.ipa'));
-  await rmQuiet(path.join(dirs.signed, s.id + '.png'));
   json(res, { ok: true });
 });
 
@@ -1265,9 +2001,11 @@ route('PATCH', /^\/api\/settings$/, async (req, res) => {
   if (b.zipLevel !== undefined) store.settings.zipLevel = Math.min(9, Math.max(0, Number(b.zipLevel) || 0));
   if (b.maxSignedPerUser !== undefined) store.settings.maxSignedPerUser = Math.min(100, Math.max(1, Number(b.maxSignedPerUser) || 10));
   if (b.udidLogin !== undefined) store.settings.udidLogin = !!b.udidLogin;
+  if (b.deleteAfterInstall !== undefined) store.settings.deleteAfterInstall = !!b.deleteAfterInstall;
   if (b.signedRetentionDays !== undefined) store.settings.signedRetentionDays = Math.min(365, Math.max(0, Number(b.signedRetentionDays) || 0));
   store.save();
-  json(res, { settings: store.settings });
+  const { github: _gh, ...settings } = store.settings;
+  json(res, { settings });
 }, 'owner');
 
 route('POST', /^\/api\/maintenance$/, async (req, res) => {
@@ -1334,6 +2072,8 @@ route('DELETE', /^\/api\/users\/([a-f0-9]{16})$/, async (req, res, m) => {
     await rmQuiet(path.join(dirs.signed, s.id + '.png'));
   }
   store.users.splice(store.users.indexOf(u), 1);
+  for (const a of store.apps) if (a.votes) delete a.votes[u.id];
+  store.data.requests = store.requests.filter((r) => r.ownerId !== u.id);
   store.save();
   json(res, { ok: true });
 }, 'owner');
@@ -1391,16 +2131,35 @@ route('GET', /^\/i\/([\w-]{20,40})\/app\.ipa$/, (req, res, m) => {
   if (!s || s.fileDeleted) return fail(res, 404, 'Link expired');
   if (req.method === 'HEAD') return serveFile(req, res, path.join(dirs.signed, s.id + '.ipa'));
   const st = installState(s);
-  if (st.phase !== 'downloading') Object.assign(st, { phase: 'downloading', downloadAt: Date.now(), sent: 0, doneAt: null });
-  // A range request continues an earlier download, so count from where it starts.
+  // A range request continues an earlier download; a plain request starts from zero.
   const range = (req.headers.range || '').match(/^bytes=(\d+)-/);
+  if (st.phase !== 'downloading' || !range) Object.assign(st, { phase: 'downloading', downloadAt: Date.now(), sent: 0, doneAt: null });
   if (range) st.sent = Math.max(st.sent, Number(range[1]));
   return serveFile(req, res, path.join(dirs.signed, s.id + '.ipa'), {
     download: `${s.name}.ipa`,
-    onBytes: (n) => { st.sent += n; },
-    onDone: () => { if (st.sent >= st.size) Object.assign(st, { phase: 'done', doneAt: Date.now(), sent: st.size }); },
+    // Done as soon as the last byte goes out. (Waiting for the stream to close is unreliable:
+    // iPhones often hang up the moment they have the whole file.)
+    onBytes: (n) => {
+      st.sent += n;
+      if (st.sent >= st.size && st.phase !== 'done') {
+        Object.assign(st, { phase: 'done', doneAt: Date.now(), sent: st.size });
+        try { recordInstall(s); } catch (e) { console.error('install tracking:', e); }
+      }
+    },
   });
 }, 'open');
+
+function recordInstall(s) {
+  const app = store.apps.find((a) => a.id === s.appId);
+  store.installLog.push({
+    id: id(), signedId: s.id, ownerId: s.ownerId, appId: s.appId, name: s.name, version: s.version,
+    shownVersion: app ? shownAppVersion(app) : s.version, certLabel: s.certLabel, at: new Date().toISOString(),
+  });
+  if (store.installLog.length > 5000) store.installLog.splice(0, store.installLog.length - 5000);
+  if (app) app.installCount = (app.installCount || 0) + 1;
+  s.installedAt = new Date().toISOString();
+  store.save();
+}
 
 // The app tells us an install is starting, then checks progress.
 route('POST', /^\/api\/signed\/([a-f0-9]{16})\/install$/, (req, res, m, acc) => {
@@ -1454,6 +2213,15 @@ route('GET', /^\/i\/([\w-]{20,40})\/?$/, async (req, res, m) => {
   }), { 'Content-Type': 'text/html; charset=utf-8' });
 }, 'open');
 
+// ----- QR codes (for install links) -----
+route('GET', /^\/api\/qr$/, (req, res) => {
+  const text = String(req.query.get('text') || '').slice(0, 200);
+  if (!text) return fail(res, 400, 'Nothing to encode');
+  let svg;
+  try { svg = qrSvg(text); } catch (e) { return fail(res, 400, e.message); }
+  send(res, 200, svg, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'private, max-age=86400' });
+});
+
 // ----- icons -----
 const iconCache = {};
 route('GET', /^\/(?:apple-touch-icon(?:-precomposed)?|icon-(\d+))\.png$/, (req, res, m) => {
@@ -1497,6 +2265,7 @@ const server = http.createServer(async (req, res) => {
     const page = (await fsp.readFile(path.join(PUBLIC_DIR, 'index.html'), 'utf8')).replace(/__VERSION__/g, displayVersion()).replace(/__BUILD__/g, BUILD_ID).replace(/__CODE_VERSION__/g, VERSION);
     return send(res, 200, page, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
   } catch (e) {
+    if (isNoSpace(e)) { if (!res.headersSent) fail(res, 507, storageFullMessage()); return; }
     if (!res.headersSent) fail(res, e.status || 500, e.status ? e.message : 'Something went wrong: ' + e.message);
     if (!e.status) console.error(e);
   }

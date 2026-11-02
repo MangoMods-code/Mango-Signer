@@ -6,6 +6,7 @@ Upload an `.ipa`, add a `.p12` + `.mobileprovision`, tap **Sign**, then **Instal
 ## Features
 - **App Library** – the owner uploads apps (or imports from a link); invited users browse, search, sign and install them
 - **Organization** – categories with emoji, featured apps, search, sorting, bulk select, full app editing, Update IPA, and default sign settings per app
+- **Cloud Library** – add AltStore/SideStore/ESign-style sources, link-only apps, or keep your own IPAs in a (private) GitHub repo's release, so app files don't sit on your Railway volume. Files are downloaded only while signing and deleted right after. Older versions from sources can be picked when signing
 - **Big files** – resumable uploads that survive dropped connections; old signed files are cleaned up automatically
 - **Accounts** – invite codes, username + password login, or sign in with your iPhone (UDID)
 - **Certificates** – each account adds its own `.p12` + `.mobileprovision`; shows type, expiry, revoke status, cert/profile mismatch, and whether your iPhone is in the profile
@@ -33,6 +34,13 @@ The owner signs in with the password only (leave username blank). Everyone else 
 | `MAX_CONCURRENT_SIGNS` | `2` | How many apps sign at once (others wait in line) |
 | `ZSIGN_PATH` | `zsign` | Path to the zsign binary |
 
+## GitHub storage (optional)
+1. Make a repo on GitHub (private is fine) and tick **Add a README** so it isn't empty.
+2. Create a **fine-grained personal access token** limited to that repo with **Contents: Read and write**.
+3. In Mango go to **Settings › Cloud Library › GitHub storage**, enter `owner/repo` and the token.
+
+Mango creates a release tagged `mango-library` and keeps each app as a release asset (up to 2 GB each). You can also drop `.ipa` files onto that release on github.com and tap **Sync**. The token is stored encrypted and never sent to the browser.
+
 ## Notes
 - JIT can't be switched on from a website; signing with **JIT support** lets tools like StikDebug attach to the app.
 - Memory entitlements only work if the capability is enabled for your App ID in your Apple Developer account.
@@ -40,7 +48,7 @@ The owner signs in with the password only (leave username blank). Everyone else 
 
 ## How it works
 - `server.js` – web server and API (no npm dependencies)
-- `lib/` – zip, plist, PNG (Apple CgBI icon) and certificate readers
+- `lib/` – zip (local and HTTP range), plist, PNG (Apple CgBI icon), certificate, source and GitHub helpers
 - `public/` – the iPhone web app
 - Signing is done by [zsign](https://github.com/zhlynn/zsign) (MIT License, by zhlynn), compiled in the Docker build.
 
