@@ -419,9 +419,17 @@ function newJob(account) {
   job.signal = job.abort.signal;
   Object.defineProperty(job, 'signal', { enumerable: false });
   jobs.set(job.id, job);
-  setTimeout(() => jobs.delete(job.id), 60 * 60 * 1000).unref();
   return job;
 }
+// Finished jobs are forgotten an hour after they end. Running ones are kept however long they take
+// (a scan of a huge channel can run for hours).
+setInterval(() => {
+  for (const [jid, j] of jobs) {
+    if (['running', 'queued'].includes(j.status)) continue;
+    j.endedAt = j.endedAt || Date.now();
+    if (Date.now() - j.endedAt > 60 * 60 * 1000) jobs.delete(jid);
+  }
+}, 5 * 60 * 1000).unref();
 let activeSigns = 0;
 const signQueue = [];
 function enqueueSign(job, work) {
@@ -993,6 +1001,7 @@ route('POST', /^\/api\/apps\/import$/, async (req, res, m, acc) => {
   const { url } = await readJson(req);
   const u = parseLink(url);
   const job = newJob(acc);
+  job.title = `Adding from ${u.hostname}`;
   json(res, { jobId: job.id });
   (async () => {
     try {
@@ -1328,6 +1337,7 @@ route('POST', /^\/api\/apps\/link$/, async (req, res, m, acc) => {
   const { url } = await readJson(req);
   const u = parseLink(url);
   const job = newJob(acc);
+  job.title = `Adding from ${u.hostname}`;
   json(res, { jobId: job.id });
   (async () => {
     try {
@@ -1429,7 +1439,7 @@ async function syncSource(src) {
   return { added, updated, removed, total: parsed.apps.length };
 }
 
-const sourceView = (src) => ({ ...src, apps: store.apps.filter((a) => a.remote && a.remote.sourceId === src.id && !a.remote.missing).length });
+const sourceView = ({ done: _d, failures: _f, ...src }) => ({ ...src, apps: store.apps.filter((a) => a.remote && a.remote.sourceId === src.id && !a.remote.missing).length });
 
 route('POST', /^\/api\/sources$/, async (req, res) => {
   const b = await readJson(req);
@@ -1616,6 +1626,7 @@ route('POST', /^\/api\/github\/move$/, async (req, res, m, acc) => {
   if (!ghClient()) return fail(res, 400, 'Connect GitHub storage first');
   if (!list.length) return fail(res, 400, 'Nothing to move — every app is already off the server');
   const job = newJob(acc);
+  job.title = `Moving ${list.length} app${list.length === 1 ? '' : 's'} to GitHub`;
   json(res, { jobId: job.id, count: list.length });
   (async () => {
     let moved = 0, freed = 0;
@@ -2185,6 +2196,7 @@ route('POST', /^\/api\/apps\/([a-f0-9]{16})\/versions$/, async (req, res, m, acc
   }
   const job = newJob(acc);
   job.cancellable = true;
+  job.title = `Adding a version of ${app.name}`;
   json(res, { jobId: job.id });
   (async () => {
     let tmp = file;
@@ -2339,10 +2351,17 @@ function cleanCaption(text) {
 }
 const normName = (n) => String(n || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 
-async function tgImportPost(src, post, job) {
+async function tgPeek(src, post) {
+  const f = await tg.file(src.ref, post.id);
+  return ipa.inspect({ url: f.url, headers: f.headers });
+}
+// "Mortal Kombat - KamoHacks [7.4.1].ipa" and "...[7.4.0].ipa" are the same app: used to skip older reposts without reading them.
+const fileKey = (name) => String(name || '').toLowerCase().replace(/\.ipa$/, '').replace(/[\[(].*?[\])]/g, ' ').replace(/v?\d+(\.\d+)+/g, ' ').replace(/[^a-z0-9]+/g, '');
+
+async function tgImportPost(src, post, job, preMeta) {
   const opts = src.options;
   const f = await tg.file(src.ref, post.id);
-  const meta = await ipa.inspect({ url: f.url, headers: f.headers });
+  const meta = preMeta || await ipa.inspect({ url: f.url, headers: f.headers });
   if (!meta.bundleId) throw new Error("couldn't read the app inside");
   const bid = meta.bundleId.toLowerCase();
   const mine = (a) => a.remote && a.remote.kind === 'telegram' && a.remote.sourceId === src.id;
@@ -2360,7 +2379,7 @@ async function tgImportPost(src, post, job) {
     return 'same';
   }
   // Where the file lives: on Telegram (just the post), or copied once to your GitHub storage.
-  const remote = { kind: 'telegram', sourceId: src.id, ref: src.ref, msgId: post.id, postDate: post.date };
+  const remote = { kind: 'telegram', sourceId: src.id, ref: src.ref, msgId: post.id, postDate: post.date, fileKey: fileKey(post.file && post.file.name) };
   if (opts.storage === 'github') {
     const g = ghSettings();
     const gh = ghClient();
@@ -2428,6 +2447,7 @@ function tgSync(src, acc) {
   if (tgSyncing.has(src.id) && jobs.has(tgSyncing.get(src.id)) && jobs.get(tgSyncing.get(src.id)).status === 'running') return jobs.get(tgSyncing.get(src.id));
   const job = newJob(acc || OWNER());
   job.cancellable = true;
+  job.title = `Checking ${src.name}`;
   tgSyncing.set(src.id, job.id);
   (async () => {
     const result = { added: 0, updated: 0, same: 0, older: 0, skipped: 0, failed: 0, removed: 0 };
@@ -2454,6 +2474,7 @@ function tgSync(src, acc) {
           const r = await tgImportPost(src, p, job);
           result[r]++;
           delete src.failures[p.id];
+          src.done = [...(src.done || []), p.id].slice(-200000);
           store.save();
         } catch (e) {
           if (job.cancelled) { blocked = true; maxDone = Math.min(maxDone || p.id - 1, p.id - 1); break; }
@@ -2494,20 +2515,22 @@ function tgSync(src, acc) {
 
 // Look further back through a channel's history (old posts from years ago), without touching what you already have.
 // count = how many .ipa posts to look through (0 = the whole channel).
-function tgDeepScan(src, count, acc) {
+function tgDeepScan(src, count, acc, { recheck = false, quick = true } = {}) {
   const job = newJob(acc || OWNER());
   job.cancellable = true;
+  job.title = `Scanning ${src.name}`;
   tgSyncing.set(src.id, job.id);
   (async () => {
-    const result = { added: 0, updated: 0, same: 0, older: 0, skipped: 0, failed: 0, removed: 0 };
+    const result = { added: 0, updated: 0, same: 0, older: 0, skipped: 0, failed: 0, removed: 0, known: 0 };
     try {
       if (!tgReady()) throw new Error('Telegram is not connected');
-      const want = count > 0 ? count : 5000;
+      const want = count > 0 ? count : Infinity;
       const words = src.options.keywords.split(',').map((w) => w.trim().toLowerCase()).filter(Boolean);
       const found = [];
       let offset = 0;
       let looked = 0;
       job.log.push(`Looking back through ${src.name}…`);
+      job.counter = { label: 'posts looked at', done: 0, total: null };
       while (found.length < want && !job.cancelled) {
         const page = await tg.posts(src.ref, 0, 200, offset);
         if (!page.scanned) break;
@@ -2517,27 +2540,63 @@ function tgDeepScan(src, count, acc) {
           if (words.length && !words.some((w) => `${p.file.name}\n${p.text}`.toLowerCase().includes(w))) { result.skipped++; continue; }
           if (found.length < want) found.push(p);
         }
-        job.log.push(`Looked at ${looked} posts, found ${found.length} .ipa file${found.length === 1 ? '' : 's'}…`);
+        job.counter.done = looked;
+        if (looked % 2000 < 200) job.log.push(`Looked at ${looked} posts, found ${found.length} .ipa files…`);
         if (!page.oldest || page.oldest <= 1) break;
         offset = page.oldest;
       }
-      // Oldest first, so the newest version of each app ends up on top.
-      found.reverse();
-      for (const [i, p] of found.entries()) {
-        if (job.cancelled) break;
-        job.progress = i / found.length;
-        job.log.push(`(${i + 1}/${found.length}) ${p.file.name}`);
-        try {
-          result[await tgImportPost(src, p, job)]++;
-          store.save();
-        } catch (e) {
-          if (job.cancelled) break;
-          result.failed++;
-          job.log.push(`✕ ${p.file.name}: ${e.message}`);
-        }
+      job.log.push(`Found ${found.length} .ipa file${found.length === 1 ? '' : 's'} in ${looked} posts.`);
+
+      // Fast skips, newest first, before reading anything:
+      //  - posts already handled by an earlier check or scan
+      //  - older reposts of an app whose newer post is in this scan or already in the library
+      src.done = src.done || [];
+      const done = new Set(src.done);
+      // A name every post shares (like "app.ipa") says nothing about which app it is, so it's ignored.
+      const keyCount = new Map();
+      for (const p of found) { const kk = fileKey(p.file.name); keyCount.set(kk, (keyCount.get(kk) || 0) + 1); }
+      const usableKey = (kk) => quick && kk.length >= 4 && !['game', 'signed', 'modded', 'hacked', 'tweaked', 'file', 'download'].includes(kk) && keyCount.get(kk) <= Math.max(25, found.length * 0.3);
+      const newestByKey = new Map();
+      for (const a of store.apps) if (a.remote && a.remote.kind === 'telegram' && a.remote.sourceId === src.id && a.remote.fileKey) newestByKey.set(a.remote.fileKey, Math.max(newestByKey.get(a.remote.fileKey) || 0, a.remote.msgId));
+      const todo = [];
+      for (const p of found) { // newest first
+        const key = usableKey(fileKey(p.file.name)) ? fileKey(p.file.name) : '';
+        if (!recheck && done.has(p.id)) { result.known++; continue; }
+        if (key && newestByKey.has(key) && newestByKey.get(key) > p.id) { result.older++; done.add(p.id); continue; }
+        if (key && !newestByKey.has(key)) newestByKey.set(key, p.id);
+        todo.push(p);
       }
+      if (result.known || result.older) job.log.push(`Skipping ${result.known + result.older} post${result.known + result.older === 1 ? '' : 's'} you already have or that are older builds.`);
+
+      // Read app info a few at a time (that's the slow part), then add them oldest first so the newest wins.
+      todo.reverse();
+      job.counter = { label: 'apps checked', done: 0, total: todo.length };
+      const PEEK = 4;
+      for (let i = 0; i < todo.length && !job.cancelled; i += PEEK) {
+        const batch = todo.slice(i, i + PEEK);
+        const metas = await Promise.all(batch.map((p) => tgPeek(src, p).then((meta) => ({ meta }), (error) => ({ error }))));
+        for (const [n, p] of batch.entries()) {
+          if (job.cancelled) break;
+          job.log.push(`(${i + n + 1}/${todo.length}) ${p.file.name}`);
+          try {
+            if (metas[n].error) throw metas[n].error;
+            result[await tgImportPost(src, p, job, metas[n].meta)]++;
+            done.add(p.id);
+          } catch (e) {
+            if (job.cancelled) break;
+            result.failed++;
+            job.log.push(`✕ ${p.file.name}: ${e.message}`);
+          }
+          job.counter.done = i + n + 1;
+          job.progress = (i + n + 1) / todo.length;
+        }
+        src.done = [...done].slice(-200000);
+        if (i % (PEEK * 10) === 0) store.save();
+      }
+      if (job.log.length > 300) job.log.splice(0, job.log.length - 300);
       job.progress = null;
       if (job.cancelled) result.cancelled = true;
+      src.done = [...done].slice(-200000);
       const newest = found.length ? Math.max(...found.map((p) => p.id)) : 0;
       if (newest > (src.lastMsgId || 0) && !job.cancelled) src.lastMsgId = newest;
       Object.assign(src, { lastSync: new Date().toISOString(), lastError: null, lastResult: result, deepest: Math.max(src.deepest || 0, found.length) });
@@ -2560,8 +2619,8 @@ route('POST', /^\/api\/sources\/([a-f0-9]{16})\/scan$/, async (req, res, m, acc)
   if (!tgReady()) return fail(res, 400, 'Connect Telegram first');
   const running = tgSyncing.get(src.id);
   if (running && jobs.has(running) && jobs.get(running).status === 'running') return fail(res, 409, 'This channel is already being checked. Wait for it to finish (or stop it) first.');
-  const { count } = await readJson(req);
-  json(res, { jobId: tgDeepScan(src, Math.max(0, Math.min(5000, Number(count) || 0)), acc).id });
+  const { count, recheck, quick } = await readJson(req);
+  json(res, { jobId: tgDeepScan(src, Math.max(0, Math.min(1e6, Number(count) || 0)), acc, { recheck: !!recheck, quick: quick !== false }).id });
 }, 'owner');
 
 route('POST', /^\/api\/telegram\/channels$/, async (req, res, m, acc) => {
@@ -3078,6 +3137,7 @@ route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
 
   const job = newJob(acc);
   job.cancellable = true;
+  job.title = `Signing ${app.name}`;
   countSign(acc.id, app.id);
   job.countedFor = acc.id;
   signingNow.set(runKey, job.id);
@@ -3204,7 +3264,18 @@ route('GET', /^\/api\/jobs\/([a-f0-9]{16})$/, (req, res, m, acc) => {
   const job = jobs.get(m[1]);
   if (!job || job.owner !== acc.id) return fail(res, 404, 'Job not found');
   const cancelled = !!job.cancelled;
-  json(res, { status: cancelled ? 'cancelled' : job.status, log: job.log.slice(-300), error: cancelled ? 'Cancelled' : job.error, result: job.result, progress: cancelled ? null : job.progress ?? null, cancellable: !!job.cancellable && !job.cancelled });
+  json(res, { status: cancelled ? 'cancelled' : job.status, log: job.log.slice(-300), error: cancelled ? 'Cancelled' : job.error, result: job.result, progress: cancelled ? null : job.progress ?? null, counter: job.counter || null, cancellable: !!job.cancellable && !job.cancelled });
+});
+
+// Background tasks you can come back to after leaving the app.
+route('GET', /^\/api\/jobs$/, (req, res, m, acc) => {
+  const list = [...jobs.values()].filter((j) => j.owner === acc.id && j.title && (['running', 'queued'].includes(j.status) || Date.now() - (j.endedAt || Date.now()) < 10 * 60 * 1000));
+  json(res, {
+    jobs: list.map((j) => ({
+      id: j.id, title: j.title, status: j.cancelled ? 'cancelled' : j.status, progress: j.progress ?? null,
+      counter: j.counter || null, last: j.log[j.log.length - 1] || '', started: j.started, error: j.error, cancellable: !!j.cancellable && !j.cancelled,
+    })).sort((a, b) => b.started - a.started),
+  });
 });
 
 route('POST', /^\/api\/jobs\/([a-f0-9]{16})\/cancel$/, (req, res, m, acc) => {
