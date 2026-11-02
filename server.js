@@ -1807,7 +1807,7 @@ async function saveRepoMeta(app, s) {
 
 const sourceView = ({ done: _d, failures: _f, ...src }) => ({ ...src, apps: store.apps.filter((a) => a.remote && a.remote.sourceId === src.id && !a.remote.missing).length });
 
-route('POST', /^\/api\/sources$/, async (req, res) => {
+route('POST', /^\/api\/sources$/, async (req, res, m, acc) => {
   const b = await readJson(req);
   // People often paste links without https:// (github.com/owner/repo).
   if (typeof b.url === 'string' && !/^[a-z]+:\/\//i.test(b.url.trim()) && /^[\w.-]+\.[a-z]{2,}\//i.test(b.url.trim())) b.url = 'https://' + b.url.trim();
@@ -1817,15 +1817,23 @@ route('POST', /^\/api\/sources$/, async (req, res) => {
   if (store.sources.some((x) => x.url.toLowerCase() === url.toLowerCase())) return fail(res, 400, 'That source is already added');
   const src = { id: id(), url, name: repo ? repo.repo : 'Source', showInLibrary: b.showInLibrary !== false, addedAt: new Date().toISOString() };
   if (repo) Object.assign(src, { kind: 'ghrepo', repo: { owner: repo.owner, repo: repo.repo } });
-  try {
-    store.sources.push(src);
-    const result = await syncSource(src);
-    json(res, { source: sourceView(src), result });
-  } catch (e) {
-    store.sources.splice(store.sources.indexOf(src), 1);
-    store.save();
-    fail(res, 400, e.message);
+  // Nothing else checking: add it right away (and tell you if the link is wrong).
+  if (!checkBusy()) {
+    try {
+      store.sources.push(src);
+      const result = await syncSource(src);
+      return json(res, { source: sourceView(src), result });
+    } catch (e) {
+      store.sources.splice(store.sources.indexOf(src), 1);
+      store.save();
+      return fail(res, 400, e.message);
+    }
   }
+  // Another check is running: add it now and let its first check wait its turn.
+  store.sources.push(src);
+  store.save();
+  const job = sourceCheck(src, acc);
+  json(res, { source: sourceView(src), jobId: job.id, waitingFor: job.waitingFor || null });
 }, 'owner');
 
 route('POST', /^\/api\/sources\/([a-f0-9]{16})\/sync$/, async (req, res, m, acc) => {
@@ -1834,17 +1842,41 @@ route('POST', /^\/api\/sources\/([a-f0-9]{16})\/sync$/, async (req, res, m, acc)
   if (src.kind === 'telegram') {
     if (!tgReady()) return fail(res, 400, 'Connect Telegram first');
     if (req.url.includes('rescan=1')) { src.lastMsgId = 0; src.failures = {}; }
-    return json(res, { jobId: tgSync(src, acc).id, source: sourceView(src) });
+    const job = tgSync(src, acc);
+    return json(res, { jobId: job.id, waitingFor: job.status === 'queued' ? job.waitingFor : null, source: sourceView(src) });
   }
-  try {
-    const result = await syncSource(src);
-    json(res, { source: sourceView(src), result });
-  } catch (e) {
-    src.lastError = e.message;
-    store.save();
-    fail(res, 502, e.message);
-  }
+  const job = sourceCheck(src, acc);
+  json(res, { jobId: job.id, waitingFor: job.status === 'queued' ? job.waitingFor : null, source: sourceView(src) });
 }, 'owner');
+
+// Checks an AltStore-style source or a GitHub repo, in the same one-at-a-time line as Telegram.
+function sourceCheck(src, acc) {
+  const already = checkFor(src.id);
+  if (already) return already;
+  const job = newJob(acc || OWNER());
+  job.title = `Checking ${src.name}`;
+  job.srcId = src.id;
+  job.cancellable = true;
+  return runCheck(job, async () => {
+    job.log.push(`Checking ${src.name}…`);
+    try {
+      job.result = await syncSource(src);
+      job.log.push(`Done: ${job.result.added} new, ${job.result.updated} updated`);
+      job.status = 'done';
+    } catch (e) {
+      src.lastError = e.message;
+      // A source added while another check ran, whose link turns out not to work: don't keep it.
+      if (!src.lastSync && !store.apps.some((a) => a.remote && a.remote.sourceId === src.id)) {
+        const i = store.sources.indexOf(src);
+        if (i >= 0) store.sources.splice(i, 1);
+        e.message += ' (so it wasn\'t added)';
+      }
+      store.save();
+      job.error = e.message;
+      job.status = 'error';
+    }
+  });
+}
 
 route('PATCH', /^\/api\/sources\/([a-f0-9]{16})$/, async (req, res, m) => {
   const src = store.sources.find((x) => x.id === m[1]);
@@ -1888,14 +1920,7 @@ route('DELETE', /^\/api\/sources\/([a-f0-9]{16})$/, async (req, res, m) => {
   json(res, { ok: true });
 }, 'owner');
 
-// Keep sources fresh: GitHub repos every 3 hours, other sources every 6.
-setInterval(async () => {
-  for (const src of store.sources.filter((x) => x.kind !== 'telegram')) {
-    const every = src.kind === 'ghrepo' ? 3 : 6;
-    if (src.lastSync && Date.now() - new Date(src.lastSync) < (every - 0.5) * 3600_000) continue;
-    try { await syncSource(src); } catch (e) { src.lastError = e.message; store.save(); }
-  }
-}, 30 * 60 * 1000).unref();
+// Sources are checked every hour by scheduleChecks (with Telegram channels, one at a time).
 
 // ----- GitHub storage -----
 function ghSettings() { return store.settings.github || null; }
@@ -2924,14 +2949,58 @@ async function tgImportPost(src, post, job, preMeta) {
 }
 const catExists = (cid) => store.categories.some((c) => c.id === cid);
 
+// ----- one check at a time -----
+// Checking a Telegram channel, a GitHub repo or a source all wait in one line, so only one runs at a time
+// (they share Telegram's and GitHub's speed limits, and running several at once makes them all crawl).
+// Starting one while another runs is fine: it waits its turn and says what it's waiting for.
+const checkQueue = [];
+let checkRunning = null;
+function runCheck(job, work) {
+  if (checkRunning || checkQueue.length) {
+    job.status = 'queued';
+    const ahead = [checkRunning, ...checkQueue.map((c) => c.job)].filter(Boolean);
+    job.waitingFor = ahead.map((j) => j.title).filter(Boolean);
+    job.log.push(`⏳ Waiting for ${job.waitingFor[0] || 'another check'} to finish${ahead.length > 1 ? ` (${ahead.length} ahead)` : ''}. It starts by itself right after.`);
+  }
+  checkQueue.push({ job, work });
+  pumpChecks();
+  return job;
+}
+async function pumpChecks() {
+  if (checkRunning) return;
+  const next = checkQueue.shift();
+  if (!next) return;
+  const { job, work } = next;
+  if (job.cancelled) { job.status = 'cancelled'; job.endedAt = Date.now(); return pumpChecks(); }
+  checkRunning = job;
+  job.status = 'running';
+  job.waitingFor = null;
+  job.started = Date.now();
+  try { await work(); } catch (e) {
+    if (job.status === 'running') { job.status = 'error'; job.error = e.message; }
+  } finally {
+    if (job.status === 'running') job.status = job.cancelled ? 'cancelled' : 'done';
+    job.endedAt = Date.now();
+    checkRunning = null;
+    setImmediate(pumpChecks);
+  }
+}
+const checkBusy = () => !!checkRunning || checkQueue.length > 0;
+// Is this source already being checked (or waiting)? Then reuse that instead of starting another.
+function checkFor(srcId) {
+  return [checkRunning, ...checkQueue.map((c) => c.job)].find((j) => j && j.srcId === srcId && !j.cancelled) || null;
+}
+
 const tgSyncing = new Map();
 function tgSync(src, acc) {
-  if (tgSyncing.has(src.id) && jobs.has(tgSyncing.get(src.id)) && jobs.get(tgSyncing.get(src.id)).status === 'running') return jobs.get(tgSyncing.get(src.id));
+  const already = checkFor(src.id);
+  if (already) return already;
   const job = newJob(acc || OWNER());
   job.cancellable = true;
   job.title = `Checking ${src.name}`;
+  job.srcId = src.id;
   tgSyncing.set(src.id, job.id);
-  (async () => {
+  return runCheck(job, async () => {
     const result = { added: 0, updated: 0, same: 0, older: 0, skipped: 0, failed: 0, removed: 0 };
     try {
       if (!tgReady()) throw new Error('Telegram is not connected');
@@ -2983,8 +3052,7 @@ function tgSync(src, acc) {
       job.error = e.message;
       job.status = 'error';
     }
-  })();
-  return job;
+  });
 }
 
 // Look further back through a channel's history (old posts from years ago), without touching what you already have.
@@ -2993,8 +3061,9 @@ function tgDeepScan(src, count, acc, { recheck = false, quick = true } = {}) {
   const job = newJob(acc || OWNER());
   job.cancellable = true;
   job.title = `Scanning ${src.name}`;
+  job.srcId = src.id;
   tgSyncing.set(src.id, job.id);
-  (async () => {
+  return runCheck(job, async () => {
     const result = { added: 0, updated: 0, same: 0, older: 0, skipped: 0, failed: 0, removed: 0, known: 0 };
     try {
       if (!tgReady()) throw new Error('Telegram is not connected');
@@ -3083,18 +3152,18 @@ function tgDeepScan(src, count, acc, { recheck = false, quick = true } = {}) {
       job.error = e.message;
       job.status = 'error';
     }
-  })();
-  return job;
+  });
 }
 
 route('POST', /^\/api\/sources\/([a-f0-9]{16})\/scan$/, async (req, res, m, acc) => {
   const src = store.sources.find((x) => x.id === m[1] && x.kind === 'telegram');
   if (!src) return fail(res, 404, 'Channel not found');
   if (!tgReady()) return fail(res, 400, 'Connect Telegram first');
-  const running = tgSyncing.get(src.id);
-  if (running && jobs.has(running) && jobs.get(running).status === 'running') return fail(res, 409, 'This channel is already being checked. Wait for it to finish (or stop it) first.');
+  const busy = checkFor(src.id);
+  if (busy) return fail(res, 409, `${busy.title} is already ${busy.status === 'queued' ? 'waiting to run' : 'running'}. Stop it first (⏳ button), or wait for it to finish.`);
   const { count, recheck, quick } = await readJson(req);
-  json(res, { jobId: tgDeepScan(src, Math.max(0, Math.min(1e6, Number(count) || 0)), acc, { recheck: !!recheck, quick: quick !== false }).id });
+  const job = tgDeepScan(src, Math.max(0, Math.min(1e6, Number(count) || 0)), acc, { recheck: !!recheck, quick: quick !== false });
+  json(res, { jobId: job.id, waitingFor: job.waitingFor || null });
 }, 'owner');
 
 route('POST', /^\/api\/telegram\/channels$/, async (req, res, m, acc) => {
@@ -3112,18 +3181,18 @@ route('POST', /^\/api\/telegram\/channels$/, async (req, res, m, acc) => {
   store.sources.push(src);
   store.save();
   const job = tgSync(src, acc);
-  json(res, { source: sourceView(src), jobId: job.id });
+  json(res, { source: sourceView(src), jobId: job.id, waitingFor: job.status === 'queued' ? job.waitingFor : null });
 }, 'owner');
 
-// Check channels for new posts every 10 minutes, one at a time.
-setInterval(async () => {
-  if (!tgReady()) return;
-  for (const src of store.sources.filter((x) => x.kind === 'telegram' && x.options && x.options.autoSync !== false)) {
-    const job = tgSync(src);
-    const started = Date.now();
-    while (job.status === 'running' && Date.now() - started < 45 * 60_000) await new Promise((r) => setTimeout(r, 2000));
+// Every hour, line up a check of every channel, GitHub repo and source (one at a time, see runCheck).
+function scheduleChecks() {
+  for (const src of store.sources) {
+    if (checkFor(src.id)) continue;
+    if (src.kind === 'telegram') { if (tgReady() && src.options && src.options.autoSync !== false) tgSync(src); } else sourceCheck(src);
   }
-}, 10 * 60_000);
+}
+setTimeout(scheduleChecks, 5 * 60_000).unref();
+setInterval(scheduleChecks, 60 * 60_000).unref();
 
 // Shortly after start, re-check which channel posts still exist. Older versions only checked
 // the first 200 apps per channel, so the rest were wrongly marked "Removed from source".
@@ -3780,7 +3849,9 @@ route('POST', /^\/api\/jobs\/([a-f0-9]{16})\/cancel$/, (req, res, m, acc) => {
   if (!job || job.owner !== acc.id) return fail(res, 404, 'Job not found');
   if (job.status === 'done' || job.status === 'error') return json(res, { ok: true, status: job.status });
   job.cancelled = true;
-  job.log.push('✕ Cancelled — stopping…');
+  job.log.push(job.status === 'queued' ? '✕ Cancelled before it started' : '✕ Cancelled — stopping…');
+  const qi = checkQueue.findIndex((c) => c.job === job);
+  if (qi >= 0) { checkQueue.splice(qi, 1); job.status = 'cancelled'; job.endedAt = Date.now(); }
   if (job.countedFor) {
     // A cancelled sign doesn't use up one of today's signs.
     const c = store.data.signCounts[job.countedFor];
