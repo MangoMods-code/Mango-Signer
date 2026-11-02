@@ -205,14 +205,30 @@ async function uploadFile(file, onProgress, onStatus) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function waitJob(jobId, onUpdate) {
-  for (;;) {
-    await sleep(900);
-    const j = await api('GET', `/api/jobs/${jobId}`);
-    onUpdate && onUpdate(j);
-    if (j.status === 'done') return j.result;
-    if (j.status === 'error') throw Object.assign(new Error(j.error || 'Failed'), { log: j.log });
+  waitJob.active = jobId;
+  try {
+    for (;;) {
+      await sleep(900);
+      const j = await api('GET', `/api/jobs/${jobId}`);
+      onUpdate && onUpdate(j);
+      // Any "Cancel" button in the open sheet shows while the job can still be stopped.
+      document.querySelectorAll('#sheetBody .job-cancel').forEach((b) => b.classList.toggle('hidden', !j.cancellable));
+      if (j.status === 'done') return j.result;
+      if (j.status === 'cancelled') throw Object.assign(new Error('Cancelled'), { cancelled: true, log: j.log });
+      if (j.status === 'error') throw Object.assign(new Error(j.error || 'Failed'), { log: j.log });
+    }
+  } finally {
+    if (waitJob.active === jobId) waitJob.active = null;
   }
 }
+const cancelBtnHtml = (label = 'Cancel') => `<button class="btn block job-cancel hidden" type="button" style="margin-top:12px">✕ ${label}</button>`;
+document.addEventListener('click', async (e) => {
+  const b = e.target.closest('.job-cancel');
+  if (!b || !waitJob.active) return;
+  b.disabled = true;
+  b.textContent = 'Stopping…';
+  try { await api('POST', `/api/jobs/${waitJob.active}/cancel`); } catch (err) { toast(err.message, true); }
+});
 
 async function refresh() {
   const d = await api('GET', '/api/state');
@@ -1467,7 +1483,7 @@ const readTgOptions = (el) => ({
 function tgRunSheet(title, jobId, back) {
   closeSheet.locked = true;
   $('#sheet').classList.add('locked');
-  openSheet(`<div class="progress-wrap"><div class="spinner"></div><h2 id="trTitle" style="margin:0 0 4px">${esc(title)}</h2><p class="muted small" id="trSub">This can take a while for big files</p><div class="bar hidden" id="trBar"><div></div></div><div class="log" id="trLog"></div></div>`);
+  openSheet(`<div class="progress-wrap"><div class="spinner"></div><h2 id="trTitle" style="margin:0 0 4px">${esc(title)}</h2><p class="muted small" id="trSub">This can take a while for big files</p><div class="bar hidden" id="trBar"><div></div></div><div class="log" id="trLog"></div>${cancelBtnHtml('Stop')}</div>`);
   const body = $('#sheetBody');
   waitJob(jobId, (j) => {
     const log = $('#trLog', body);
@@ -1482,6 +1498,7 @@ function tgRunSheet(title, jobId, back) {
   }).catch(async (e) => {
     closeSheet.locked = false; $('#sheet').classList.remove('locked');
     await refresh().catch(() => {});
+    if (e.cancelled) { toast('Stopped. Apps that finished importing were kept.'); return back(); }
     toast(e.message, true);
     back();
   });
@@ -2033,7 +2050,7 @@ function bulkLinksSheet() {
 
 // ---------- adding & updating apps ----------
 function uploadProgressHtml() {
-  return `<div class="bar"><div></div></div><p class="muted small" id="addMsg">Starting…</p><p class="hint" id="addSub"></p>`;
+  return `<div class="bar"><div></div></div><p class="muted small" id="addMsg">Starting…</p><p class="hint" id="addSub"></p>${cancelBtnHtml()}`;
 }
 
 // Uploads with GitHub storage on come back as a job (the file is sent on to GitHub).
@@ -2104,7 +2121,7 @@ async function runWithProgress(el, work, onDone) {
     $('#sheet').classList.remove('locked');
     el.querySelectorAll('button, input').forEach((b) => { b.disabled = false; });
     box.innerHTML = '';
-    toast(e.message, true);
+    toast(e.cancelled ? 'Cancelled' : e.message, !e.cancelled);
   }
 }
 
@@ -3028,6 +3045,7 @@ function runSign(a, opts, extra) {
       <p class="muted small" id="pSub">Keep this screen open</p>
       <div class="bar hidden" id="pBar"><div></div></div>
       <div class="log hidden" id="pLog"></div>
+      ${cancelBtnHtml('Cancel signing')}
     </div>`);
   const body = $('#sheetBody');
   const setTitle = (t, s) => { $('#pTitle', body).textContent = t; if (s !== undefined) $('#pSub', body).textContent = s; };
@@ -3057,13 +3075,12 @@ function runSign(a, opts, extra) {
       });
       closeSheet.locked = false;
       $('#sheet').classList.remove('locked');
-    $('#sheet').classList.remove('locked');
       await refresh().catch(() => {});
       showSigned(result.signed, opts);
     } catch (e) {
       closeSheet.locked = false;
       $('#sheet').classList.remove('locked');
-    $('#sheet').classList.remove('locked');
+      if (e.cancelled) { closeSheet(); toast('Signing cancelled'); return; }
       openSheet(`
         <div class="progress-wrap">
           <h2>Signing failed</h2>

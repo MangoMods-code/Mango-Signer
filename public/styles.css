@@ -682,3 +682,13 @@ html[data-accent="red"] { --mango: #ff5c5c; --mango-2: #ff9b9b; --accent-2: #f03
 .rule-card { margin-bottom: 10px; }
 .rule-row { display: flex; gap: 8px; align-items: center; }
 .rule-row select { flex: 1; min-width: 0; }
+
+/* ---------- V1.7.2: full text, no "…" cut-offs ---------- */
+/* In sheets and Settings, long lines (errors, file names, log messages) wrap instead of ending in "…". */
+#sheetBody .row-title, #sheetBody .row-sub,
+#view .list .setting, #view button.row .row-sub, #view button.row .row-title { white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; }
+/* Library rows keep their tidy one-line look. */
+#libList .row-title, #libList .row-sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; overflow-wrap: normal; }
+#addMsg, #addSub, #pSub, #trSub { overflow-wrap: anywhere; }
+.log { max-height: 45vh; overflow-wrap: anywhere; word-break: normal; }
+.job-cancel { color: var(--red); }
