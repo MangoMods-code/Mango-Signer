@@ -1188,6 +1188,21 @@ route('POST', /^\/api\/apps\/bulk$/, async (req, res) => {
   json(res, { ok: true, count: apps.length });
 }, 'owner');
 
+// Deletes every app marked "Removed from source" (optionally just one source's).
+// Telegram channels are re-checked first, so only apps whose post is really gone are deleted.
+route('POST', /^\/api\/apps\/delete-removed$/, async (req, res) => {
+  const { sourceId = null } = await readJson(req);
+  const srcs = store.sources.filter((x) => x.kind === 'telegram' && (!sourceId || x.id === sourceId));
+  for (const src of srcs) {
+    if (!store.apps.some((a) => a.remote && a.remote.sourceId === src.id && a.remote.missing)) continue;
+    try { await tgMarkRemoved(src); } catch { /* use what we have */ }
+  }
+  const gone = store.apps.filter((a) => a.remote && a.remote.missing && (!sourceId || a.remote.sourceId === sourceId)).map((a) => a.id);
+  for (const id of gone) await deleteApp(id);
+  store.save();
+  json(res, { ok: true, count: gone.length });
+}, 'owner');
+
 route('GET', /^\/api\/apps\/([a-f0-9]{16})\/icon$/, (req, res, m, acc) => {
   const app = visibleApps(acc).find((a) => a.id === m[1]);
   if (!app) return fail(res, 404, 'Not found');
@@ -2299,6 +2314,26 @@ route('DELETE', /^\/api\/apps\/([a-f0-9]{16})\/versions\/([a-f0-9]{16})$/, async
 // Mango signs in to Telegram as you (through lib/telegram_helper.py) and watches channels for new .ipa posts.
 // Files stay on Telegram (or get copied to your GitHub storage) — nothing is kept on this server.
 const tg = telegram.createHelper();
+
+// Checks which of a channel's apps still have their post, 200 at a time (Telegram's limit per call).
+// Apps whose post is gone get marked removed; apps whose post is back get unmarked.
+// A batch that fails to check is left alone, so a hiccup never marks apps as removed.
+async function tgMarkRemoved(src) {
+  const linked = store.apps.filter((a) => a.remote && a.remote.kind === 'telegram' && a.remote.sourceId === src.id && !a.remote.ghAssetId);
+  let newlyGone = 0;
+  for (let i = 0; i < linked.length; i += 200) {
+    const batch = linked.slice(i, i + 200);
+    let exists;
+    try { ({ exists } = await tg.exists(src.ref, batch.map((a) => a.remote.msgId))); } catch { continue; }
+    const have = new Set(exists);
+    for (const a of batch) {
+      const gone = !have.has(a.remote.msgId);
+      if (gone && !a.remote.missing) newlyGone++;
+      if (gone) a.remote.missing = true; else delete a.remote.missing;
+    }
+  }
+  return newlyGone;
+}
 const tgSettings = () => store.settings.telegram || null;
 const tgReady = () => !!(tgSettings() && tgSettings().sessionEnc);
 function tgCreds(extra = {}) {
@@ -2524,15 +2559,7 @@ function tgSync(src, acc) {
       const newest = posts.length ? Math.max(...posts.map((p) => p.id)) : 0;
       src.lastMsgId = blocked ? maxDone : Math.max(src.lastMsgId || 0, newest);
       // Posts deleted from the channel: hide those apps (unless they were copied to GitHub).
-      const linked = store.apps.filter((a) => a.remote && a.remote.kind === 'telegram' && a.remote.sourceId === src.id && !a.remote.ghAssetId);
-      if (linked.length) {
-        const { exists } = await tg.exists(src.ref, linked.map((a) => a.remote.msgId));
-        for (const a of linked) {
-          const gone = !exists.includes(a.remote.msgId);
-          if (gone && !a.remote.missing) result.removed++;
-          a.remote.missing = gone;
-        }
-      }
+      result.removed += await tgMarkRemoved(src);
       if (job.cancelled) result.cancelled = true;
       Object.assign(src, { lastSync: new Date().toISOString(), lastError: null, lastResult: result });
       store.save();
@@ -2684,6 +2711,19 @@ setInterval(async () => {
     while (job.status === 'running') await new Promise((r) => setTimeout(r, 2000));
   }
 }, 10 * 60_000);
+
+// Shortly after start, re-check which channel posts still exist. Older versions only checked
+// the first 200 apps per channel, so the rest were wrongly marked "Removed from source".
+setTimeout(async () => {
+  if (!tgReady()) return;
+  let fixed = 0;
+  for (const src of store.sources.filter((x) => x.kind === 'telegram')) {
+    const before = store.apps.filter((a) => a.remote && a.remote.sourceId === src.id && a.remote.missing).length;
+    try { await tgMarkRemoved(src); } catch { continue; }
+    fixed += before - store.apps.filter((a) => a.remote && a.remote.sourceId === src.id && a.remote.missing).length;
+  }
+  if (fixed) { store.save(); console.log(`Un-marked ${fixed} apps that were wrongly shown as removed`); }
+}, 30_000);
 
 // ----- screenshots -----
 const IMG_TYPES = [
