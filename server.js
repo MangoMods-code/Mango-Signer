@@ -125,7 +125,7 @@ const safeEqual = (a, b) => {
 const SESSION_DAYS = 90;
 const OWNER = () => ({
   id: 'owner', username: 'owner', role: 'owner',
-  udid: store.settings.ownerUdid || null, deviceName: store.settings.ownerDeviceName || null, sv: 0,
+  udid: store.settings.ownerUdid || null, deviceName: store.settings.ownerDeviceName || null, sv: store.settings.ownerSv || 0,
 });
 const findUser = (uid) => store.users.find((u) => u.id === uid);
 function accountById(uid) {
@@ -170,6 +170,58 @@ function rateLimited(req) {
   const f = loginFails.get(ip) || { n: 0, t: 0 };
   if (Date.now() - f.t > 60_000) f.n = 0;
   return { limited: f.n >= 6, fail: () => loginFails.set(ip, { n: f.n + 1, t: Date.now() }), ok: () => loginFails.delete(ip) };
+}
+
+// ---------- alerts & security log ----------
+const clientIp = (req) => (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+function shortUa(ua = '') {
+  const ios = ua.match(/(iPhone|iPad|iPod).*?OS (\d+)_(\d+)/);
+  const browser = /CriOS/.test(ua) ? 'Chrome' : /FxiOS/.test(ua) ? 'Firefox' : /EdgiOS|Edg\//.test(ua) ? 'Edge' : /Safari/.test(ua) ? 'Safari' : '';
+  if (ios) return `${ios[1]} · iOS ${ios[2]}.${ios[3]}${browser ? ' · ' + browser : ''}`;
+  if (/Android/.test(ua)) return `Android${browser ? ' · ' + browser : ''}`;
+  if (/Macintosh/.test(ua)) return `Mac${browser ? ' · ' + browser : ''}`;
+  if (/Windows/.test(ua)) return `Windows${browser ? ' · ' + browser : ''}`;
+  return ua ? ua.slice(0, 40) : 'Unknown device';
+}
+// An alert shows up in someone's 🔔 inbox. ownerId 'owner' is you.
+function addAlert(ownerId, kind, title, body = '', extra = {}) {
+  store.alerts.push({ id: id(), ownerId, kind, title: String(title).slice(0, 120), body: String(body).slice(0, 400), at: new Date().toISOString(), read: false, ...extra });
+  const mine = store.alerts.filter((a) => a.ownerId === ownerId);
+  if (mine.length > 100) for (const old of mine.slice(0, mine.length - 100)) store.alerts.splice(store.alerts.indexOf(old), 1);
+  if (store.alerts.length > 8000) store.alerts.splice(0, store.alerts.length - 8000);
+}
+function secEvent(req, type, user, ok, detail = '') {
+  store.securityLog.push({ id: id(), at: new Date().toISOString(), type, user: user || '?', ok: !!ok, ip: req ? clientIp(req) : '', device: req ? shortUa(req.headers['user-agent']) : '', detail });
+  if (store.securityLog.length > 600) store.securityLog.splice(0, store.securityLog.length - 600);
+}
+// Too many wrong passwords for one username locks it for 15 minutes (on top of the per-IP limit).
+const userFails = new Map();
+const LOCK_AFTER = 8;
+const LOCK_MS = 15 * 60_000;
+function accountLocked(name) {
+  const f = userFails.get(name);
+  return !!(f && f.n >= LOCK_AFTER && Date.now() - f.t < LOCK_MS);
+}
+function noteFail(req, name) {
+  const f = userFails.get(name);
+  const n = f && Date.now() - f.t < LOCK_MS ? f.n + 1 : 1;
+  userFails.set(name, { n, t: Date.now() });
+  if (n === LOCK_AFTER) {
+    secEvent(req, 'locked', name, false, `${LOCK_AFTER} wrong passwords in a row`);
+    addAlert('owner', 'security', `🔒 ${name === 'owner' ? 'Your owner login' : name} was locked for 15 minutes`, `${LOCK_AFTER} wrong passwords in a row from ${clientIp(req) || 'an unknown address'} (${shortUa(req.headers['user-agent'])}).`);
+    const u = store.users.find((x) => x.username === name);
+    if (u) addAlert(u.id, 'security', '🔒 Someone kept trying your password', `Your account was locked for 15 minutes after ${LOCK_AFTER} wrong passwords. If this wasn't you, change your password.`);
+  }
+}
+// Tells everyone who installed an app that a new version is in the library.
+function notifyUpdate(app, oldVersion) {
+  const shown = app.versionOverride || app.version;
+  if (!oldVersion || !shown || oldVersion === shown || app.published === false) return;
+  const who = new Set(store.installLog.filter((l) => l.appId === app.id).map((l) => l.ownerId));
+  for (const uid of who) {
+    if (store.alerts.some((a) => a.ownerId === uid && a.kind === 'update' && a.appId === app.id && a.version === shown)) continue;
+    addAlert(uid, 'update', `⬆ ${app.name} ${shown} is out`, `You have ${oldVersion}. Tap to update.`, { appId: app.id, version: shown });
+  }
 }
 
 // ---------- helpers ----------
@@ -437,6 +489,8 @@ function userView(u) {
     createdAt: u.createdAt, lastLogin: u.lastLogin || null, disabled: !!u.disabled, invite: u.invite || null,
     certCount: store.certs.filter((c) => c.ownerId === u.id).length,
     signedCount: store.signed.filter((s) => s.ownerId === u.id).length,
+    signLimit: u.signLimit ?? null, signsToday: signsToday(u.id),
+    recentSignins: store.securityLog.filter((e) => e.user === u.username && /^login/.test(e.type)).slice(-5).reverse(),
   };
 }
 function accountView(acc) {
@@ -474,19 +528,29 @@ route('POST', /^\/api\/login$/, async (req, res) => {
   if (rl.limited) return fail(res, 429, 'Too many tries — wait a minute');
   const { username = '', password = '' } = await readJson(req);
   const name = String(username).trim().toLowerCase();
+  const who = name || 'owner';
+  if (accountLocked(who)) return fail(res, 429, 'Too many wrong passwords — this account is locked for 15 minutes');
 
   if ((!name || name === 'owner') && APP_PASSWORD && safeEqual(password, APP_PASSWORD)) {
     rl.ok();
+    userFails.delete('owner');
+    secEvent(req, 'login', 'owner', true);
+    store.save();
     return send(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(req, OWNER()) });
   }
   const u = store.users.find((x) => x.username === name);
   if (u && !u.disabled && checkPassword(password, u)) {
     rl.ok();
+    userFails.delete(name);
     u.lastLogin = new Date().toISOString();
+    secEvent(req, 'login', name, true);
     store.save();
     return send(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(req, { ...u }) });
   }
   rl.fail();
+  if (name === 'owner' || !name || u) noteFail(req, who);
+  secEvent(req, 'login', who, false, u && u.disabled ? 'account turned off' : u || who === 'owner' ? 'wrong password' : 'no such user');
+  store.save();
   if (u && u.disabled) return fail(res, 403, 'This account is turned off');
   return fail(res, 401, name ? 'Wrong username or password' : 'Wrong password');
 }, 'open');
@@ -499,6 +563,7 @@ route('POST', /^\/api\/signup$/, async (req, res) => {
   const code = String(invite).trim().toUpperCase();
   const inv = store.invites.find((i) => i.code === code);
   if (!inv || inv.uses >= inv.maxUses) { rl.fail(); return fail(res, 400, 'That invite code is invalid or used up'); }
+  if (inv.expiresAt && new Date(inv.expiresAt) < new Date()) { rl.fail(); return fail(res, 400, 'That invite code has expired'); }
   if (!/^[a-z0-9_.]{3,24}$/.test(name)) return fail(res, 400, 'Username must be 3–24 letters, numbers, dots or underscores');
   if (name === 'owner' || name === 'admin' || store.users.some((u) => u.username === name)) return fail(res, 400, 'That username is taken');
   if (String(password).length < 6) return fail(res, 400, 'Password must be at least 6 characters');
@@ -515,6 +580,8 @@ route('POST', /^\/api\/signup$/, async (req, res) => {
   store.users.push(user);
   inv.uses += 1;
   inv.usedBy = [...(inv.usedBy || []), name];
+  secEvent(req, 'signup', name, true, `invite ${code}`);
+  addAlert('owner', 'user', `👋 ${name} joined`, `Used invite ${code}${inv.note ? ` (${inv.note})` : ''}.`, { userId: user.id });
   store.save();
   rl.ok();
   send(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(req, user) });
@@ -630,7 +697,9 @@ route('GET', /^\/udid\/done$/, (req, res) => {
     const acc = accountById(holder);
     udidStates.delete(state);
     if (!acc) return redirect(res, '/?udid=disabled');
-    if (holder !== 'owner') { findUser(holder).lastLogin = new Date().toISOString(); store.save(); }
+    if (holder !== 'owner') findUser(holder).lastLogin = new Date().toISOString();
+    secEvent(req, 'login-udid', acc.username, true, acc.deviceName ? `with ${acc.deviceName}` : 'with iPhone');
+    store.save();
     res.writeHead(302, { Location: '/?udid=welcome', 'Set-Cookie': sessionCookie(req, acc), 'Cache-Control': 'no-store' });
     return res.end();
   }
@@ -695,6 +764,9 @@ route('GET', /^\/api\/state$/, async (req, res, m, acc) => {
     requests: (isOwner(acc) ? store.requests : store.requests.filter((r) => r.ownerId === acc.id)).slice(-200).reverse(),
     installs: store.installLog.filter((l) => l.ownerId === acc.id).slice(-60).reverse(),
     tweaks: visibleTweaks(acc).map((t) => tweakView(t, acc)),
+    alerts: store.alerts.filter((a) => a.ownerId === acc.id).slice(-60).reverse().map(alertView),
+    favorites: store.favorites[acc.id] || [],
+    mySignins: store.securityLog.filter((e) => e.user === acc.username && /^login|signout/.test(e.type)).slice(-8).reverse(),
     presets: store.presets.filter((p) => p.ownerId === acc.id).map(({ ownerId, ...p }) => p),
     substrate: substrateView(),
     announcement: store.settings.announcement && store.settings.announcement.text ? store.settings.announcement : null,
@@ -707,9 +779,10 @@ route('GET', /^\/api\/state$/, async (req, res, m, acc) => {
     out.invites = store.invites;
     out.sources = store.sources.map(sourceView);
     out.github = ghView();
+    out.securityLog = store.securityLog.slice(-200).reverse();
     out.server = { ...out.server, zsign: zsignVersion, passwordSet: !!APP_PASSWORD, storage: await storageUsed(), storageBreakdown: await storageBreakdown(), disk: diskInfo() };
   } else {
-    out.settings = { maxSignedPerUser: store.settings.maxSignedPerUser, signedRetentionDays: store.settings.signedRetentionDays };
+    out.settings = { maxSignedPerUser: store.settings.maxSignedPerUser, signedRetentionDays: store.settings.signedRetentionDays, signsPerDay: signLimitFor(acc), signsToday: signsToday(acc.id) };
   }
   json(res, out);
 });
@@ -850,6 +923,7 @@ async function replaceAppFile(app, file) {
   const oldShown = app.versionOverride || oldVersion;
   Object.assign(app, metaFields(meta), { updatedAt: new Date().toISOString(), previousVersion: oldShown, versionOverride: null });
   if (!app.customIcon) app.hasIcon = !!meta.icon;
+  notifyUpdate(app, oldShown);
   store.save();
   return app;
 }
@@ -955,6 +1029,7 @@ route('POST', /^\/api\/apps\/([a-f0-9]{16})\/replace$/, async (req, res, m, acc)
         const meta = await inspectLink(u.toString(), null, job);
         const oldShown = app.versionOverride || app.version;
         Object.assign(app, metaFields(meta), { updatedAt: new Date().toISOString(), previousVersion: oldShown, versionOverride: null });
+        notifyUpdate(app, oldShown);
         if (meta.icon && !app.customIcon) await fsp.writeFile(path.join(dirs.apps, app.id + '.png'), meta.icon);
         await rmQuiet(path.join(dirs.apps, app.id + '.ipa'));
         app.remote = { kind: 'link', url: u.toString() };
@@ -1017,7 +1092,9 @@ route('PATCH', /^\/api\/apps\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
   if (b.versionOverride !== undefined) {
     const v = String(b.versionOverride || '').trim();
     if (v && !/^[\w.\-+ ()]{1,30}$/.test(v)) return fail(res, 400, 'Version can use letters, numbers, dots, dashes and spaces (30 max)');
+    const was = app.versionOverride || app.version;
     app.versionOverride = v || null;
+    if ((app.versionOverride || app.version) !== was) notifyUpdate(app, was);
   }
   if (typeof b.useVersionWhenSigning === 'boolean') app.useVersionWhenSigning = b.useVersionWhenSigning;
   if (Array.isArray(b.tags)) {
@@ -1291,6 +1368,7 @@ async function syncSource(src) {
     if (oldVersion && v.version && oldVersion !== v.version) {
       app.previousVersion = app.versionOverride || oldVersion;
       app.updatedAt = new Date().toISOString();
+      notifyUpdate(app, app.previousVersion);
       updated++;
     }
   }
@@ -1498,6 +1576,98 @@ route('POST', /^\/api\/github\/move$/, async (req, res, m, acc) => {
     if (job.status === 'error') job.error = errors[0];
   })();
 }, 'owner');
+
+// ----- daily sign limits -----
+const today = () => new Date().toISOString().slice(0, 10);
+function signsToday(uid) { const c = store.data.signCounts[uid]; return c && c.day === today() ? c.n : 0; }
+function countSign(uid) {
+  const c = store.data.signCounts[uid];
+  store.data.signCounts[uid] = c && c.day === today() ? { day: c.day, n: c.n + 1 } : { day: today(), n: 1 };
+}
+// 0 = no limit. A per-user limit (set on their page) wins over the everyone limit.
+function signLimitFor(acc) {
+  if (isOwner(acc)) return 0;
+  const u = findUser(acc.id);
+  if (u && u.signLimit !== null && u.signLimit !== undefined) return u.signLimit;
+  return Number(store.settings.signsPerDay) || 0;
+}
+
+// ----- alerts inbox -----
+const alertView = ({ ownerId, ...a }) => a;
+route('POST', /^\/api\/alerts\/read$/, async (req, res, m, acc) => {
+  const { ids } = await readJson(req);
+  for (const a of store.alerts) if (a.ownerId === acc.id && (!Array.isArray(ids) || ids.includes(a.id))) a.read = true;
+  store.save();
+  json(res, { ok: true });
+});
+route('DELETE', /^\/api\/alerts$/, (req, res, m, acc) => {
+  store.data.alerts = store.alerts.filter((a) => a.ownerId !== acc.id);
+  store.save();
+  json(res, { ok: true });
+});
+
+// ----- favorites -----
+route('POST', /^\/api\/apps\/([a-f0-9]{16})\/favorite$/, async (req, res, m, acc) => {
+  if (!visibleApps(acc).some((a) => a.id === m[1])) return fail(res, 404, 'App not found');
+  const { on } = await readJson(req);
+  const list = new Set(store.favorites[acc.id] || []);
+  if (on) list.add(m[1]); else list.delete(m[1]);
+  store.favorites[acc.id] = [...list].slice(-500);
+  store.save();
+  json(res, { favorite: !!on });
+});
+
+// ----- security -----
+// Signs out every other phone or browser: bumps your session version, then gives this one a fresh cookie.
+route('POST', /^\/api\/account\/signout-others$/, async (req, res, m, acc) => {
+  if (isOwner(acc)) store.settings.ownerSv = (store.settings.ownerSv || 0) + 1;
+  else { const u = findUser(acc.id); u.sv = (u.sv || 0) + 1; }
+  secEvent(req, 'signout-all', acc.username, true);
+  store.save();
+  const fresh = accountById(acc.id);
+  send(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(req, fresh) });
+});
+route('DELETE', /^\/api\/security-log$/, (req, res) => { store.data.securityLog = []; store.save(); json(res, { ok: true }); }, 'owner');
+
+// ----- background checks: certificates and storage -----
+const CERT_THRESHOLDS = [7, 3, 1, 0];
+async function certAlerts({ checkRevoked = false } = {}) {
+  let changed = false;
+  for (const c of store.certs) {
+    const ownerId = c.ownerId;
+    const dates = [c.p12 && c.p12.validTo, c.profile && c.profile.expires].filter(Boolean).sort();
+    if (dates[0]) {
+      const days = Math.floor((new Date(dates[0]) - Date.now()) / 864e5);
+      const hit = CERT_THRESHOLDS.find((t) => days <= t && (c.alertedDays === undefined || t < c.alertedDays));
+      if (hit !== undefined && days >= -1) {
+        c.alertedDays = hit;
+        changed = true;
+        addAlert(ownerId, 'cert', days < 0 ? `⚠️ ${c.label} has expired` : days === 0 ? `⚠️ ${c.label} expires today` : `⏳ ${c.label} expires in ${days} day${days === 1 ? '' : 's'}`,
+          days < 0 ? 'Apps signed with it won\'t open anymore. Add a new certificate and sign them again.' : 'Apps signed with it stop opening when it expires. Get a new certificate before then and re-sign.', { certId: c.id });
+      }
+    }
+    if (checkRevoked && zsignVersion) {
+      const before = c.check && c.check.status;
+      try { c.check = await checkCert(c); changed = true; } catch { /* offline */ }
+      if (c.check && c.check.status === 'revoked' && before !== 'revoked') {
+        addAlert(ownerId, 'cert', `🚫 ${c.label} was revoked`, 'Apple turned this certificate off, so apps signed with it won\'t open. Add a new certificate and sign your apps again.', { certId: c.id });
+      }
+    }
+  }
+  if (changed) store.save();
+}
+function storageAlert() {
+  const d = diskInfo();
+  if (!d || d.free > 1024 ** 3) return;
+  const last = store.settings.lastStorageAlert;
+  if (last && Date.now() - new Date(last) < 864e5) return;
+  store.settings.lastStorageAlert = new Date().toISOString();
+  addAlert('owner', 'storage', `💾 Only ${gb(d.free)} free on your server`, 'Big apps need room to sign. Move apps to GitHub or clean up signed files in Settings › Storage.');
+  store.save();
+}
+setTimeout(() => { certAlerts().catch(() => {}); storageAlert(); }, 20_000);
+setInterval(() => { certAlerts().catch(() => {}); storageAlert(); }, 3 * 3600_000);
+setInterval(() => certAlerts({ checkRevoked: true }).catch(() => {}), 12 * 3600_000);
 
 // ----- tweaks library -----
 // Tweaks are small (.dylib files, usually under 1 MB), so they're kept on the server.
@@ -1837,6 +2007,7 @@ route('POST', /^\/api\/requests$/, async (req, res, m, acc) => {
   };
   store.requests.push(r);
   if (store.requests.length > 1000) store.requests.splice(0, store.requests.length - 1000);
+  if (!isOwner(acc)) addAlert('owner', 'request', `🙋 ${acc.username} wants ${name}`, r.note || r.link || '', { requestId: r.id });
   store.save();
   json(res, { request: r });
 });
@@ -1844,9 +2015,13 @@ route('PATCH', /^\/api\/requests\/([a-f0-9]{16})$/, async (req, res, m) => {
   const r = store.requests.find((x) => x.id === m[1]);
   if (!r) return fail(res, 404, 'Request not found');
   const b = await readJson(req);
+  const before = r.status;
   if (['pending', 'added', 'declined'].includes(b.status)) r.status = b.status;
   if (typeof b.reply === 'string') r.reply = b.reply.trim().slice(0, 300);
   if (typeof b.appId === 'string' && store.apps.some((a) => a.id === b.appId)) r.appId = b.appId;
+  if (r.ownerId !== 'owner' && r.status !== before && r.status !== 'pending') {
+    addAlert(r.ownerId, 'request', r.status === 'added' ? `✅ ${r.name} was added` : `✕ Your request for ${r.name} was declined`, r.reply || '', { requestId: r.id, appId: r.appId || null });
+  }
   r.updatedAt = new Date().toISOString();
   store.save();
   json(res, { request: r });
@@ -2173,6 +2348,8 @@ route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
   const cert = ownCert(acc, b.certId || defaultCertId(acc));
   if (!cert) return fail(res, 400, 'Add a certificate first');
   if (!zsignVersion) return fail(res, 500, 'The signing engine is not installed on the server');
+  const limit = signLimitFor(acc);
+  if (limit && signsToday(acc.id) >= limit) return fail(res, 429, `You've used all ${limit} signs for today. It resets at midnight (server time).`);
 
   const opts = {
     name: String(b.name || '').trim().slice(0, 80),
@@ -2205,6 +2382,7 @@ route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
   }
 
   const job = newJob(acc);
+  countSign(acc.id);
   signingNow.set(runKey, job.id);
   json(res, { jobId: job.id });
 
@@ -2358,6 +2536,7 @@ route('PATCH', /^\/api\/settings$/, async (req, res) => {
   if (b.udidLogin !== undefined) store.settings.udidLogin = !!b.udidLogin;
   if (b.deleteAfterInstall !== undefined) store.settings.deleteAfterInstall = !!b.deleteAfterInstall;
   if (b.signedRetentionDays !== undefined) store.settings.signedRetentionDays = Math.min(365, Math.max(0, Number(b.signedRetentionDays) || 0));
+  if (b.signsPerDay !== undefined) store.settings.signsPerDay = Math.min(500, Math.max(0, Number(b.signsPerDay) || 0));
   store.save();
   const { github: _gh, ...settings } = store.settings;
   json(res, { settings });
@@ -2388,6 +2567,7 @@ route('POST', /^\/api\/invites$/, async (req, res) => {
   const inv = {
     code: inviteCode(), note: String(b.note || '').trim().slice(0, 60),
     maxUses: Math.min(1000, Math.max(1, Number(b.maxUses) || 1)), uses: 0, usedBy: [], createdAt: new Date().toISOString(),
+    expiresAt: Number(b.expiresDays) > 0 ? new Date(Date.now() + Math.min(365, Number(b.expiresDays)) * 864e5).toISOString() : null,
   };
   store.invites.unshift(inv);
   store.save();
@@ -2413,6 +2593,8 @@ route('PATCH', /^\/api\/users\/([a-f0-9]{16})$/, async (req, res, m) => {
     u.sv = (u.sv || 0) + 1;
   }
   if (b.unlinkDevice) { u.udid = null; u.deviceName = null; }
+  if (b.signOut) u.sv = (u.sv || 0) + 1;
+  if (b.signLimit !== undefined) u.signLimit = b.signLimit === null ? null : Math.max(0, Math.min(500, Number(b.signLimit) || 0));
   store.save();
   json(res, { user: userView(u) });
 }, 'owner');

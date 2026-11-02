@@ -11,6 +11,7 @@ Upload an `.ipa`, add a `.p12` + `.mobileprovision`, tap **Sign**, then **Instal
 - **Cloud Library** – add AltStore/SideStore/ESign-style sources, link-only apps, or keep your own IPAs in a (private) GitHub repo's release, so app files don't sit on your Railway volume. Files are downloaded only while signing and deleted right after. Older versions from sources can be picked when signing
 - **Tweaks** – a tweaks library (jailbreak `.deb` or `.dylib`), per-app default tweaks, automatic CydiaSubstrate/ElleKit bundling for tweaks that need it
 - **Presets & batch signing** – save sign settings as presets, select several apps and Get them all at once, import certificates from a `.zip`
+- **Alerts & security** – 🔔 alerts inbox (updates, requests, certificate expiry and revokes, new users, lockouts, low storage), ♥ favorites, security log, account lockout, sign out everywhere, expiring invites, daily sign limits
 - **Big files** – resumable uploads that survive dropped connections; old signed files are cleaned up automatically
 - **Accounts** – invite codes, username + password login, or sign in with your iPhone (UDID)
 - **Certificates** – each account adds its own `.p12` + `.mobileprovision`; shows type, expiry, revoke status, cert/profile mismatch, and whether your iPhone is in the profile
