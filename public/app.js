@@ -52,8 +52,9 @@ async function whatsNewSheet() {
     openSheet(`
       <h2>What's New</h2>
       <p class="muted small" style="margin-top:-8px">You're on Mango Signer V${esc(CLIENT_VERSION || version)}</p>
-      ${versions.map((v, i) => whatsNewHtml(v, i === 0)).join('')}
-      <button class="btn primary big block" id="wnDone" style="margin-top:14px">Got it</button>`, (el) => {
+      ${versions.length ? whatsNewHtml(versions[0], true) : ''}
+      <button class="btn primary big block" id="wnDone" style="margin:14px 0 4px">Got it</button>
+      ${versions.length > 1 ? `<div class="section-title">Earlier versions</div>${versions.slice(1).map((v) => whatsNewHtml(v, false)).join('')}` : ''}`, (el) => {
       $('#wnDone', el).onclick = closeSheet;
     });
     try { localStorage.setItem(SEEN_KEY, CODE_VERSION || version); } catch { /* */ }
@@ -673,6 +674,10 @@ function appTile(a) {
   </button>`;
 }
 
+function miniCard(a, sub = '') {
+  return `<button class="mini-card" data-act="app" data-id="${a.id}">${appIcon(a)}<span class="mini-name">${esc(a.name)}</span>${sub ? `<span class="mini-sub">${esc(sub)}</span>` : ''}</button>`;
+}
+
 function shelfCard(a, sub) {
   return `<button class="shelf-card" data-act="app" data-id="${a.id}">${appIcon(a, true)}<span class="shelf-name">${esc(a.name)}</span><span class="shelf-sub">${esc(sub)}</span></button>`;
 }
@@ -701,22 +706,14 @@ function libraryListHtml() {
   // Grouped view: shelves up top, then one section per category, in your order.
   if (cat === 'all' && !q && state.lib.sort === 'smart' && !state.lib.select) {
     let html = '';
+    // Kept small on purpose: a slim row of icons instead of big cards.
     const updates = apps.filter(hasUpdate);
     if (updates.length) {
-      html += `<div class="section-title" style="margin-top:6px">⬆ Updates for you <span class="count">${updates.length}</span></div><div class="shelf">${updates.map((a) => shelfCard(a, `${a.installed.version} → ${shownVersion(a)}`)).join('')}</div>`;
+      html += `<div class="section-title" style="margin-top:6px">⬆ Updates for you <span class="count">${updates.length}</span></div><div class="mini-shelf">${updates.map((a) => miniCard(a, `→ ${shownVersion(a)}`)).join('')}</div>`;
     }
     const featured = apps.filter((a) => a.featured);
     if (featured.length) {
-      html += `<div class="section-title" style="margin-top:6px">★ Featured</div><div class="shelf">${featured.map((a) => shelfCard(a, catLabel(a.categoryId))).join('')}</div>`;
-    }
-    const popular = apps.filter((a) => a.installCount > 0).sort((x, y) => y.installCount - x.installCount).slice(0, 8);
-    if (popular.length >= 2) {
-      html += `<div class="section-title">🔥 Popular</div><div class="shelf">${popular.map((a) => shelfCard(a, `${a.installCount} install${a.installCount === 1 ? '' : 's'}`)).join('')}</div>`;
-    }
-    const cols = state.collections.filter((c) => c.appIds.some((x) => apps.some((a) => a.id === x)));
-    if (cols.length) {
-      html += `<div class="section-title">📦 Collections</div><div class="shelf">${cols.map((c) => `
-        <button class="shelf-card col-card" data-act="collection" data-id="${c.id}"><span class="col-emoji">${esc(c.emoji)}</span><span class="shelf-name">${esc(c.name)}</span><span class="shelf-sub">${c.appIds.filter((x) => apps.some((a) => a.id === x)).length} apps</span></button>`).join('')}</div>`;
+      html += `<div class="section-title" style="margin-top:6px">★ Featured</div><div class="mini-shelf">${featured.map((a) => miniCard(a)).join('')}</div>`;
     }
     // Everything else: one list, most recently added or updated first.
     const recent = apps.slice().sort((x, y) => String(y.updatedAt || y.addedAt).localeCompare(String(x.updatedAt || x.addedAt)));
@@ -757,7 +754,8 @@ function renderLibrary() {
     ${state.apps.length ? `
     <div class="searchbar">${ICONS.search}<input type="search" id="libSearch" placeholder="Search ${state.apps.length} apps" value="${esc(q)}" autocapitalize="off" autocorrect="off"></div>
     <div class="chips-row" id="libChips">
-      ${chips.filter(([k]) => k === 'all' || k === cat || counts(k) > 0 || (isOwner() && state.categories.some((c) => c.id === k))).map(([k, l]) => `<button class="fchip ${cat === k ? 'on' : ''}" data-cat="${esc(k)}">${esc(l)} <span>${counts(k)}</span></button>`).join('')}
+      ${chips.filter(([k]) => k === 'all' || k === cat || (counts(k) > 0 && !(k === 'new' && counts(k) === state.apps.length)) || (isOwner() && state.categories.some((c) => c.id === k))).map(([k, l]) => `<button class="fchip ${cat === k ? 'on' : ''}" data-cat="${esc(k)}">${esc(l)} <span>${counts(k)}</span></button>`).join('')}
+      ${state.collections.filter((c) => c.appIds.some((x) => state.apps.some((a) => a.id === x))).map((c) => `<button class="fchip" data-act="collection" data-id="${c.id}">${esc(c.emoji)} ${esc(c.name)} <span>${c.appIds.filter((x) => state.apps.some((a) => a.id === x)).length}</span></button>`).join('')}
       ${isOwner() ? '<button class="fchip ghost" data-act="manage-cats">⚙︎ Edit</button>' : ''}
     </div>
     <div class="lib-tools">
