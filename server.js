@@ -1355,10 +1355,11 @@ route('PATCH', /^\/api\/apps\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
   json(res, { app: appView(app, acc) });
 }, 'owner');
 
-async function deleteApp(appId, { keepRemote = false } = {}) {
+async function deleteApp(appId, { keepRemote = false, exclude = false } = {}) {
   const i = store.apps.findIndex((a) => a.id === appId);
   if (i < 0) return false;
   const app = store.apps[i];
+  if (exclude) excludeFromSource(app);
   if (!keepRemote) {
     const gh = ghClient();
     for (const v of app.manualVersions || []) if (gh && v.storage && v.storage.kind === 'github') await gh.deleteAsset(v.storage.assetId).catch(() => {});
@@ -1376,7 +1377,7 @@ async function deleteApp(appId, { keepRemote = false } = {}) {
 }
 
 route('DELETE', /^\/api\/apps\/([a-f0-9]{16})$/, async (req, res, m) => {
-  if (!(await deleteApp(m[1]))) return fail(res, 404, 'App not found');
+  if (!(await deleteApp(m[1], { exclude: true }))) return fail(res, 404, 'App not found');
   store.save();
   json(res, { ok: true });
 }, 'owner');
@@ -1392,7 +1393,7 @@ route('POST', /^\/api\/apps\/bulk$/, async (req, res) => {
     else if (action === 'hide') a.published = false;
     else if (action === 'feature') a.featured = true;
     else if (action === 'unfeature') a.featured = false;
-    else if (action === 'delete') await deleteApp(a.id);
+    else if (action === 'delete') await deleteApp(a.id, { exclude: true });
     else return fail(res, 400, 'Unknown action');
   }
   store.save();
@@ -1631,6 +1632,22 @@ function categoryIdFor(name) {
   return cat.id;
 }
 
+// ----- apps you deleted from a source -----
+// Deleting an app that came from a source, GitHub repo or Telegram channel remembers it on that source,
+// so the next refresh doesn't add it back. (Handy when two sources both have the same app.)
+// It can be brought back from the source's page.
+const normBid = (b) => String(b || '').trim().toLowerCase();
+function excludeFromSource(app) {
+  const r = app.remote;
+  const src = r && r.sourceId && store.sources.find((x) => x.id === r.sourceId);
+  if (!src) return;
+  src.excluded = src.excluded || [];
+  const bid = normBid(app.bundleId);
+  if (src.excluded.some((e) => (r.key && e.key === r.key) || (bid && e.bundleId === bid))) return;
+  src.excluded.push({ key: r.key || null, bundleId: bid || null, name: app.originalName || app.name, at: new Date().toISOString() });
+}
+const isExcluded = (src, { key, bundleId }) => (src.excluded || []).some((e) => (key && e.key === key) || (normBid(bundleId) && e.bundleId === normBid(bundleId)));
+
 // ----- GitHub repos as sources -----
 // "Follow" a developer's GitHub repo: every release with an .ipa attached becomes a version, so new
 // releases show up as updates, whatever the file is called (BuildBox-2.1.3.ipa, BuildBox-2.1.4.ipa…).
@@ -1727,6 +1744,7 @@ async function syncSource(src) {
   let added = 0, updated = 0;
   for (const s of parsed.apps) {
     seen.add(s.key);
+    if (isExcluded(src, s)) continue; // you deleted it from this source
     const existing = byKey.get(s.key);
     if (existing) dropSupersededManual(existing, s.versions);
     // Your own newer uploads (added with "Add a newer version") count as part of the source.
@@ -1791,6 +1809,8 @@ const sourceView = ({ done: _d, failures: _f, ...src }) => ({ ...src, apps: stor
 
 route('POST', /^\/api\/sources$/, async (req, res) => {
   const b = await readJson(req);
+  // People often paste links without https:// (github.com/owner/repo).
+  if (typeof b.url === 'string' && !/^[a-z]+:\/\//i.test(b.url.trim()) && /^[\w.-]+\.[a-z]{2,}\//i.test(b.url.trim())) b.url = 'https://' + b.url.trim();
   let url;
   const repo = parseGithubRepo(b.url);
   try { url = repo ? repo.url : sources.normalizeSourceUrl(b.url); } catch (e) { return fail(res, 400, e.message); }
@@ -1841,6 +1861,22 @@ route('PATCH', /^\/api\/sources\/([a-f0-9]{16})$/, async (req, res, m) => {
   }
   store.save();
   json(res, { source: sourceView(src) });
+}, 'owner');
+
+// Bring back an app you deleted from a source: it's added again on the next refresh (started right away).
+route('POST', /^\/api\/sources\/([a-f0-9]{16})\/restore$/, async (req, res, m, acc) => {
+  const src = store.sources.find((x) => x.id === m[1]);
+  if (!src) return fail(res, 404, 'Source not found');
+  const { index } = await readJson(req);
+  if (!src.excluded || !src.excluded[index]) return fail(res, 404, 'Not found');
+  const [gone] = src.excluded.splice(index, 1);
+  store.save();
+  if (src.kind === 'telegram') {
+    json(res, { ok: true, restored: gone.name, note: 'It comes back the next time it\'s posted. To get it now, use Scan older posts with "Re-check posts already checked" on.' });
+    return;
+  }
+  try { await syncSource(src); } catch (e) { src.lastError = e.message; store.save(); }
+  json(res, { ok: true, restored: gone.name, source: sourceView(src) });
 }, 'owner');
 
 route('DELETE', /^\/api\/sources\/([a-f0-9]{16})$/, async (req, res, m) => {
@@ -2806,6 +2842,11 @@ async function tgImportPost(src, post, job, preMeta) {
   let app = store.apps.find((a) => mine(a) && (a.bundleId || '').toLowerCase() === bid)
     || (opts.matchName ? store.apps.find((a) => mine(a) && normName(a.originalName || a.name) === normName(meta.name)) : null)
     || (opts.updateMine ? store.apps.find((a) => (a.bundleId || '').toLowerCase() === bid && (!a.remote || ['github', 'link'].includes(a.remote.kind))) : null);
+  // You deleted this app from the channel: don't add it back (updating your own copy with "update mine" is still fine).
+  if (!app && isExcluded(src, { bundleId: bid })) {
+    job.log.push(`– ${meta.name}: skipped (you deleted it from this channel)`);
+    return 'skipped';
+  }
   const notes = opts.captionNotes ? cleanCaption(post.text) : '';
   if (app && meta.version && app.version && versionCmp(meta.version, app.version) < 0) {
     job.log.push(`= ${meta.name} ${meta.version} is older than the ${app.version} you have`);
