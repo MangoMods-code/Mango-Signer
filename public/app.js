@@ -1452,7 +1452,12 @@ function tgOptionsHtml(o = {}, src = {}) {
       ${toggle('tcShow', 'Show its apps to everyone', 'Off = only you can see them until you turn it on', src.showInLibrary !== false)}
     </div>
     <div class="field" style="margin-top:12px"><label>Only import posts that mention</label><input type="text" id="tcWords" value="${esc(o.keywords || '')}" placeholder="Optional, e.g. mortal kombat, youtube" autocapitalize="off"><div class="hint">Comma-separated. Leave empty to import every .ipa.</div></div>
-    <div class="field"><label>Category for new apps</label>${categorySelectHtml(src.categoryId || '').replace('id="eCat"', 'id="tcCat"').replace('<option value="__new">+ New category…</option>', '')}</div>`;
+    <div class="field"><label>Category for new apps</label>
+      <select id="tcCat">
+        <option value="__auto" ${!src.categoryId || src.categoryId === '__auto' ? 'selected' : ''}>✨ Automatic (your rules, then the App Store)</option>
+        <option value="__none" ${src.categoryId === '__none' ? 'selected' : ''}>Uncategorized</option>
+        ${state.categories.map((c) => `<option value="${c.id}" ${c.id === src.categoryId ? 'selected' : ''}>${esc(c.emoji)} ${esc(c.name)}</option>`).join('')}
+      </select></div>`;
 }
 const readTgOptions = (el) => ({
   storage: $('#tcStore', el).value, updateMine: $('#tcMine', el).checked, matchName: $('#tcName', el).checked,
@@ -2745,7 +2750,32 @@ function manageCategoriesSheet() {
           <button class="mini" data-edit="${c.id}">✎</button>
           <button class="mini danger" data-del="${c.id}">✕</button>
         </div>`).join('') || '<div class="setting muted">No categories yet</div>'}</div>
-      <button class="btn primary block" id="cNew" style="margin-top:12px">+ New category</button>`, (el) => {
+      <button class="btn primary block" id="cNew" style="margin-top:12px">+ New category</button>
+      <div class="section-title">✨ Sort automatically</div>
+      <p class="hint" style="margin:0 4px 10px">Mango checks your keyword rules first, then looks the app up on the App Store and uses its category (Games, Social Networking…). It also fills in a missing developer, description and screenshots. Apps you put in a category yourself are never moved.</p>
+      <div class="actions" style="margin-top:0">
+        <button class="btn block" id="cAuto">Sort uncategorized apps (${state.apps.filter((a) => !catById(a.categoryId)).length})</button>
+        <button class="btn block" id="cAutoAll">Re-sort every app</button>
+        <button class="btn block" id="cRules">Keyword rules (${(state.settings.catRules || []).length})</button>
+      </div>`, (el) => {
+      const runAuto = async (all) => {
+        if (all && !confirm('Re-sort every app? Apps you moved yourself stay where they are.')) return;
+        try {
+          const { jobId, count } = await api('POST', '/api/apps/auto-categorize', { all });
+          if (!count) return toast('Nothing to sort');
+          closeSheet.locked = true; $('#sheet').classList.add('locked');
+          openSheet(`<div class="progress-wrap"><div class="spinner"></div><h2 style="margin:0 0 4px">Sorting ${count} app${count === 1 ? '' : 's'}…</h2><div class="bar" id="asBar"><div></div></div><div class="log" id="asLog"></div></div>`);
+          const body = $('#sheetBody');
+          const r = await waitJob(jobId, (j) => { $('#asBar > div', body).style.width = `${Math.round((j.progress || 0) * 100)}%`; const l = $('#asLog', body); l.textContent = j.log.join('\n'); l.scrollTop = l.scrollHeight; });
+          closeSheet.locked = false; $('#sheet').classList.remove('locked');
+          await refresh();
+          toast(`Sorted ${r.sorted} (${r.byAppStore} from the App Store, ${r.byRule} by your rules)${r.unknown ? ` · ${r.unknown} not found` : ''}`);
+          draw();
+        } catch (e) { closeSheet.locked = false; $('#sheet').classList.remove('locked'); toast(e.message, true); }
+      };
+      $('#cAuto', el).onclick = () => runAuto(false);
+      $('#cAutoAll', el).onclick = () => runAuto(true);
+      $('#cRules', el).onclick = () => catRulesSheet(draw);
       const reorder = async (from, to) => {
         const ids = cats.map((c) => c.id);
         ids.splice(to, 0, ids.splice(from, 1)[0]);
@@ -2770,6 +2800,43 @@ function manageCategoriesSheet() {
         };
       });
       $('#cNew', el).onclick = async () => { if (await promptNewCategory()) { render(); draw(); } };
+    });
+  };
+  draw();
+}
+
+// Keyword rules: "if the name or post mentions any of these words, put it in this category".
+function catRulesSheet(back) {
+  const rules = (state.settings.catRules || []).map((r) => ({ ...r }));
+  const draw = () => {
+    openSheet(`
+      <h2>Keyword rules</h2>
+      <p class="muted small" style="margin-top:-6px">Checked before the App Store, against the app's name, file name and the Telegram post. The first rule that matches wins.</p>
+      <div id="crList">${rules.map((r, i) => `
+        <div class="card rule-card">
+          <div class="field" style="margin:0 0 8px"><label>If it mentions</label><input type="text" data-w="${i}" value="${esc(r.words)}" placeholder="emulator, emu" autocapitalize="off"></div>
+          <div class="rule-row">${categorySelectHtml(r.categoryId).replace('id="eCat"', `data-c="${i}"`).replace('<option value="__new">+ New category…</option>', '').replace('<option value="">Uncategorized</option>', '')}
+            <button class="mini danger" data-rm="${i}">✕</button></div>
+        </div>`).join('') || '<p class="hint">No rules yet.</p>'}</div>
+      <button class="btn block" id="crAdd" style="margin-top:10px">+ Add rule</button>
+      <button class="btn primary big block" id="crSave" style="margin-top:10px">Save rules</button>
+      <button class="link-btn block" id="crBack" type="button">Back</button>`, (el) => {
+      const sync = () => {
+        el.querySelectorAll('[data-w]').forEach((x) => { rules[+x.dataset.w].words = x.value; });
+        el.querySelectorAll('[data-c]').forEach((x) => { rules[+x.dataset.c].categoryId = x.value; });
+      };
+      el.querySelectorAll('[data-rm]').forEach((b) => { b.onclick = () => { sync(); rules.splice(+b.dataset.rm, 1); draw(); }; });
+      $('#crAdd', el).onclick = () => {
+        sync();
+        if (!state.categories.length) return toast('Make a category first', true);
+        rules.push({ words: '', categoryId: state.categories[0].id });
+        draw();
+      };
+      $('#crBack', el).onclick = back;
+      $('#crSave', el).onclick = async () => {
+        sync();
+        try { state.settings = (await api('PATCH', '/api/settings', { catRules: rules })).settings; toast('Rules saved'); back(); } catch (e) { toast(e.message, true); }
+      };
     });
   };
   draw();

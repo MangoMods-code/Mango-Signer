@@ -679,3 +679,6 @@ html[data-accent="red"] { --mango: #ff5c5c; --mango-2: #ff9b9b; --accent-2: #f03
 .chart-lbl { fill: var(--muted); font-size: 10px; }
 .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
 .rank { width: 22px; flex: none; color: var(--muted); font-weight: 700; text-align: center; }
+.rule-card { margin-bottom: 10px; }
+.rule-row { display: flex; gap: 8px; align-items: center; }
+.rule-row select { flex: 1; min-width: 0; }
