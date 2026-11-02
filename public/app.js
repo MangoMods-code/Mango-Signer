@@ -71,12 +71,24 @@ const saveLibPrefs = () => { try { localStorage.setItem('mango.lib', JSON.string
 
 // ---------- api ----------
 async function api(method, url, body) {
-  const r = await fetch(url, {
-    method,
-    headers: body ? { 'Content-Type': 'application/json' } : {},
-    body: body ? JSON.stringify(body) : undefined,
-    credentials: 'same-origin',
-  });
+  // Never wait forever: if the server or the connection goes quiet, give up with a clear message.
+  const slow = /\/(sync|delete-removed|auto-categorize|restore|bulk|scan)\b/.test(url);
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), slow ? 300000 : 60000);
+  let r;
+  try {
+    r = await fetch(url, {
+      method,
+      headers: body ? { 'Content-Type': 'application/json' } : {},
+      body: body ? JSON.stringify(body) : undefined,
+      credentials: 'same-origin',
+      signal: ctrl.signal,
+    });
+  } catch (e) {
+    throw Object.assign(new Error(ctrl.signal.aborted ? 'Mango took too long to answer. Check your connection and try again.' : "Couldn't reach Mango. Check your connection and try again."), { network: true });
+  } finally {
+    clearTimeout(timer);
+  }
   let data = {};
   try { data = await r.json(); } catch { /* empty */ }
   if (r.status === 401 && !['/api/login', '/api/signup'].includes(url)) { showLogin(); throw new Error('Please sign in'); }
@@ -216,7 +228,7 @@ async function waitJob(jobId, onUpdate) {
         misses = 0;
       } catch (e) {
         // Phone locked or the app was in the background: the job keeps running on the server, so just try again.
-        if (/not found/i.test(e.message) || ++misses > 120) throw e;
+        if (e.status === 404 || ++misses > 120) throw e;
         await sleep(Math.min(10000, 1000 * misses));
         continue;
       }
@@ -630,7 +642,9 @@ function render() {
 const DAY = 864e5;
 const isNewApp = (a) => Date.now() - new Date(a.addedAt) < 3 * DAY;
 const isUpdatedApp = (a) => !isNewApp(a) && a.updatedAt && a.previousVersion && Date.now() - new Date(a.updatedAt) < 3 * DAY;
-const hasUpdate = (a) => a.installed && a.installed.version && shownVersion(a) && a.installed.version !== shownVersion(a);
+// Mango works this out on the server: the real version you installed vs the newest one (a custom version name never triggers it).
+const hasUpdate = (a) => !!(a.installed && a.installed.update && !a.installed.stopped);
+const isStopped = (a) => !!(a.installed && a.installed.stopped);
 function libView() { try { return localStorage.getItem('mango.libView') || 'list'; } catch { return 'list'; } }
 
 function filteredApps() {
@@ -664,9 +678,79 @@ function filteredApps() {
   return apps.sort(by[sort] || by.smart);
 }
 
+// The "You installed…" line on an app's page, with quick fixes when Mango's guess is wrong.
+function installedNoteHtml(a) {
+  const i = a.installed;
+  const why = i.stopped === 'revoked' ? 'the certificate it was signed with was revoked' : 'the certificate it was signed with has expired';
+  return `<div class="installed-note">
+    ${i.stopped ? `<p class="warning bad" style="margin:8px 0 0">You installed ${esc(i.version || '')} ${ago(i.at)}, but ${why}, so it won't open anymore. Sign it again with a working certificate to fix it.</p>`
+      : `<p class="hint center" style="margin:8px 0 0">You installed ${esc(i.version || '')} ${ago(i.at)}${hasUpdate(a) ? ` · ${esc(shownVersion(a))} is out` : ''}</p>`}
+    <div class="note-links">
+      ${hasUpdate(a) ? '<button class="linkish" data-myapp="latest">I already updated it</button>' : ''}
+      <button class="linkish" data-myapp="remove">Not on my phone anymore</button>
+    </div>
+  </div>`;
+}
+function bindInstalledNote(el, a, after) {
+  el.querySelectorAll('[data-myapp]').forEach((b) => {
+    b.onclick = async () => {
+      const action = b.dataset.myapp;
+      try {
+        const { installed } = await api('POST', `/api/my-apps/${a.id}`, { action });
+        const app = state.apps.find((x) => x.id === a.id);
+        if (app) app.installed = action === 'remove' ? null : installed;
+        toast(action === 'remove' ? 'Removed from your installed apps' : 'Marked as up to date');
+        if (after) after();
+        render();
+        refresh().catch(() => {});
+      } catch (e) { toast(e.message, true); }
+    };
+  });
+}
+// Everything Mango thinks is on your phone, so you can fix the list in one place.
+function myAppsSheet() {
+  const mine = state.apps.filter((a) => a.installed).sort((x, y) => (hasUpdate(y) - hasUpdate(x)) || (isStopped(y) - isStopped(x)) || String(y.installed.at).localeCompare(String(x.installed.at)));
+  const stopped = mine.filter(isStopped).length;
+  openSheet(`
+    <h2>Your installed apps</h2>
+    <p class="hint" style="margin:0 4px 12px">iPhones don't let websites see your home screen, so this is every app you installed through Mango. Deleted one, or updated it somewhere else? Fix it here and Mango stops bugging you about it.</p>
+    ${stopped ? `<button class="btn block" id="maClean" style="margin-bottom:10px">Forget ${stopped} app${stopped === 1 ? '' : 's'} that won't open anymore</button>` : ''}
+    ${mine.length ? `<div class="group">${mine.map((a) => `
+      <div class="row" data-ma="${a.id}">
+        ${appIcon(a)}
+        <div class="row-main"><div class="row-title">${esc(a.name)}</div>
+          <div class="row-sub">${esc(a.installed.version || '?')} · ${ago(a.installed.at)}${hasUpdate(a) ? ` · <b class="mango-text">${esc(shownVersion(a))} is out</b>` : isStopped(a) ? ' · <b class="bad-text">won\'t open</b>' : ' · up to date'}</div></div>
+        <div class="row-btns">
+          ${hasUpdate(a) ? '<button class="btn small-btn" data-ma-act="latest" title="I already updated it">✓</button>' : ''}
+          <button class="btn small-btn" data-ma-act="remove" aria-label="Not on my phone">✕</button>
+        </div>
+      </div>`).join('')}</div>
+      <p class="hint" style="margin:8px 4px 0">✓ = I already have the newest version · ✕ = not on my phone anymore</p>` : '<p class="empty">Nothing yet. Apps you install from Mango show up here.</p>'}
+  `, (el) => {
+    el.querySelectorAll('[data-ma-act]').forEach((b) => {
+      b.onclick = async () => {
+        const row = b.closest('[data-ma]');
+        const action = b.dataset.maAct;
+        b.disabled = true;
+        try {
+          const { installed } = await api('POST', `/api/my-apps/${row.dataset.ma}`, { action });
+          const app = state.apps.find((x) => x.id === row.dataset.ma);
+          if (app) app.installed = action === 'remove' ? null : installed;
+          render();
+          myAppsSheet();
+        } catch (e) { b.disabled = false; toast(e.message, true); }
+      };
+    });
+    if ($('#maClean', el)) $('#maClean', el).onclick = async () => {
+      try { const { removed } = await api('POST', '/api/my-apps/clean'); await refresh(); toast(`Forgot ${removed} app${removed === 1 ? '' : 's'}`); myAppsSheet(); } catch (e) { toast(e.message, true); }
+    };
+  });
+}
+
 function appBadges(a, { compact = false } = {}) {
   const b = [];
   if (hasUpdate(a)) b.push('<span class="badge mango">⬆ Update</span>');
+  else if (isStopped(a)) b.push('<span class="badge bad">⚠ Won\'t open</span>');
   else if (a.installed) b.push('<span class="badge good">✓ Installed</span>');
   if (isNewApp(a)) b.push('<span class="badge new">NEW</span>');
   else if (isUpdatedApp(a)) b.push('<span class="badge new">UPDATED</span>');
@@ -690,6 +774,7 @@ const storedLabel = (a) => ({ telegram: `Telegram: ${a.sourceName || 'a channel'
 
 function getLabel(a) {
   if (hasUpdate(a)) return 'Update';
+  if (isStopped(a)) return 'Fix';
   return 'Get';
 }
 
@@ -852,6 +937,7 @@ function renderLibrary() {
       </div>
       <button class="btn small-btn" data-act="toggle-select-mode">${state.lib.select ? 'Done' : 'Select'}</button>
     </div>` : ''}
+    ${['installed', 'updates'].includes(cat) && libCount('installed') ? `<div class="hint-card"><span>Deleted something or updated it elsewhere?</span><button class="btn small-btn" data-act="my-apps">Fix the list</button></div>` : ''}
     ${cat === 'missing' && isOwner() && libCount('missing') ? `<div class="warning bad" style="margin:0 0 12px;display:flex;align-items:center;gap:10px"><span style="flex:1">These apps were removed from their source and are hidden from everyone.</span><button class="btn small-btn danger" data-act="delete-missing">Delete all ${libCount('missing')}</button></div>` : ''}
     <div id="libList">${libraryListHtml()}</div>
     ${state.lib.select ? bulkBarHtml() : ''}`;
@@ -944,13 +1030,15 @@ async function finishBulk(msg) {
 function installHistoryHtml(limit = 20) {
   const list = (state.installs || []).slice(0, limit);
   if (!list.length) return '';
+  const mine = state.apps.filter((a) => a.installed).length;
   return `<div class="section-title">Install history <span class="count">${state.installs.length}</span></div>
+    ${mine ? `<div class="hint-card"><span>${mine} app${mine === 1 ? '' : 's'} on your phone, as far as Mango knows</span><button class="btn small-btn" data-act="my-apps">Review</button></div>` : ''}
     <div class="list">${list.map((l) => {
       const app = state.apps.find((a) => a.id === l.appId);
       return `<div class="row" ${app ? `data-act="app" data-id="${app.id}"` : ''}>
         ${app ? appIcon(app) : iconHtml(null, l.name)}
         <div class="row-main"><div class="row-title">${esc(l.name)}</div>
-          <div class="row-sub">${esc(l.shownVersion || l.version || '')} · ${esc(l.certLabel || '')}</div>
+          <div class="row-sub">${esc(l.shownVersion || l.version || '')} · ${esc(l.certLabel || '')}${l.via === 'link' ? ' · from a shared link' : ''}</div>
           <div class="row-sub">${new Date(l.at).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</div></div>
         <span class="badge good">✓</span></div>`;
     }).join('')}</div>`;
@@ -974,7 +1062,7 @@ function renderSigned() {
     <div class="row" data-act="signed" data-id="${s.id}">
       ${signedIcon(s)}
       <div class="row-main">
-        <div class="row-title">${esc(s.name)} ${badge}</div>
+        <div class="row-title">${esc(s.name)} ${s.onPhone ? '<span class="badge good">On your phone</span>' : ''} ${badge}</div>
         <div class="row-sub">${esc(s.version || '—')} · ${esc(s.certLabel)}</div>
         <div class="row-sub">Signed ${ago(s.signedAt)} · ${fmtSize(s.size)}</div>
       </div>
@@ -1222,6 +1310,7 @@ function bindView(view) {
         'security-log': securityLogSheet,
         dupes: duplicatesSheet,
         filters: filterSheet,
+        'my-apps': myAppsSheet,
         'delete-missing': () => deleteRemovedApps(null, libCount('missing')),
         'clear-filter': () => { state.lib.cat = 'all'; state.lib.limit = 40; saveLibPrefs(); render(); },
         'lib-more': () => { state.lib.limit += 40; const y = window.scrollY; render(); window.scrollTo(0, y); },
@@ -2348,8 +2437,8 @@ function appSheet(appId) {
       <div><b>${esc(a.minOS || '—')}</b><span>min iOS</span></div>
     </div>
     ${a.missing ? `<p class="warning bad">${owner ? `This app was removed from ${esc(a.sourceName || 'its source')}, so it's hidden from everyone. You can still try signing it if the link works, or delete it.` : 'This app is no longer available.'}</p>` : ''}
-    <button class="btn primary big block" id="aGet">${hasUpdate(a) ? `Update to ${esc(shownVersion(a))}` : a.installed ? 'Get Again' : 'Get'}</button>
-    ${a.installed ? `<p class="hint center" style="margin-top:8px">You installed ${esc(a.installed.version || '')} ${ago(a.installed.at)}</p>` : ''}
+    <button class="btn primary big block" id="aGet">${hasUpdate(a) ? `Update to ${esc(shownVersion(a))}` : isStopped(a) ? 'Sign Again to Fix' : a.installed ? 'Get Again' : 'Get'}</button>
+    ${a.installed ? installedNoteHtml(a) : ''}
     ${defaults.length ? `<p class="hint center" style="margin-top:${a.installed ? 2 : 8}px">Comes set up with: ${esc(defaults.join(' · '))}</p>` : ''}
     <button class="link-btn block" id="aOptions" type="button">Sign with options…</button>
 
@@ -2408,6 +2497,7 @@ function appSheet(appId) {
       <button class="btn block danger" id="aDelete">Delete</button>
     </div>` : ''}`, (el) => {
     $('#aGet', el).onclick = () => quickGet(a.id);
+    bindInstalledNote(el, a, () => appSheet(a.id));
     $('#aOptions', el).onclick = () => signSheet(a.id);
     el.querySelectorAll('[data-shot]').forEach((b) => { b.onclick = () => shotViewer(a, Number(b.dataset.shot)); });
     el.querySelectorAll('[data-ver]').forEach((b) => {
@@ -3440,8 +3530,10 @@ function installSheet(s) {
       const p = Math.floor(st.progress * 100);
       title.textContent = 'Installing…';
       pctEl.textContent = `${p}%`;
-      sub.textContent = `${fmtSize(st.sent)} of ${fmtSize(st.size)}${rate > 1024 ? ` · ${fmtSize(rate)}/s · ${fmtTime((st.size - st.sent) / rate)} left` : ''}`;
-      hint('');
+      if (st.sent !== tick.lastSentSeen) { tick.lastSentSeen = st.sent; tick.movedAt = now; }
+      const stuck = now - (tick.movedAt || now) > 30000;
+      sub.textContent = stuck ? `Stuck at ${fmtSize(st.sent)} of ${fmtSize(st.size)}` : `${fmtSize(st.sent)} of ${fmtSize(st.size)}${rate > 1024 ? ` · ${fmtSize(rate)}/s · ${fmtTime((st.size - st.sent) / rate)} left` : ''}`;
+      hint(stuck ? "Nothing's moved for 30 seconds. Check your iPhone has enough free space and a good connection, then tap Try again." : '');
     } else if (st.phase === 'done') {
       if (!doneSeen) { doneSeen = now; confetti(); refresh().catch(() => {}); }
       pctEl.textContent = '100%';

@@ -705,3 +705,13 @@ html[data-accent="red"] { --mango: #ff5c5c; --mango-2: #ff9b9b; --accent-2: #f03
 .task-pill .mini-spin { width: 18px; height: 18px; border-width: 2.5px; }
 .task-row { align-items: flex-start; }
 .task-row .bar { height: 6px; }
+
+/* Installed-app fixes */
+.bad-text { color: var(--red); }
+.linkish { background: none; border: 0; color: var(--mango); font: inherit; font-size: 14px; padding: 6px 4px; cursor: pointer; }
+.installed-note .note-links { display: flex; justify-content: center; flex-wrap: wrap; gap: 4px 14px; margin-top: 2px; }
+.hint-card { display: flex; align-items: center; gap: 10px; margin: 0 0 12px; padding: 10px 12px; border-radius: 12px; background: var(--card); color: var(--soft-text); font-size: 14px; }
+.hint-card span { flex: 1; }
+.row-btns { display: flex; gap: 6px; flex-shrink: 0; }
+.row-btns .small-btn { min-width: 36px; }
+.btn.small-btn { padding: 7px 12px; font-size: 14px; border-radius: 10px; flex-shrink: 0; }
