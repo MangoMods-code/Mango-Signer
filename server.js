@@ -48,6 +48,7 @@ const dirs = {
   tmp: path.join(DATA_DIR, 'tmp'),
   work: path.join(DATA_DIR, 'work'),
   tweaks: path.join(DATA_DIR, 'tweaks'),
+  cache: path.join(DATA_DIR, 'cache'),
 };
 for (const d of Object.values(dirs)) fs.mkdirSync(d, { recursive: true });
 fs.rmSync(dirs.work, { recursive: true, force: true });
@@ -800,9 +801,57 @@ async function storageBreakdown() {
     library: (await dirSize(dirs.apps)) + (await dirSize(dirs.tweaks)),
     signed: await dirSize(dirs.signed),
     certs: await dirSize(dirs.certs),
-    temp: (await dirSize(dirs.tmp)) + (await dirSize(dirs.work)),
+    temp: (await dirSize(dirs.tmp)) + (await dirSize(dirs.work)) + (await dirSize(dirs.cache)),
   };
 }
+
+// ----- download cache -----
+// Apps that live elsewhere (Telegram, GitHub, links) are downloaded each time they're signed. The last
+// few downloads are kept for a while, so signing the same app again (or for someone else) skips the download.
+// Kept small: 1 GB at most, 2 days at most, and nothing is cached when the server is low on space.
+const CACHE_MAX = () => (Number(store.settings.ipaCacheMB) || 1024) * 1048576;
+function downloadCacheKey(app, versionIndex, dl) {
+  const r = app.remote || {};
+  const id = [app.id, versionIndex || 0, (dl && dl.version) || app.version || '', app.updatedAt || '', r.msgId || '', r.assetId || r.ghAssetId || '', r.kind === 'link' ? r.url : ''].join('|');
+  return crypto.createHash('sha1').update(id).digest('hex').slice(0, 24) + '.ipa';
+}
+async function cacheGet(key) {
+  const p = path.join(dirs.cache, key);
+  const st = await fsp.stat(p).catch(() => null);
+  if (!st || !st.size) return null;
+  const now = new Date();
+  await fsp.utimes(p, now, now).catch(() => {});
+  return p;
+}
+async function cachePut(file, key) {
+  try {
+    const d = diskInfo();
+    if (d && d.free < 1.5 * 1024 ** 3) return;
+    const st = await fsp.stat(file);
+    if (st.size > CACHE_MAX() * 0.6) return;
+    const dest = path.join(dirs.cache, key);
+    await rmQuiet(dest);
+    // Same disk, so a hard link costs no extra space while the work folder still has it.
+    await fsp.link(file, dest).catch(() => fsp.copyFile(file, dest));
+    await trimCache();
+  } catch { /* caching is only a speed-up */ }
+}
+async function trimCache() {
+  const files = [];
+  for (const f of await fsp.readdir(dirs.cache).catch(() => [])) {
+    const st = await fsp.stat(path.join(dirs.cache, f)).catch(() => null);
+    if (st) files.push({ f, size: st.size, used: st.mtimeMs });
+  }
+  files.sort((a, b) => b.used - a.used);
+  let total = 0;
+  const d = diskInfo();
+  const max = d && d.free < 1024 ** 3 ? 0 : CACHE_MAX();
+  for (const x of files) {
+    total += x.size;
+    if (total > max || Date.now() - x.used > 2 * 864e5) await rmQuiet(path.join(dirs.cache, x.f));
+  }
+}
+setInterval(() => trimCache().catch(() => {}), 30 * 60 * 1000).unref();
 
 // Signed .ipa files are only needed to install, so old ones are deleted to save space.
 // The record stays so people can see it and tap "Sign again".
@@ -3359,7 +3408,7 @@ route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
         '-m', provPath,
         '-o', out,
         '-t', work,
-        '-z', String(Math.min(9, Math.max(0, Number(store.settings.zipLevel ?? 6)))),
+        '-z', String(Math.min(9, Math.max(0, Number(store.settings.zipLevel ?? 1)))),
       ];
       if (opts.bundleId) args.push('-b', opts.bundleId);
       if (opts.name) args.push('-n', opts.name);
@@ -3394,9 +3443,21 @@ route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
 
       let input = path.join(dirs.apps, app.id + '.ipa');
       if (dl) {
-        // Link-only app: download it just for this signing. It's deleted with the work folder afterwards.
+        // App stored elsewhere: use a recent download if there is one, otherwise download it for this signing.
+        const key = downloadCacheKey(app, versionIndex, dl);
+        let cached = await cacheGet(key);
         input = path.join(work, 'original.ipa');
-        await fetchToFile(dl.url, dl.headers, input, job, `Downloading ${app.name}${dl.version ? ' ' + dl.version : ''}…`);
+        // zsign unpacks next to its input, so work from a link inside this job's own folder.
+        if (cached && !(await fsp.link(cached, input).then(() => true, () => fsp.copyFile(cached, input).then(() => true, () => false)))) cached = null;
+        if (cached) {
+          job.log.push(`Using ${app.name}${dl.version ? ' ' + dl.version : ''} downloaded earlier — no download needed ✓`);
+        } else {
+          const t0 = Date.now();
+          const got = await fetchToFile(dl.url, dl.headers, input, job, `Downloading ${app.name}${dl.version ? ' ' + dl.version : ''}…`);
+          const secs = Math.max(1, (Date.now() - t0) / 1000);
+          if (got > 5 * 1048576) job.log.push(`Downloaded ${gb(got)} in ${Math.round(secs)}s (${(got / 1048576 / secs).toFixed(1)} MB/s)`);
+          await cachePut(input, key);
+        }
         job.progress = null;
       }
       if (plistEdits.length || inject.frameworks.length) input = await prepareModifiedIpa(input, work, plistEdits, job, inject.frameworks);
@@ -3524,6 +3585,7 @@ route('POST', /^\/api\/maintenance$/, async (req, res) => {
   const { action } = await readJson(req);
   if (action === 'clear-temp') {
     for (const f of await fsp.readdir(dirs.tmp).catch(() => [])) { await rmQuiet(path.join(dirs.tmp, f)); uploads.delete(f); }
+    for (const f of await fsp.readdir(dirs.cache).catch(() => [])) await rmQuiet(path.join(dirs.cache, f));
     return json(res, { message: 'Temporary files cleared' });
   }
   if (action === 'purge-signed') {
