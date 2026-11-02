@@ -6,7 +6,7 @@ const state = {
   tab: 'library', account: null, apps: [], categories: [], certs: [], signed: [], users: [], invites: [], settings: {}, server: {},
   sources: [], github: { connected: false },
   udidState: null,
-  lib: { q: '', cat: 'all', sort: 'smart', select: false, selected: new Set() },
+  lib: { q: '', cat: 'all', sort: 'smart', select: false, selected: new Set(), limit: 40 },
 };
 const isOwner = () => state.account && state.account.role === 'owner';
 
@@ -645,11 +645,12 @@ function getLabel(a) {
   return 'Get';
 }
 
-function appRow(a) {
+function appRow(a, { age = false } = {}) {
   const sel = state.lib.select;
   const checked = state.lib.selected.has(a.id);
   const rating = a.likes + a.dislikes ? `👍 ${Math.round((100 * a.likes) / (a.likes + a.dislikes))}%` : '';
-  const sub2 = [a.developer, fmtSize(a.size), a.installCount ? `🔥 ${a.installCount}` : '', rating].filter(Boolean).join(' · ');
+  const when = age ? `${a.updatedAt && a.updatedAt !== a.addedAt ? 'Updated' : 'Added'} ${ago(a.updatedAt || a.addedAt)}` : '';
+  const sub2 = [when, a.developer, fmtSize(a.size), a.installCount ? `🔥 ${a.installCount}` : '', rating].filter(Boolean).join(' · ');
   return `
     <div class="row ${checked ? 'selected' : ''}" data-act="${sel ? 'toggle-select' : 'app'}" data-id="${a.id}">
       ${sel ? `<span class="check ${checked ? 'on' : ''}">${checked ? ICONS.check : ''}</span>` : ''}
@@ -676,10 +677,10 @@ function shelfCard(a, sub) {
   return `<button class="shelf-card" data-act="app" data-id="${a.id}">${appIcon(a, true)}<span class="shelf-name">${esc(a.name)}</span><span class="shelf-sub">${esc(sub)}</span></button>`;
 }
 
-function appsBlock(apps) {
+function appsBlock(apps, opts = {}) {
   return libView() === 'grid'
-    ? `<div class="grid">${apps.map(appTile).join('')}</div>`
-    : `<div class="list">${apps.map(appRow).join('')}</div>`;
+    ? `<div class="grid">${apps.map((a) => appTile(a)).join('')}</div>`
+    : `<div class="list">${apps.map((a) => appRow(a, opts)).join('')}</div>`;
 }
 
 function libraryListHtml() {
@@ -717,21 +718,14 @@ function libraryListHtml() {
       html += `<div class="section-title">📦 Collections</div><div class="shelf">${cols.map((c) => `
         <button class="shelf-card col-card" data-act="collection" data-id="${c.id}"><span class="col-emoji">${esc(c.emoji)}</span><span class="shelf-name">${esc(c.name)}</span><span class="shelf-sub">${c.appIds.filter((x) => apps.some((a) => a.id === x)).length} apps</span></button>`).join('')}</div>`;
     }
-    const fresh = apps.filter((a) => isNewApp(a) || isUpdatedApp(a)).sort((x, y) => String(y.updatedAt || y.addedAt).localeCompare(String(x.updatedAt || x.addedAt)));
-    if (fresh.length && fresh.length < apps.length) {
-      html += `<div class="section-title">🆕 New & updated</div><div class="shelf">${fresh.slice(0, 10).map((a) => shelfCard(a, isNewApp(a) ? 'New' : `Updated to ${shownVersion(a)}`)).join('')}</div>`;
-    }
-    const groups = state.categories.map((c) => ({ key: c.id, title: `${c.emoji} ${c.name}`, apps: apps.filter((a) => a.categoryId === c.id) }));
-    groups.push({ key: 'none', title: 'Other', apps: apps.filter((a) => !catById(a.categoryId)) });
-    // Big sources can add hundreds of apps; show the first few per category and link to the rest.
-    const PER_GROUP = 24;
-    for (const g of groups.filter((x) => x.apps.length)) {
-      html += `<div class="section-title">${esc(g.title)} <span class="count">${g.apps.length}</span></div>${appsBlock(g.apps.slice(0, PER_GROUP))}`;
-      if (g.apps.length > PER_GROUP) html += `<button class="btn block see-all" data-cat-jump="${esc(g.key)}">See all ${g.apps.length} in ${esc(g.title)} ›</button>`;
-    }
+    // Everything else: one list, most recently added or updated first.
+    const recent = apps.slice().sort((x, y) => String(y.updatedAt || y.addedAt).localeCompare(String(x.updatedAt || x.addedAt)));
+    const shown = recent.slice(0, state.lib.limit);
+    html += `<div class="section-title">🕒 Recently updated <span class="count">${apps.length}</span></div>${appsBlock(shown, { age: true })}`;
+    if (recent.length > shown.length) html += `<button class="btn block see-all" data-act="lib-more">Show more (${recent.length - shown.length} left)</button>`;
     return html;
   }
-  return `<div class="section-title" style="margin-top:6px">${apps.length} app${apps.length === 1 ? '' : 's'}</div>${state.lib.select ? `<div class="list">${apps.map(appRow).join('')}</div>` : appsBlock(apps)}`;
+  return `<div class="section-title" style="margin-top:6px">${apps.length} app${apps.length === 1 ? '' : 's'}</div>${state.lib.select ? `<div class="list">${apps.map((a) => appRow(a)).join('')}</div>` : appsBlock(apps)}`;
 }
 
 function renderLibrary() {
@@ -768,7 +762,7 @@ function renderLibrary() {
     </div>
     <div class="lib-tools">
       <select id="libSort">
-        ${[['smart', 'Grouped'], ['popular', 'Popular'], ['rating', 'Top rated'], ['name', 'A–Z'], ['newest', 'Newest'], ['size', 'Biggest']].map(([k, l]) => `<option value="${k}" ${sort === k ? 'selected' : ''}>Sort: ${l}</option>`).join('')}
+        ${[['smart', cat === 'all' ? 'Recently updated' : 'Featured first'], ['popular', 'Popular'], ['rating', 'Top rated'], ['name', 'A–Z'], ['newest', 'Newest'], ['size', 'Biggest']].map(([k, l]) => `<option value="${k}" ${sort === k ? 'selected' : ''}>Sort: ${l}</option>`).join('')}
       </select>
       <div class="seg" role="group" aria-label="Layout">
         <button data-view="list" class="${view === 'list' ? 'on' : ''}" aria-label="List">☰</button>
@@ -807,7 +801,7 @@ function bindLibrary(view) {
     b.onclick = () => { state.lib.cat = b.dataset.catJump; saveLibPrefs(); window.scrollTo(0, 0); render(); };
   });
   view.querySelectorAll('.fchip[data-cat]').forEach((b) => {
-    b.onclick = () => { state.lib.cat = b.dataset.cat; saveLibPrefs(); render(); };
+    b.onclick = () => { state.lib.cat = b.dataset.cat; state.lib.limit = 40; saveLibPrefs(); render(); };
   });
   const sort = $('#libSort', view);
   if (sort) sort.onchange = () => { state.lib.sort = sort.value; saveLibPrefs(); render(); };
@@ -1100,6 +1094,7 @@ function bindView(view) {
         'request-app': requestAppSheet,
         'manage-cols': manageCollectionsSheet,
         'add-source': addSourceSheet,
+        'lib-more': () => { state.lib.limit += 40; const y = window.scrollY; render(); window.scrollTo(0, y); },
         source: () => sourceSheet(idv),
         github: githubSheet,
         announce: announcementSheet,
