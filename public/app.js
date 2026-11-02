@@ -4,7 +4,7 @@ const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(
 
 const state = {
   tab: 'library', account: null, apps: [], categories: [], certs: [], signed: [], users: [], invites: [], settings: {}, server: {},
-  sources: [], github: { connected: false },
+  sources: [], github: { connected: false }, tweaks: [], presets: [], substrate: { installed: false },
   udidState: null,
   lib: { q: '', cat: 'all', sort: 'smart', select: false, selected: new Set(), limit: 40 },
 };
@@ -534,6 +534,14 @@ function bindSignOptions(el, defaults = {}, prefix = '') {
 }
 
 // Short list of what an app's default sign settings turn on, e.g. "JIT · More RAM · 120Hz".
+// Checkboxes for tweaks from the Tweaks library.
+function tweakPickerHtml(prefix, selected = []) {
+  if (!state.tweaks.length) return '';
+  return `<div class="group tweak-pick">${state.tweaks.map((t) => toggle(`${prefix}Tw_${t.id}`, `🧩 ${t.name}${t.version ? ' ' + t.version : ''}`,
+    t.description ? t.description.split('\n')[0].slice(0, 90) : (t.warnings.length ? '⚠️ ' + t.warnings[0] : `${t.files.length} file${t.files.length === 1 ? '' : 's'}`), selected.includes(t.id))).join('')}</div>`;
+}
+const pickedTweaks = (el, prefix) => state.tweaks.filter((t) => { const x = $(`#${prefix}Tw_${t.id}`, el); return x && x.checked; }).map((t) => t.id);
+
 function defaultsSummary(d = {}) {
   const bits = [];
   for (const p of ENT_PRESETS) if ((d.entitlements || []).some((e) => e.key === p.key)) bits.push(p.short);
@@ -543,6 +551,8 @@ function defaultsSummary(d = {}) {
   if (extraEnt) bits.push(`${extraEnt} custom entitlement${extraEnt === 1 ? '' : 's'}`);
   if (extraPlist) bits.push(`${extraPlist} Info.plist change${extraPlist === 1 ? '' : 's'}`);
   for (const o of OPTION_TOGGLES) if (d[o.key]) bits.push(o.short);
+  const tw = (d.tweakIds || []).map((tid) => (state.tweaks.find((t) => t.id === tid) || {}).name).filter(Boolean);
+  if (tw.length) bits.push(`🧩 ${tw.join(', ')}`);
   return bits;
 }
 
@@ -725,38 +735,73 @@ function libraryListHtml() {
   return `<div class="section-title" style="margin-top:6px">${apps.length} app${apps.length === 1 ? '' : 's'}</div>${state.lib.select ? `<div class="list">${apps.map((a) => appRow(a)).join('')}</div>` : appsBlock(apps)}`;
 }
 
+// How many apps a filter key matches.
+function libCount(key) {
+  const A = state.apps;
+  if (key === 'all') return A.length;
+  if (key === 'installed') return A.filter((a) => a.installed).length;
+  if (key === 'updates') return A.filter(hasUpdate).length;
+  if (key === 'new') return A.filter((a) => isNewApp(a) || isUpdatedApp(a)).length;
+  if (key === 'featured') return A.filter((a) => a.featured).length;
+  if (key === 'none') return A.filter((a) => !catById(a.categoryId)).length;
+  if (key === 'hidden') return A.filter((a) => !a.published).length;
+  if (key.startsWith('tag:')) return A.filter((a) => (a.tags || []).includes(key.slice(4))).length;
+  if (key.startsWith('src:')) return A.filter((a) => a.cloud === 'source' && a.sourceName === key.slice(4)).length;
+  if (key === 'cloud:github') return A.filter((a) => a.cloud === 'github').length;
+  if (key === 'cloud:link') return A.filter((a) => a.cloud === 'link').length;
+  if (key === 'missing') return A.filter((a) => a.missing).length;
+  return A.filter((a) => a.categoryId === key).length;
+}
+// Everything you can filter by, grouped for the Filters sheet.
+function filterGroups() {
+  const tags = [...new Set(state.apps.flatMap((a) => a.tags || []))].sort();
+  const srcNames = [...new Set(state.apps.filter((a) => a.cloud === 'source' && a.sourceName).map((a) => a.sourceName))].sort();
+  const g = [
+    { title: 'Show', items: [['all', '📱 All'], ['installed', '✓ Installed'], ['updates', '⬆ Updates'], ['new', '🆕 New'], ['featured', '★ Featured']] },
+    { title: 'Categories', items: state.categories.map((c) => [c.id, `${c.emoji} ${c.name}`]) },
+    { title: 'Sources', items: srcNames.map((n) => [`src:${n}`, `☁ ${n}`]) },
+    { title: 'Tags', items: tags.map((t) => [`tag:${t}`, `# ${t}`]) },
+  ];
+  if (isOwner()) g.push({ title: 'Owner', items: [['cloud:github', '☁ On GitHub'], ['cloud:link', '🔗 Links'], ['none', 'Uncategorized'], ['hidden', 'Hidden'], ['missing', '⚠ Removed']] });
+  return g.map((x) => ({ ...x, items: x.items.filter(([k]) => k === 'all' || libCount(k) > 0 || (x.title === 'Categories' && isOwner())) })).filter((x) => x.items.length);
+}
+const filterLabel = (key) => (filterGroups().flatMap((x) => x.items).find(([k]) => k === key) || [key, key])[1];
+const PRIMARY_FILTERS = ['all', 'installed', 'updates', 'featured'];
+
+function filterSheet() {
+  const cols = state.collections.filter((c) => c.appIds.some((x) => state.apps.some((a) => a.id === x)));
+  openSheet(`
+    <h2>Filter</h2>
+    ${filterGroups().map((g) => `<div class="section-title">${esc(g.title)}</div>
+      <div class="filter-grid">${g.items.map(([k, l]) => `<button class="fopt ${state.lib.cat === k ? 'on' : ''} ${libCount(k) ? '' : 'zero'}" data-f="${esc(k)}"><span>${esc(l)}</span><b>${libCount(k)}</b></button>`).join('')}</div>`).join('')}
+    ${cols.length ? `<div class="section-title">Collections</div><div class="filter-grid">${cols.map((c) => `<button class="fopt" data-col="${c.id}"><span>${esc(c.emoji)} ${esc(c.name)}</span><b>${c.appIds.filter((x) => state.apps.some((a) => a.id === x)).length}</b></button>`).join('')}</div>` : ''}
+    <div class="actions" style="margin-top:14px">
+      ${isOwner() ? '<button class="btn block" id="fEdit">⚙︎ Edit categories</button>' : '<button class="btn block" id="fReq">+ Request an App</button>'}
+    </div>`, (el) => {
+    el.querySelectorAll('[data-f]').forEach((b) => {
+      b.onclick = () => { state.lib.cat = b.dataset.f; state.lib.limit = 40; saveLibPrefs(); closeSheet(); window.scrollTo(0, 0); render(); };
+    });
+    el.querySelectorAll('[data-col]').forEach((b) => { b.onclick = () => collectionSheet(b.dataset.col); });
+    if ($('#fEdit', el)) $('#fEdit', el).onclick = manageCategoriesSheet;
+    if ($('#fReq', el)) $('#fReq', el).onclick = requestAppSheet;
+  });
+}
+
 function renderLibrary() {
   const { q, cat, sort } = state.lib;
-  const allTags = [...new Set(state.apps.flatMap((a) => a.tags || []))].sort();
-  const srcNames = [...new Set(state.apps.filter((a) => a.cloud === 'source' && a.sourceName).map((a) => a.sourceName))].sort();
-  const chips = [['all', 'All'], ['installed', '✓ Installed'], ['updates', '⬆ Updates'], ['new', '🆕 New'], ['featured', '★ Featured'],
-    ...state.categories.map((c) => [c.id, `${c.emoji} ${c.name}`]), ...srcNames.map((n) => [`src:${n}`, `☁ ${n}`]), ...allTags.map((t) => [`tag:${t}`, `# ${t}`])];
-  if (isOwner()) chips.push(['cloud:github', '☁ GitHub'], ['cloud:link', '🔗 Links'], ['none', 'Uncategorized'], ['hidden', 'Hidden'], ['missing', '⚠ Removed']);
-  const counts = (key) => {
-    if (key === 'all') return state.apps.length;
-    if (key === 'installed') return state.apps.filter((a) => a.installed).length;
-    if (key === 'updates') return state.apps.filter(hasUpdate).length;
-    if (key === 'new') return state.apps.filter((a) => isNewApp(a) || isUpdatedApp(a)).length;
-    if (key === 'featured') return state.apps.filter((a) => a.featured).length;
-    if (key === 'none') return state.apps.filter((a) => !catById(a.categoryId)).length;
-    if (key === 'hidden') return state.apps.filter((a) => !a.published).length;
-    if (key.startsWith('tag:')) return state.apps.filter((a) => (a.tags || []).includes(key.slice(4))).length;
-    if (key.startsWith('src:')) return state.apps.filter((a) => a.cloud === 'source' && a.sourceName === key.slice(4)).length;
-    if (key === 'cloud:github') return state.apps.filter((a) => a.cloud === 'github').length;
-    if (key === 'cloud:link') return state.apps.filter((a) => a.cloud === 'link').length;
-    if (key === 'missing') return state.apps.filter((a) => a.missing).length;
-    return state.apps.filter((a) => a.categoryId === key).length;
-  };
+  const primary = [['all', 'All'], ['installed', '✓ Installed'], ['updates', '⬆ Updates'], ['featured', '★ Featured']]
+    .filter(([k]) => k === 'all' || k === cat || libCount(k) > 0);
+  const extraOn = !PRIMARY_FILTERS.includes(cat);
   const setup = !isOwner() && !state.certs.length
     ? `<p class="warning" data-act="go-certs" style="margin:0 0 12px;cursor:pointer">Add your certificate in the Certificates tab to start signing →</p>` : '';
   const view = libView();
   return `${setup}
     ${state.apps.length ? `
     <div class="searchbar">${ICONS.search}<input type="search" id="libSearch" placeholder="Search ${state.apps.length} apps" value="${esc(q)}" autocapitalize="off" autocorrect="off"></div>
-    <div class="chips-row" id="libChips">
-      ${chips.filter(([k]) => k === 'all' || k === cat || (counts(k) > 0 && !(k === 'new' && counts(k) === state.apps.length)) || (isOwner() && state.categories.some((c) => c.id === k))).map(([k, l]) => `<button class="fchip ${cat === k ? 'on' : ''}" data-cat="${esc(k)}">${esc(l)} <span>${counts(k)}</span></button>`).join('')}
-      ${state.collections.filter((c) => c.appIds.some((x) => state.apps.some((a) => a.id === x))).map((c) => `<button class="fchip" data-act="collection" data-id="${c.id}">${esc(c.emoji)} ${esc(c.name)} <span>${c.appIds.filter((x) => state.apps.some((a) => a.id === x)).length}</span></button>`).join('')}
-      ${isOwner() ? '<button class="fchip ghost" data-act="manage-cats">⚙︎ Edit</button>' : ''}
+    <div class="chips-row compact" id="libChips">
+      ${primary.map(([k, l]) => `<button class="fchip ${cat === k ? 'on' : ''}" data-cat="${esc(k)}">${esc(l)}${k === 'all' ? '' : ` <span>${libCount(k)}</span>`}</button>`).join('')}
+      ${extraOn ? `<button class="fchip on" data-act="clear-filter" aria-label="Clear filter">${esc(filterLabel(cat))} <span>${libCount(cat)}</span> ✕</button>` : ''}
+      <button class="fchip ghost" data-act="filters">☰ Filters</button>
     </div>
     <div class="lib-tools">
       <select id="libSort">
@@ -766,8 +811,7 @@ function renderLibrary() {
         <button data-view="list" class="${view === 'list' ? 'on' : ''}" aria-label="List">☰</button>
         <button data-view="grid" class="${view === 'grid' ? 'on' : ''}" aria-label="Grid">▦</button>
       </div>
-      ${isOwner() ? `<button class="btn small-btn" data-act="toggle-select-mode">${state.lib.select ? 'Done' : 'Select'}</button>`
-        : '<button class="btn small-btn" data-act="request-app">Request</button>'}
+      <button class="btn small-btn" data-act="toggle-select-mode">${state.lib.select ? 'Done' : 'Select'}</button>
     </div>` : ''}
     <div id="libList">${libraryListHtml()}</div>
     ${state.lib.select ? bulkBarHtml() : ''}`;
@@ -775,8 +819,12 @@ function renderLibrary() {
 
 function bulkBarHtml() {
   const n = state.lib.selected.size;
+  if (!isOwner()) {
+    return `<div class="bulk-bar"><span>${n} selected</span><button data-bulk="get" class="primary" ${n ? '' : 'disabled'}>Get ${n || ''}</button></div>`;
+  }
   return `<div class="bulk-bar">
     <span>${n} selected</span>
+    <button data-bulk="get" ${n ? '' : 'disabled'}>Get</button>
     <button data-bulk="category" ${n ? '' : 'disabled'}>Move</button>
     <button data-bulk="show" ${n ? '' : 'disabled'}>Show</button>
     <button data-bulk="hide" ${n ? '' : 'disabled'}>Hide</button>
@@ -812,6 +860,13 @@ function bindLibrary(view) {
 async function bulkAction(action) {
   const ids = [...state.lib.selected];
   if (!ids.length) return;
+  if (action === 'get') {
+    const apps = ids.map((i) => state.apps.find((a) => a.id === i)).filter(Boolean);
+    state.lib.selected.clear();
+    state.lib.select = false;
+    render();
+    return getAll(apps, `Get ${apps.length} app${apps.length === 1 ? '' : 's'}`);
+  }
   if (action === 'category') {
     return openSheet(`<h2>Move ${ids.length} app${ids.length === 1 ? '' : 's'} to…</h2>
       <div class="list">${[...state.categories.map((c) => [c.id, `${c.emoji} ${c.name}`]), ['', 'Uncategorized']].map(([cid, l]) => `<button class="row" data-cid="${cid}"><span class="row-main row-title">${esc(l)}</span></button>`).join('')}</div>`, (el) => {
@@ -1050,6 +1105,8 @@ function renderSettings() {
       <div class="setting"><span>Apps</span><span class="value">${state.apps.length} (${state.apps.filter((a) => a.published).length} shown)</span></div>
       <button class="row" data-act="manage-cats"><span class="row-main" style="font-weight:600">Categories</span><span class="value muted">${state.categories.length} ›</span></button>
       <button class="row" data-act="manage-cols"><span class="row-main" style="font-weight:600">Collections</span><span class="value muted">${state.collections.length} ›</span></button>
+      <button class="row" data-act="tweaks"><span class="row-main" style="font-weight:600">🧩 Tweaks</span><span class="value muted">${state.tweaks.length}${state.tweaks.length && !state.substrate.installed && state.tweaks.some((t) => t.files.some((f) => f.needsSubstrate)) ? ' · ⚠️ needs Substrate' : ''} ›</span></button>
+      ${duplicateGroups().length ? `<button class="row" data-act="dupes"><span class="row-main" style="font-weight:600">🔁 Duplicates</span><span class="value" style="color:var(--mango)">${duplicateGroups().length} ›</span></button>` : ''}
       <button class="row" data-act="announce"><span class="row-main" style="font-weight:600">📣 Announcement</span><span class="value muted">${state.announcement ? 'On' : 'Off'} ›</span></button>
       <div class="setting"><span>Your signed apps</span><span class="value">${state.signed.length}</span></div>
       <div class="setting"><span>Users</span><span class="value">${state.users.length}</span></div>
@@ -1092,6 +1149,10 @@ function bindView(view) {
         'request-app': requestAppSheet,
         'manage-cols': manageCollectionsSheet,
         'add-source': addSourceSheet,
+        tweaks: tweaksSheet,
+        dupes: duplicatesSheet,
+        filters: filterSheet,
+        'clear-filter': () => { state.lib.cat = 'all'; state.lib.limit = 40; saveLibPrefs(); render(); },
         'lib-more': () => { state.lib.limit += 40; const y = window.scrollY; render(); window.scrollTo(0, y); },
         source: () => sourceSheet(idv),
         github: githubSheet,
@@ -1373,6 +1434,184 @@ function moveToGithubSheet(ids, label) {
   });
 }
 
+// ---------- tweaks library ----------
+function tweaksSheet() {
+  const sub = state.substrate || {};
+  const needSub = state.tweaks.some((t) => t.files.some((f) => f.needsSubstrate));
+  openSheet(`
+    <h2>🧩 Tweaks</h2>
+    <p class="muted small" style="margin-top:-6px">Tweaks you add here can be ticked on when anyone signs an app, or set as an app's default. Upload a jailbreak <b>.deb</b> or a <b>.dylib</b>.</p>
+    <div class="card sub-card">
+      <div class="row-main"><div class="row-title">Substrate ${sub.installed ? '<span class="badge good">Ready</span>' : needSub ? '<span class="badge bad">Missing</span>' : '<span class="badge">Not set</span>'}</div>
+      <div class="row-sub">${sub.installed ? `${esc(sub.name)} · ${fmtSize(sub.size)} · added to apps that need it` : 'Most jailbreak tweaks need it to run. Upload ElleKit (.deb) or a CydiaSubstrate.framework (.zip) once.'}</div></div>
+      <div class="card-actions"><button class="btn" id="twSub">${sub.installed ? 'Replace' : 'Upload Substrate'}</button>${sub.installed ? '<button class="btn danger" id="twSubDel">Remove</button>' : ''}</div>
+    </div>
+    <button class="file-btn" id="twAdd">${ICONS.plus}<div class="row-main"><div class="row-title">Add tweaks</div><div class="row-sub">.deb or .dylib · pick several at once</div></div></button>
+    <div id="addProgress"></div>
+    ${state.tweaks.length ? `<div class="section-title">${state.tweaks.length} tweak${state.tweaks.length === 1 ? '' : 's'}</div><div class="list">${state.tweaks.map((t) => `
+      <button class="row" data-tw="${t.id}"><span class="app-icon tw-icon">🧩</span>
+        <span class="row-main"><span class="row-title">${esc(t.name)}${t.version ? ` <span class="muted small">${esc(t.version)}</span>` : ''}</span>
+        <span class="row-sub">${t.warnings.length ? `⚠️ ${t.warnings.length} warning${t.warnings.length === 1 ? '' : 's'}` : esc(t.author || `${t.files.length} file${t.files.length === 1 ? '' : 's'}`)}${t.published ? '' : ' · hidden'}</span></span>
+        <span class="value muted">›</span></button>`).join('')}</div>` : ''}
+    <p class="hint" style="margin:10px 4px 0">Not every jailbreak tweak works on a non-jailbroken iPhone — ones that change the system (Springboard, Control Center, lock screen) won't. Tweaks for a specific app (like YouTube or Instagram tweaks) usually do.</p>`, (el) => {
+    el.querySelectorAll('[data-tw]').forEach((b) => { b.onclick = () => tweakSheet(b.dataset.tw); });
+    $('#twAdd', el).onclick = async () => {
+      const files = ((await pickFile('', true)) || []).filter((f) => {
+        if (/\.(deb|dylib)$/i.test(f.name)) return true;
+        toast(`${f.name} isn't a .deb or .dylib`, true);
+        return false;
+      });
+      if (!files.length) return;
+      const box = $('#addProgress', el);
+      let added = 0;
+      for (const [i, f] of files.entries()) {
+        box.innerHTML = `<p class="muted small center">Adding ${i + 1} of ${files.length}: ${esc(f.name)}…</p>`;
+        try {
+          const up = await uploadFile(f);
+          await api('POST', '/api/tweaks', { uploadId: up.uploadId, fileName: f.name });
+          added++;
+        } catch (e) { toast(`${f.name}: ${e.message}`, true); }
+      }
+      await refresh();
+      if (added) toast(`Added ${added} tweak${added === 1 ? '' : 's'}`);
+      tweaksSheet();
+    };
+    $('#twSub', el).onclick = async () => {
+      const f = await pickFile('');
+      if (!f) return;
+      if (!/\.(deb|zip|dylib)$/i.test(f.name)) return toast('Pick a .deb, .zip or .dylib', true);
+      $('#addProgress', el).innerHTML = '<p class="muted small center">Setting up Substrate…</p>';
+      try {
+        const up = await uploadFile(f);
+        await api('PUT', '/api/substrate', { uploadId: up.uploadId, fileName: f.name });
+        await refresh();
+        toast('Substrate is ready');
+      } catch (e) { toast(e.message, true); }
+      tweaksSheet();
+    };
+    if ($('#twSubDel', el)) {
+      $('#twSubDel', el).onclick = async () => {
+        if (!confirm('Remove Substrate? Tweaks that need it will crash the apps they are added to.')) return;
+        try { await api('DELETE', '/api/substrate'); await refresh(); toast('Removed'); } catch (e) { toast(e.message, true); }
+        tweaksSheet();
+      };
+    }
+  });
+}
+
+function tweakSheet(tid) {
+  const t = state.tweaks.find((x) => x.id === tid);
+  if (!t) return tweaksSheet();
+  const usedBy = state.apps.filter((a) => ((a.signDefaults || {}).tweakIds || []).includes(t.id));
+  openSheet(`
+    <div class="sheet-head"><span class="app-icon big tw-icon">🧩</span><div class="row-main"><h2>${esc(t.name)}</h2><div class="row-sub">${esc([t.version, t.author].filter(Boolean).join(' · ') || 'Tweak')}</div></div></div>
+    ${t.warnings.map((w) => `<p class="warning">${esc(w)}</p>`).join('')}
+    <dl class="kv card" style="margin:0">
+      ${t.package ? `<dt>Package</dt><dd class="mono small-break">${esc(t.package)}</dd>` : ''}
+      <dt>Files</dt><dd>${t.files.map((f) => `${esc(f.name)} <span class="muted small">${fmtSize(f.size)}</span>`).join('<br>')}</dd>
+      <dt>Needs Substrate</dt><dd>${t.files.some((f) => f.needsSubstrate) ? (state.substrate.installed ? 'Yes · bundled for you' : 'Yes · ⚠️ not set up') : 'No'}</dd>
+      <dt>Default for</dt><dd>${usedBy.length ? usedBy.map((a) => esc(a.name)).join(', ') : '—'}</dd>
+    </dl>
+    <div class="field" style="margin-top:12px"><label>Name</label><input type="text" id="twName" value="${esc(t.name)}" maxlength="80"></div>
+    <div class="field"><label>Description</label><textarea id="twDesc" rows="3" placeholder="What it does (shown when signing)">${esc(t.description || '')}</textarea></div>
+    <div class="group">${toggle('twPub', 'Available to everyone', 'Off = only you can pick it when signing', t.published)}</div>
+    <div class="actions">
+      <button class="btn primary block" id="twSave">Save</button>
+      <button class="btn block" id="twBack">Back to Tweaks</button>
+      <button class="btn block danger" id="twDel">Delete</button>
+    </div>`, (el) => {
+    $('#twBack', el).onclick = tweaksSheet;
+    $('#twSave', el).onclick = async () => {
+      try {
+        await api('PATCH', `/api/tweaks/${t.id}`, { name: $('#twName', el).value, description: $('#twDesc', el).value, published: $('#twPub', el).checked });
+        await refresh(); toast('Saved'); tweaksSheet();
+      } catch (e) { toast(e.message, true); }
+    };
+    $('#twDel', el).onclick = async () => {
+      if (!confirm(`Delete ${t.name}?${usedBy.length ? ` It's a default for ${usedBy.length} app${usedBy.length === 1 ? '' : 's'}, which will stop adding it.` : ''}`)) return;
+      try { await api('DELETE', `/api/tweaks/${t.id}`); await refresh(); toast('Deleted'); tweaksSheet(); } catch (e) { toast(e.message, true); }
+    };
+  });
+}
+
+// ---------- duplicates ----------
+function duplicateGroups() {
+  const by = new Map();
+  for (const a of state.apps) {
+    if (!a.bundleId || a.missing) continue;
+    const k = a.bundleId.toLowerCase();
+    if (!by.has(k)) by.set(k, []);
+    by.get(k).push(a);
+  }
+  return [...by.values()].filter((g) => g.length > 1);
+}
+function duplicatesSheet() {
+  const groups = duplicateGroups();
+  openSheet(`
+    <h2>🔁 Duplicates</h2>
+    <p class="muted small" style="margin-top:-6px">Apps that share a bundle ID — usually the same app added twice, or once from a source and once by you. Keep the one you want and delete the rest.</p>
+    ${groups.length ? groups.map((g) => `
+      <div class="section-title">${esc(g[0].bundleId)}</div>
+      <div class="list">${g.map((a) => `
+        <div class="row" data-open="${a.id}">${appIcon(a)}
+          <div class="row-main"><div class="row-title">${esc(a.name)}</div>
+            <div class="row-sub">v${esc(shownVersion(a) || '?')} · ${fmtSize(a.size)} · ${esc(a.cloud === 'source' ? a.sourceName || 'source' : a.cloud === 'github' ? 'GitHub' : a.cloud === 'link' ? 'link' : 'this server')} · ${a.installCount || 0} installs</div>
+            <div class="row-sub">${a.updatedAt && a.updatedAt !== a.addedAt ? 'Updated' : 'Added'} ${ago(a.updatedAt || a.addedAt)}</div></div>
+          <button class="pill danger-pill" data-del="${a.id}">Delete</button>
+        </div>`).join('')}</div>`).join('') : '<div class="empty" style="padding:30px 10px"><h3>No duplicates 🎉</h3></div>'}`, (el) => {
+    el.querySelectorAll('[data-open]').forEach((b) => { b.onclick = () => appSheet(b.dataset.open); b.style.cursor = 'pointer'; });
+    el.querySelectorAll('[data-del]').forEach((b) => {
+      b.onclick = async (e) => {
+        e.stopPropagation();
+        const a = state.apps.find((x) => x.id === b.dataset.del);
+        if (!a || !confirm(`Delete this copy of ${a.name}?`)) return;
+        try { await api('DELETE', `/api/apps/${a.id}`); await refresh(); toast('Deleted'); duplicatesSheet(); } catch (e) { toast(e.message, true); }
+      };
+    });
+  });
+}
+
+// ---------- add many links ----------
+function bulkLinksSheet() {
+  openSheet(`
+    <h2>Add several links</h2>
+    <p class="muted small" style="margin-top:-6px">Paste direct .ipa download links, one per line. They're added one after another.</p>
+    <div class="field"><textarea id="blUrls" rows="7" placeholder="https://…/app1.ipa&#10;https://…/app2.ipa" autocapitalize="off" autocorrect="off" spellcheck="false"></textarea></div>
+    <div class="group">${toggle('blLink', 'Link only (uses no storage)', 'Recommended. Only the info and icon are saved.', true)}</div>
+    <button class="btn primary block" id="blGo" style="margin-top:12px">Add links</button>
+    <div id="blList"></div>`, (el) => {
+    $('#blGo', el).onclick = async () => {
+      const urls = [...new Set($('#blUrls', el).value.split(/\s+/).map((u) => u.trim()).filter((u) => /^https?:\/\//i.test(u)))].slice(0, 50);
+      if (!urls.length) return toast('Paste at least one link', true);
+      const linkOnly = $('#blLink', el).checked;
+      el.querySelectorAll('button, textarea, input').forEach((x) => { x.disabled = true; });
+      closeSheet.locked = true;
+      $('#sheet').classList.add('locked');
+      const rows = urls.map((u) => ({ u, s: 'Waiting…' }));
+      const draw = () => {
+        $('#blList', el).innerHTML = `<div class="list" style="margin-top:12px">${rows.map((r) => `<div class="row"><div class="row-main"><div class="row-title small-break">${esc(r.name || decodeURIComponent(r.u.split('/').pop().split('?')[0]) || r.u)}</div><div class="row-sub">${esc(r.s)}</div></div></div>`).join('')}</div>`;
+      };
+      draw();
+      let ok = 0;
+      for (const r of rows) {
+        r.s = 'Reading…'; draw();
+        try {
+          const { jobId } = await api('POST', linkOnly ? '/api/apps/link' : '/api/apps/import', { url: r.u });
+          const res = await waitJob(jobId, (j) => { if (j.progress != null) { r.s = `${linkOnly ? 'Reading' : 'Downloading'} ${Math.round(j.progress * 100)}%`; draw(); } });
+          r.name = res.app.name; r.s = `✓ Added ${res.app.version || ''}`; ok++;
+        } catch (e) { r.s = `✕ ${e.message}`; }
+        draw();
+      }
+      closeSheet.locked = false;
+      $('#sheet').classList.remove('locked');
+      await refresh().catch(() => {});
+      toast(`Added ${ok} of ${rows.length}`);
+      $('#blList', el).insertAdjacentHTML('beforeend', '<button class="btn block" id="blDone" style="margin-top:12px">Done</button>');
+      $('#blDone', el).onclick = closeSheet;
+    };
+  });
+}
+
 // ---------- adding & updating apps ----------
 function uploadProgressHtml() {
   return `<div class="bar"><div></div></div><p class="muted small" id="addMsg">Starting…</p><p class="hint" id="addSub"></p>`;
@@ -1395,9 +1634,11 @@ function addAppSheet() {
     <div class="field"><input type="url" id="ipaUrl" placeholder="https://example.com/app.ipa" autocapitalize="off" autocorrect="off"><div class="hint">Direct download links only. Dropbox links work (dl=0 is fixed for you).</div></div>
     <div class="group">${toggle('linkOnly', 'Link only (uses no storage)', "Only the app's info and icon are saved. The file is downloaded fresh each time someone signs it.", true)}</div>
     <button class="btn block" id="importUrl" style="margin-top:10px">Add from link</button>
+    <button class="link-btn block" id="goBulk" type="button">🔗 Add several links at once</button>
     <button class="link-btn block" id="goSources" type="button">☁ Add a whole source (AltStore / ESign repo) instead</button>
     <div id="addProgress"></div>`, (el) => {
     $('#goSources', el).onclick = addSourceSheet;
+    $('#goBulk', el).onclick = bulkLinksSheet;
     $('#pickIpa', el).onclick = async () => {
       const file = await pickFile('');
       if (!file) return;
@@ -1692,6 +1933,9 @@ function signOptsFromDefaults(a) {
     removeWatch: d.removeWatch !== undefined ? !!d.removeWatch : !!a.hasWatch,
     removeUISD: !!d.removeUISD,
     enableDocs: !!d.enableDocs,
+    weakDylibs: !!d.weakDylibs,
+    injectExtensions: !!d.injectExtensions,
+    tweakIds: (d.tweakIds || []).filter((tid) => state.tweaks.some((t) => t.id === tid)),
   };
 }
 
@@ -1701,7 +1945,8 @@ function reusableSigned(a) {
   if (!cert) return null;
   return state.signed.find((s) => s.appId === a.id && s.fileAvailable && s.certId === cert.id
     && new Date(s.signedAt) >= new Date(a.updatedAt || a.addedAt) && !(s.options && (s.options.dylibs || []).length) && !(s.options && s.options.icon)
-    && !(s.options && s.options.versionIndex)) || null;
+    && !(s.options && s.options.versionIndex)
+    && [...((s.options && s.options.tweakIds) || [])].sort().join() === [...signOptsFromDefaults(a).tweakIds].sort().join()) || null;
 }
 
 function quickGet(appId) {
@@ -1988,6 +2233,7 @@ function editAppSheet(a, isNew = false) {
     <p class="hint" style="margin:0 4px 10px">These are switched on automatically when anyone signs this app, so they can just tap Sign.</p>
     <div class="field"><label>Minimum iOS (optional)</label><input type="text" id="eMin" value="${esc((a.signDefaults || {}).minOS || '')}" placeholder="${esc(a.minOS || 'unchanged')}" inputmode="decimal"></div>
     ${signOptionsHtml(a, 'd')}
+    ${state.tweaks.length ? `<div class="section-title">Default tweaks</div>${tweakPickerHtml('d', (a.signDefaults || {}).tweakIds || [])}` : ''}
 
     <button class="btn primary big block" id="eSave">Save</button>
     <div style="height:6px"></div>`, (el) => {
@@ -2032,7 +2278,7 @@ function editAppSheet(a, isNew = false) {
           published: $('#ePub', el).checked,
           featured: $('#eFeat', el).checked,
           useIconWhenSigning: $('#eIconSign', el).checked,
-          signDefaults: { ...collect(), minOS: $('#eMin', el).value.trim() },
+          signDefaults: { ...collect(), minOS: $('#eMin', el).value.trim(), tweakIds: pickedTweaks(el, 'd') },
         };
         if (pending.icon) body.iconUploadId = (await uploadFile(pending.icon)).uploadId;
         if (pending.resetIcon) body.resetIcon = true;
@@ -2128,7 +2374,9 @@ function signSheet(appId, overrides) {
     </div>
     ${(a.versions || []).length > 1 ? `<div class="field"><label>App version</label>
       <select id="sVer">${a.versions.map((v, i) => `<option value="${i}" ${i === (Number(defaults.versionIndex) || 0) ? 'selected' : ''}>${esc(v.version || 'Version ' + (i + 1))}${i === 0 ? ' (newest)' : ''}${v.date ? ' · ' + esc(String(v.date).slice(0, 10)) : ''}</option>`).join('')}</select></div>` : ''}
-    ${summary.length ? `<p class="setup-note">✨ Set up for you: ${esc(summary.join(' · '))}</p>` : ''}
+    ${state.presets.length ? `<div class="field"><label>Preset</label>
+      <select id="sPreset"><option value="">${overrides && overrides.presetId ? 'App defaults' : 'None (app defaults)'}</option>${state.presets.map((p) => `<option value="${p.id}" ${overrides && overrides.presetId === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></div>` : ''}
+    ${summary.length ? `<p class="setup-note">✨ ${overrides && overrides.presetId ? 'From your preset' : 'Set up for you'}: ${esc(summary.join(' · '))}</p>` : ''}
     ${state.signed.some((x) => x.appId === a.id) ? '<p class="hint center" style="margin:-4px 0 10px">This replaces your current signed copy of this app.</p>' : ''}
     <button class="btn primary big block" id="sGo">Sign App</button>
     <button class="link-btn block" id="sMore" type="button">More options ▾</button>
@@ -2146,13 +2394,15 @@ function signSheet(appId, overrides) {
       ${signOptionsHtml(a, 's')}
 
       <div class="section-title">Tweaks</div>
-      <button class="file-btn" id="sDylib">${ICONS.plus}<div class="row-main"><div class="row-title">Add .dylib</div><div class="row-sub">Inject tweaks or frameworks into the app</div></div></button>
+      ${tweakPickerHtml('s', defaults.tweakIds || [])}
+      <button class="file-btn" id="sDylib" style="margin-top:${state.tweaks.length ? 10 : 0}px">${ICONS.plus}<div class="row-main"><div class="row-title">Add your own .dylib or .deb</div><div class="row-sub">Jailbreak tweaks work too — Mango pulls the tweak out of the .deb</div></div></button>
       <div class="chips" id="sDylibs"></div>
       <div class="group" style="margin-top:10px">
         ${toggle('sWeak', 'Weak injection', 'App still opens if a tweak fails to load', !!defaults.weakDylibs)}
         ${toggle('sInjExt', 'Inject into extensions', 'Also load tweaks in widgets and share extensions', !!defaults.injectExtensions)}
       </div>
       <button class="btn primary big block" id="sGo2" style="margin-top:16px">Sign App</button>
+      <button class="link-btn block" id="sSavePreset" type="button">💾 Save these settings as a preset</button>
     </div>
     <div style="height:6px"></div>`, (el) => {
     const collect = bindSignOptions(el, { removeWatch: true, ...defaults }, 's');
@@ -2211,12 +2461,37 @@ function signSheet(appId, overrides) {
     $('#sDylib', el).onclick = async () => {
       const files = await pickFile('', true);
       for (const f of files || []) {
-        if (!/\.dylib$/i.test(f.name)) { toast(`${f.name} isn't a .dylib`, true); continue; }
+        if (!/\.(dylib|deb)$/i.test(f.name)) { toast(`${f.name} isn't a .dylib or .deb`, true); continue; }
         extra.dylibs.push(f);
       }
       drawDylibs();
     };
 
+    if ($('#sPreset', el)) {
+      $('#sPreset', el).onchange = (e) => {
+        const p = state.presets.find((x) => x.id === e.target.value);
+        signSheet(a.id, p ? { ...p.options, presetId: p.id } : undefined);
+      };
+    }
+    const formOptions = () => {
+      const o = collect();
+      return {
+        minOS: $('#sMin', el).value.trim(), entitlements: o.entitlements, plist: o.plist,
+        weakDylibs: $('#sWeak', el).checked, injectExtensions: $('#sInjExt', el).checked,
+        removeExtensions: !!o.removeExtensions, removeWatch: !!o.removeWatch, removeUISD: !!o.removeUISD, enableDocs: !!o.enableDocs,
+        tweakIds: pickedTweaks(el, 's'),
+      };
+    };
+    $('#sSavePreset', el).onclick = async () => {
+      const current = overrides && overrides.presetId ? (state.presets.find((p) => p.id === overrides.presetId) || {}).name : '';
+      const name = prompt('Name this preset (using an existing name updates it):', current || '');
+      if (!name || !name.trim()) return;
+      try {
+        const { preset, replaced } = await api('POST', '/api/presets', { name: name.trim(), options: formOptions() });
+        await refresh();
+        toast(replaced ? `Updated “${preset.name}”` : `Saved “${preset.name}”`);
+      } catch (e) { toast(e.message, true); }
+    };
     const go = () => {
       const o = collect();
       const opts = {
@@ -2235,6 +2510,7 @@ function signSheet(appId, overrides) {
         removeUISD: !!o.removeUISD,
         enableDocs: !!o.enableDocs,
         versionIndex: $('#sVer', el) ? Number($('#sVer', el).value) : 0,
+        tweakIds: pickedTweaks(el, 's'),
       };
       runSign(a, opts, extra);
     };
@@ -2681,6 +2957,8 @@ function addCertSheet() {
   const chosen = { p12: null, prov: null };
   openSheet(`
     <h2>Add Certificate</h2>
+    <button class="file-btn" id="cZip">${ICONS.file}<div class="row-main"><div class="row-title">Got a .zip? Import it in one go</div><div class="row-sub">The .p12, profile and password are found for you</div></div></button>
+    <div class="section-title">Or pick the files</div>
     <div class="field">
       <button class="file-btn" id="cP12">${ICONS.file}<div class="row-main"><div class="row-title">Certificate (.p12)</div><div class="row-sub" id="cP12Name">Tap to choose</div></div></button>
     </div>
@@ -2699,6 +2977,26 @@ function addCertSheet() {
       chosen[key] = f;
       $(btn, el).classList.add('chosen');
       $(label, el).textContent = f.name;
+    };
+    $('#cZip', el).onclick = async () => {
+      const f = await pickFile('');
+      if (!f) return;
+      if (!/\.zip$/i.test(f.name)) return toast("That's not a .zip file", true);
+      const btn = $('#cZip', el);
+      btn.disabled = true;
+      $('#cMsg', el).textContent = 'Uploading…';
+      try {
+        const up = await uploadFile(f);
+        $('#cMsg', el).textContent = 'Looking inside…';
+        const { cert, passwordFound } = await api('POST', '/api/certs/zip', { uploadId: up.uploadId, password: $('#cPass', el).value, label: $('#cLabel', el).value });
+        closeSheet();
+        toast(`Added ${cert.label}${passwordFound ? ' (password found in the zip)' : ''}`);
+        await refresh();
+      } catch (e) {
+        btn.disabled = false;
+        $('#cMsg', el).textContent = '';
+        toast(e.message + (/password/i.test(e.message) ? ' (type it in the Password box below, then import again)' : ''), true);
+      }
     };
     $('#cP12', el).onclick = pick('p12', '#cP12', '#cP12Name', /\.(p12|pfx)$/i, '.p12');
     $('#cProv', el).onclick = pick('prov', '#cProv', '#cProvName', /\.mobileprovision$/i, '.mobileprovision');

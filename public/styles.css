@@ -639,3 +639,21 @@ html[data-accent="red"] { --mango: #ff5c5c; --mango-2: #ff9b9b; --accent-2: #f03
 .mini-card .app-icon { width: 56px; height: 56px; border-radius: 14px; font-size: 22px; }
 .mini-name { font-size: 11.5px; font-weight: 600; max-width: 64px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mini-sub { font-size: 10.5px; color: var(--mango); margin-top: -3px; max-width: 64px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---------- V1.5 ---------- */
+.chips-row.compact { flex-wrap: wrap; overflow: visible; margin: 0; padding: 2px 0 8px; }
+.filter-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.fopt { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 44px; padding: 10px 12px; border-radius: 12px; border: 1px solid var(--line); background: var(--card); color: var(--text); font: inherit; font-size: 14px; font-weight: 600; text-align: left; cursor: pointer; transition: transform .15s ease, background .2s ease; }
+.fopt span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fopt b { font-size: 12px; color: var(--muted); font-weight: 600; flex: none; }
+.fopt.on { background: var(--mango); border-color: var(--mango); color: var(--on-accent, #1b1205); }
+.fopt.on b { color: inherit; opacity: .75; }
+.fopt:active { transform: scale(.96); }
+.tw-icon { font-size: 24px; display: grid; place-items: center; }
+.app-icon.big.tw-icon { font-size: 36px; }
+.sub-card { margin-bottom: 12px; }
+.sub-card .row-sub { margin-top: 4px; }
+.pill.danger-pill { background: rgba(255, 92, 108, .16); color: var(--red); margin-left: 6px; }
+.bulk-bar button.primary { background: var(--mango); color: var(--on-accent, #1b1205); }
+.row-main > span.row-title, .row-main > span.row-sub { display: block; }
+.fopt.zero { opacity: .55; }
