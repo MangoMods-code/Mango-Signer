@@ -1052,7 +1052,9 @@ function renderSigned() {
   const keep = Number(state.settings.signedRetentionDays);
   const notes = [];
   if (!isOwner()) notes.push(`Your newest ${state.settings.maxSignedPerUser || 10} signed apps are kept.`);
-  if (keep) notes.push(`Signed files are removed after ${keep} day${keep === 1 ? '' : 's'} to save space — tap Sign again any time.`);
+  const onGh = state.settings.signedOnGithub || (state.github && state.github.signedToGithub);
+  if (onGh) notes.push('Signed apps stay here until you delete them, or until their certificate expires.');
+  else if (keep) notes.push(`Signed files are removed after ${keep} day${keep === 1 ? '' : 's'} to save space — tap Sign again any time.`);
   const ready = state.signed.filter((s) => s.fileAvailable);
   const old = state.signed.filter((s) => !s.fileAvailable);
   const row = (s) => {
@@ -1064,7 +1066,7 @@ function renderSigned() {
       <div class="row-main">
         <div class="row-title">${esc(s.name)} ${s.onPhone ? '<span class="badge good">On your phone</span>' : ''} ${badge}</div>
         <div class="row-sub">${esc(s.version || '—')} · ${esc(s.certLabel)}</div>
-        <div class="row-sub">Signed ${ago(s.signedAt)} · ${fmtSize(s.size)}</div>
+        <div class="row-sub">Signed ${ago(s.signedAt)} · ${fmtSize(s.size)}${s.savedOnGithub ? ' · ☁ saved' : ''}</div>
       </div>
       ${s.fileAvailable ? `<button class="pill" data-act="install" data-id="${s.id}">Get</button>` : `<button class="pill dim" data-act="resign" data-id="${s.id}">Re-sign</button>`}
     </div>`;
@@ -1774,6 +1776,7 @@ function githubSheet(editing = false) {
       <dt>Last sync</dt><dd>${g.lastSync ? ago(g.lastSync) : 'never'}</dd>
     </dl>
     <div class="group" style="margin-top:12px">${toggle('ghStore', 'Save new uploads to GitHub', 'Apps you upload go straight to your repo, then get removed from this server', g.storeUploads)}</div>
+    <div class="group" style="margin-top:12px">${toggle('ghSigned', 'Keep signed apps on GitHub', g.private ? `Signed apps stay in everyone's Signed tab until they delete them, without using space here${g.signedSaved ? ` · ${g.signedSaved} saved` : ''}` : 'Needs a private repo — anyone could download signed apps from a public one', g.signedToGithub)}</div>
     <p class="hint" style="margin:8px 4px 0">You can also add apps on github.com: open your repo › <b>Releases</b> › <b>Mango Library</b> › ✏️ Edit, drop .ipa files in, save, then tap <b>Sync</b> here.</p>
     <div class="actions">
       <button class="btn primary block" id="ghSync">Sync with GitHub</button>
@@ -1784,6 +1787,12 @@ function githubSheet(editing = false) {
     </div>`, (el) => {
     $('#ghStore', el).onchange = async (e) => {
       try { state.github = (await api('PATCH', '/api/github', { storeUploads: e.target.checked })).github; toast(e.target.checked ? 'New uploads go to GitHub' : 'New uploads stay on this server'); } catch (err) { toast(err.message, true); }
+    };
+    $('#ghSigned', el).onchange = async (e) => {
+      try {
+        state.github = (await api('PATCH', '/api/github', { signedToGithub: e.target.checked })).github;
+        toast(e.target.checked ? 'Signed apps are saved to GitHub' : 'Signed apps stay on this server only');
+      } catch (err) { e.target.checked = !e.target.checked; toast(err.message, true); }
     };
     $('#ghSync', el).onclick = async (e) => {
       const b = e.currentTarget;
