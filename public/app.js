@@ -852,6 +852,7 @@ function renderLibrary() {
       </div>
       <button class="btn small-btn" data-act="toggle-select-mode">${state.lib.select ? 'Done' : 'Select'}</button>
     </div>` : ''}
+    ${cat === 'missing' && isOwner() && libCount('missing') ? `<div class="warning bad" style="margin:0 0 12px;display:flex;align-items:center;gap:10px"><span style="flex:1">These apps were removed from their source and are hidden from everyone.</span><button class="btn small-btn danger" data-act="delete-missing">Delete all ${libCount('missing')}</button></div>` : ''}
     <div id="libList">${libraryListHtml()}</div>
     ${state.lib.select ? bulkBarHtml() : ''}`;
 }
@@ -920,6 +921,18 @@ async function bulkAction(action) {
   const all = ids.every((i) => (state.apps.find((a) => a.id === i) || {}).featured);
   const act = action === 'feature' && all ? 'unfeature' : action;
   try { await api('POST', '/api/apps/bulk', { ids, action: act }); finishBulk({ show: 'Shown', hide: 'Hidden', feature: 'Featured', unfeature: 'Unfeatured', delete: 'Deleted' }[act]); } catch (e) { toast(e.message, true); }
+}
+// Deletes every app marked "Removed from source" (all sources, or just one).
+async function deleteRemovedApps(sourceId, n) {
+  if (!confirm(`Delete ${n} app${n === 1 ? '' : 's'} that ${n === 1 ? 'was' : 'were'} removed from ${sourceId ? 'this source' : 'their sources'}? Mango double-checks Telegram channels first, so only apps that are really gone get deleted. This can't be undone.`)) return;
+  toast('Deleting…');
+  try {
+    const { count } = await api('POST', '/api/apps/delete-removed', { sourceId: sourceId || null });
+    closeSheet();
+    if (state.lib.cat === 'missing') state.lib.cat = 'all';
+    await refresh();
+    toast(count ? `Deleted ${count} removed app${count === 1 ? '' : 's'}` : 'Nothing to delete — those apps are still there');
+  } catch (e) { toast(e.message, true); }
 }
 async function finishBulk(msg) {
   state.lib.selected.clear();
@@ -1209,6 +1222,7 @@ function bindView(view) {
         'security-log': securityLogSheet,
         dupes: duplicatesSheet,
         filters: filterSheet,
+        'delete-missing': () => deleteRemovedApps(null, libCount('missing')),
         'clear-filter': () => { state.lib.cat = 'all'; state.lib.limit = 40; saveLibPrefs(); render(); },
         'lib-more': () => { state.lib.limit += 40; const y = window.scrollY; render(); window.scrollTo(0, y); },
         source: () => sourceSheet(idv),
@@ -1359,9 +1373,11 @@ function sourceSheet(sid) {
     <div class="actions">
       <button class="btn primary block" id="srcSync">Refresh now</button>
       ${apps.length ? `<button class="btn block" id="srcBrowse">See its ${apps.length} app${apps.length === 1 ? '' : 's'} in the library</button>` : ''}
+      ${missing ? `<button class="btn block danger" id="srcDelMissing">🗑 Delete ${missing} removed app${missing === 1 ? '' : 's'}</button>` : ''}
       <button class="btn block" id="srcSave">Save name</button>
       <button class="btn block danger" id="srcDel">Remove source</button>
     </div>`, (el) => {
+    if ($('#srcDelMissing', el)) $('#srcDelMissing', el).onclick = () => deleteRemovedApps(sid, missing);
     $('#srcShow', el).onchange = async (e) => {
       try { await api('PATCH', `/api/sources/${sid}`, { showInLibrary: e.target.checked }); await refresh(); toast(e.target.checked ? 'Shown to everyone' : 'Only you can see these apps now'); } catch (err) { toast(err.message, true); }
     };
@@ -1577,6 +1593,7 @@ function tgChannelSheet(sid) {
   }
   const apps = state.apps.filter((a) => a.cloud === 'telegram' && a.sourceName === src.name);
   const r = src.lastResult;
+  const tcMissing = apps.filter((a) => a.missing).length;
   openSheet(`
     <div class="sheet-head"><span class="app-icon big tw-icon">✈️</span><div class="row-main"><h2>${esc(src.name)}</h2><div class="row-sub">${src.username ? '@' + esc(src.username) : 'Telegram channel'}</div></div></div>
     ${src.lastError ? `<p class="warning bad">Last check failed: ${esc(src.lastError)}</p>` : ''}
@@ -1588,6 +1605,7 @@ function tgChannelSheet(sid) {
     <div class="actions">
       <button class="btn primary block" id="tcSync">Check for new posts now</button>
       ${apps.length ? `<button class="btn block" id="tcBrowse">See its ${apps.length} app${apps.length === 1 ? '' : 's'}</button>` : ''}
+      ${tcMissing ? `<button class="btn block danger" id="tcDelMissing">🗑 Delete ${tcMissing} removed app${tcMissing === 1 ? '' : 's'}</button>` : ''}
     </div>
     <div class="section-title">Settings</div>
     ${tgOptionsHtml(src.options || {}, src)}
@@ -1602,6 +1620,7 @@ function tgChannelSheet(sid) {
     $('#tcSync', el).onclick = async () => {
       try { const { jobId } = await api('POST', `/api/sources/${src.id}/sync`); tgRunSheet(`Checking ${src.name}…`, jobId, () => tgChannelSheet(src.id)); } catch (e) { toast(e.message, true); }
     };
+    if ($('#tcDelMissing', el)) $('#tcDelMissing', el).onclick = () => deleteRemovedApps(sid, tcMissing);
     $('#tcDeep', el).onclick = () => tgScanSheet(src);
     if ($('#tcBrowse', el)) $('#tcBrowse', el).onclick = () => { closeSheet(); state.lib.cat = `src:${src.name}`; state.lib.q = ''; switchTab('library'); };
     $('#tcSave', el).onclick = async () => {
