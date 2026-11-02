@@ -345,11 +345,13 @@ let zsignVersion = null;
 function runLogged(cmd, args, job, { timeout = 20 * 60 * 1000, cwd = dirs.work } = {}) {
   return new Promise((resolve) => {
     const child = spawn(cmd, args, { cwd });
+    Object.defineProperty(job, 'child', { value: child, enumerable: false, configurable: true });
+    if (job.cancelled) child.kill('SIGKILL');
     const timer = setTimeout(() => { job.log.push('Timed out.'); child.kill('SIGKILL'); }, timeout);
     const onData = (d) => {
       for (const line of d.toString().split(/\r?\n/)) {
         const clean = line.replace(/\x1b\[[0-9;]*m/g, '').trim();
-        if (clean) job.log.push(clean.slice(0, 400));
+        if (clean) job.log.push(clean.slice(0, 2000));
       }
       if (job.log.length > 400) job.log.splice(0, job.log.length - 400);
     };
@@ -412,6 +414,10 @@ dedupeSigned().catch((e) => console.error('dedupe:', e));
 const jobs = new Map();
 function newJob(account) {
   const job = { id: id(), owner: account.id, status: 'running', log: [], result: null, error: null, started: Date.now() };
+  // Cancel support: long downloads/uploads listen to this signal, and a running zsign gets killed.
+  Object.defineProperty(job, 'abort', { value: new AbortController(), enumerable: false });
+  job.signal = job.abort.signal;
+  Object.defineProperty(job, 'signal', { enumerable: false });
   jobs.set(job.id, job);
   setTimeout(() => jobs.delete(job.id), 60 * 60 * 1000).unref();
   return job;
@@ -422,7 +428,7 @@ function enqueueSign(job, work) {
   const start = async () => {
     activeSigns++;
     job.status = 'running';
-    try { await work(); } finally {
+    try { if (!job.cancelled) await work(); } finally {
       activeSigns--;
       const next = signQueue.shift();
       if (next) next();
@@ -934,7 +940,8 @@ async function replaceAppFile(app, file) {
 async function downloadToTmp(u, job) {
   const dest = path.join(dirs.tmp, id());
   job.log.push(`Downloading ${u.hostname}…`);
-  const r = await fetch(u, { redirect: 'follow' });
+  job.cancellable = true;
+  const r = await fetch(u, { redirect: 'follow', signal: job.signal });
   if (!r.ok || !r.body) throw new Error(`Download failed (HTTP ${r.status})`);
   const type = r.headers.get('content-type') || '';
   if (/text\/html/i.test(type)) throw new Error("That link opens a web page, not a file. Use a direct download link (for Dropbox, change dl=0 to dl=1).");
@@ -1230,19 +1237,20 @@ async function resolveDownload(dl) {
 
 // Fetches a link that may need a login header. The header is only sent to the first address:
 // if it redirects (GitHub sends you to a short-lived download link), the next hop gets no token.
-async function fetchAuthed(url, headers) {
-  if (!headers) return fetch(url, { headers: { 'User-Agent': 'Mango-Signer' }, redirect: 'follow' });
-  const first = await fetch(url, { headers: { 'User-Agent': 'Mango-Signer', ...headers }, redirect: 'manual' });
+async function fetchAuthed(url, headers, signal) {
+  if (!headers) return fetch(url, { headers: { 'User-Agent': 'Mango-Signer' }, redirect: 'follow', signal });
+  const first = await fetch(url, { headers: { 'User-Agent': 'Mango-Signer', ...headers }, redirect: 'manual', signal });
   if (first.status >= 300 && first.status < 400 && first.headers.get('location')) {
     first.body && first.body.cancel().catch(() => {});
-    return fetch(new URL(first.headers.get('location'), url), { headers: { 'User-Agent': 'Mango-Signer' }, redirect: 'follow' });
+    return fetch(new URL(first.headers.get('location'), url), { headers: { 'User-Agent': 'Mango-Signer' }, redirect: 'follow', signal });
   }
   return first;
 }
 
 async function fetchToFile(url, headers, dest, job, label) {
   if (job && label) job.log.push(label);
-  const r = await fetchAuthed(url, headers);
+  if (job) job.cancellable = true;
+  const r = await fetchAuthed(url, headers, job && job.signal);
   if (!r.ok || !r.body) throw new Error(`Download failed (HTTP ${r.status}). The link may have moved or expired.`);
   if (/text\/html/i.test(r.headers.get('content-type') || '')) {
     r.body.cancel().catch(() => {});
@@ -1534,7 +1542,8 @@ async function moveToGithub(app, job) {
   const size = (await fsp.stat(file)).size;
   const safe = `${(app.originalName || app.name).replace(/[^\w.\-]+/g, '_')}-${app.version || 'app'}-${app.id.slice(0, 6)}.ipa`;
   if (job) job.log.push(`Sending ${app.name} to GitHub…`);
-  const asset = await gh.uploadAsset(g.releaseId, safe, file, size, (p) => { if (job) job.progress = p; });
+  if (job) job.cancellable = true;
+  const asset = await gh.uploadAsset(g.releaseId, safe, file, size, (p) => { if (job) job.progress = p; }, job && job.signal);
   app.remote = { kind: 'github', assetId: asset.id, name: asset.name };
   app.size = size;
   store.save();
@@ -1598,6 +1607,7 @@ route('POST', /^\/api\/github\/move$/, async (req, res, m, acc) => {
     let moved = 0, freed = 0;
     const errors = [];
     for (const [i, app] of list.entries()) {
+      if (job.cancelled) break;
       try {
         job.log.push(`(${i + 1}/${list.length}) ${app.name}`);
         const size = app.size;
@@ -2211,11 +2221,11 @@ async function tgImportPost(src, post, job) {
     const gh = ghClient();
     if (!gh || !g.releaseId) throw new Error('this channel saves to GitHub, but GitHub storage is not connected');
     job.log.push(`Copying ${meta.name} ${meta.version} to GitHub…`);
-    const r = await fetchAuthed(f.url, f.headers);
+    const r = await fetchAuthed(f.url, f.headers, job.signal);
     if (!r.ok || !r.body) throw new Error(`couldn't read the file from Telegram (HTTP ${r.status})`);
     const size = Number(r.headers.get('content-length')) || meta.size;
     const safe = `tg-${normName(meta.name).slice(0, 40) || 'app'}-${meta.version || 'v'}-${id().slice(0, 6)}.ipa`;
-    const asset = await gh.uploadStream(g.releaseId, safe, r.body, size, (p) => { job.progress = p; });
+    const asset = await gh.uploadStream(g.releaseId, safe, r.body, size, (p) => { job.progress = p; }, job.signal);
     job.progress = null;
     remote.ghAssetId = asset.id;
   }
@@ -2267,6 +2277,7 @@ const tgSyncing = new Map();
 function tgSync(src, acc) {
   if (tgSyncing.has(src.id) && jobs.has(tgSyncing.get(src.id)) && jobs.get(tgSyncing.get(src.id)).status === 'running') return jobs.get(tgSyncing.get(src.id));
   const job = newJob(acc || OWNER());
+  job.cancellable = true;
   tgSyncing.set(src.id, job.id);
   (async () => {
     const result = { added: 0, updated: 0, same: 0, skipped: 0, failed: 0, removed: 0 };
@@ -2287,6 +2298,7 @@ function tgSync(src, acc) {
       let maxDone = src.lastMsgId || 0;
       let blocked = false;
       for (const [i, p] of ipas.entries()) {
+        if (job.cancelled) { blocked = true; maxDone = Math.min(maxDone || p.id - 1, p.id - 1); break; }
         job.log.push(`(${i + 1}/${ipas.length}) ${p.file.name}`);
         try {
           const r = await tgImportPost(src, p, job);
@@ -2294,6 +2306,7 @@ function tgSync(src, acc) {
           delete src.failures[p.id];
           store.save();
         } catch (e) {
+          if (job.cancelled) { blocked = true; maxDone = Math.min(maxDone || p.id - 1, p.id - 1); break; }
           src.failures[p.id] = (src.failures[p.id] || 0) + 1;
           result.failed++;
           job.log.push(`✕ ${p.file.name}: ${e.message}`);
@@ -2314,6 +2327,7 @@ function tgSync(src, acc) {
           a.remote.missing = gone;
         }
       }
+      if (job.cancelled) result.cancelled = true;
       Object.assign(src, { lastSync: new Date().toISOString(), lastError: null, lastResult: result });
       store.save();
       job.result = result;
@@ -2841,7 +2855,9 @@ route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
   }
 
   const job = newJob(acc);
+  job.cancellable = true;
   countSign(acc.id, app.id);
+  job.countedFor = acc.id;
   signingNow.set(runKey, job.id);
   json(res, { jobId: job.id });
 
@@ -2965,7 +2981,25 @@ const signingNow = new Map(); // "owner:app" -> job id
 route('GET', /^\/api\/jobs\/([a-f0-9]{16})$/, (req, res, m, acc) => {
   const job = jobs.get(m[1]);
   if (!job || job.owner !== acc.id) return fail(res, 404, 'Job not found');
-  json(res, { status: job.status, log: job.log.slice(-30), error: job.error, result: job.result, progress: job.progress ?? null });
+  const cancelled = !!job.cancelled;
+  json(res, { status: cancelled ? 'cancelled' : job.status, log: job.log.slice(-300), error: cancelled ? 'Cancelled' : job.error, result: job.result, progress: cancelled ? null : job.progress ?? null, cancellable: !!job.cancellable && !job.cancelled });
+});
+
+route('POST', /^\/api\/jobs\/([a-f0-9]{16})\/cancel$/, (req, res, m, acc) => {
+  const job = jobs.get(m[1]);
+  if (!job || job.owner !== acc.id) return fail(res, 404, 'Job not found');
+  if (job.status === 'done' || job.status === 'error') return json(res, { ok: true, status: job.status });
+  job.cancelled = true;
+  job.log.push('✕ Cancelled — stopping…');
+  if (job.countedFor) {
+    // A cancelled sign doesn't use up one of today's signs.
+    const c = store.data.signCounts[job.countedFor];
+    if (c && c.n > 0) { c.n -= 1; store.save(); }
+    job.countedFor = null;
+  }
+  try { job.abort.abort(new Error('Cancelled')); } catch { /* */ }
+  if (job.child) job.child.kill('SIGKILL');
+  json(res, { ok: true });
 });
 
 // ----- signed apps -----
