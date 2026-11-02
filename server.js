@@ -2350,6 +2350,10 @@ async function tgImportPost(src, post, job) {
     || (opts.matchName ? store.apps.find((a) => mine(a) && normName(a.originalName || a.name) === normName(meta.name)) : null)
     || (opts.updateMine ? store.apps.find((a) => (a.bundleId || '').toLowerCase() === bid && (!a.remote || ['github', 'link'].includes(a.remote.kind))) : null);
   const notes = opts.captionNotes ? cleanCaption(post.text) : '';
+  if (app && meta.version && app.version && versionCmp(meta.version, app.version) < 0) {
+    job.log.push(`= ${meta.name} ${meta.version} is older than the ${app.version} you have`);
+    return 'older';
+  }
   if (app && app.version === meta.version && (app.build || '') === (meta.build || '')) {
     if (mine(app) && !app.remote.ghAssetId) { app.remote.msgId = post.id; app.remote.missing = false; }
     job.log.push(`= ${meta.name} ${meta.version} is already in the library`);
@@ -2376,6 +2380,10 @@ async function tgImportPost(src, post, job) {
     const oldShown = app.versionOverride || app.version;
     for (const [k, val] of Object.entries(metaFields(meta))) if (!locked.has(k)) app[k] = val;
     if (notes && !locked.has('notes')) app.notes = notes;
+    if (app.descFromCaption && !locked.has('description')) {
+      const cap = cleanCaption(String(post.text || '').split('\n').map((l) => l.trim()).filter(Boolean).slice(0, 12).join('\n')).slice(0, 600);
+      if (cap) app.description = cap;
+    }
     if (meta.icon && !app.customIcon) await fsp.writeFile(path.join(dirs.apps, app.id + '.png'), meta.icon);
     if (old && old.screenshots) remote.screenshots = old.screenshots;
     if ((!app.categoryId || !catExists(app.categoryId)) && !locked.has('categoryId') && (!src.categoryId || src.categoryId === '__auto')) {
@@ -2396,13 +2404,14 @@ async function tgImportPost(src, post, job) {
     source: 'telegram', remote, fileName: (post.file && post.file.name) || 'app.ipa',
     description: cleanCaption(lines.slice(0, 12).join('\n')).slice(0, 600), notes,
     published: src.showInLibrary !== false, categoryId: src.categoryId && catExists(src.categoryId) ? src.categoryId : null,
+    descFromCaption: true,
   });
   if (!src.categoryId || src.categoryId === '__auto') {
     const r = await autoCategory(rec, post.text);
     rec.categoryId = r.categoryId;
     if (r.info) {
       rec.developer = r.info.developer.slice(0, 80);
-      if (r.info.description) rec.description = r.info.description;
+      if (r.info.description) { rec.description = r.info.description; rec.descFromCaption = false; }
       remote.screenshots = r.info.screenshots;
     }
     if (r.categoryId) job.log.push(`  → ${(store.categories.find((c) => c.id === r.categoryId) || {}).name}${r.how === 'rule' ? ' (your rule)' : ' (App Store)'}`);
@@ -2421,7 +2430,7 @@ function tgSync(src, acc) {
   job.cancellable = true;
   tgSyncing.set(src.id, job.id);
   (async () => {
-    const result = { added: 0, updated: 0, same: 0, skipped: 0, failed: 0, removed: 0 };
+    const result = { added: 0, updated: 0, same: 0, older: 0, skipped: 0, failed: 0, removed: 0 };
     try {
       if (!tgReady()) throw new Error('Telegram is not connected');
       const opts = src.options;
@@ -2482,6 +2491,78 @@ function tgSync(src, acc) {
   })();
   return job;
 }
+
+// Look further back through a channel's history (old posts from years ago), without touching what you already have.
+// count = how many .ipa posts to look through (0 = the whole channel).
+function tgDeepScan(src, count, acc) {
+  const job = newJob(acc || OWNER());
+  job.cancellable = true;
+  tgSyncing.set(src.id, job.id);
+  (async () => {
+    const result = { added: 0, updated: 0, same: 0, older: 0, skipped: 0, failed: 0, removed: 0 };
+    try {
+      if (!tgReady()) throw new Error('Telegram is not connected');
+      const want = count > 0 ? count : 5000;
+      const words = src.options.keywords.split(',').map((w) => w.trim().toLowerCase()).filter(Boolean);
+      const found = [];
+      let offset = 0;
+      let looked = 0;
+      job.log.push(`Looking back through ${src.name}…`);
+      while (found.length < want && !job.cancelled) {
+        const page = await tg.posts(src.ref, 0, 200, offset);
+        if (!page.scanned) break;
+        looked += page.scanned;
+        for (const p of page.posts) {
+          if (!p.file || !/\.ipa$/i.test(p.file.name)) continue;
+          if (words.length && !words.some((w) => `${p.file.name}\n${p.text}`.toLowerCase().includes(w))) { result.skipped++; continue; }
+          if (found.length < want) found.push(p);
+        }
+        job.log.push(`Looked at ${looked} posts, found ${found.length} .ipa file${found.length === 1 ? '' : 's'}…`);
+        if (!page.oldest || page.oldest <= 1) break;
+        offset = page.oldest;
+      }
+      // Oldest first, so the newest version of each app ends up on top.
+      found.reverse();
+      for (const [i, p] of found.entries()) {
+        if (job.cancelled) break;
+        job.progress = i / found.length;
+        job.log.push(`(${i + 1}/${found.length}) ${p.file.name}`);
+        try {
+          result[await tgImportPost(src, p, job)]++;
+          store.save();
+        } catch (e) {
+          if (job.cancelled) break;
+          result.failed++;
+          job.log.push(`✕ ${p.file.name}: ${e.message}`);
+        }
+      }
+      job.progress = null;
+      if (job.cancelled) result.cancelled = true;
+      const newest = found.length ? Math.max(...found.map((p) => p.id)) : 0;
+      if (newest > (src.lastMsgId || 0) && !job.cancelled) src.lastMsgId = newest;
+      Object.assign(src, { lastSync: new Date().toISOString(), lastError: null, lastResult: result, deepest: Math.max(src.deepest || 0, found.length) });
+      store.save();
+      job.result = result;
+      job.status = 'done';
+    } catch (e) {
+      src.lastError = e.message;
+      store.save();
+      job.error = e.message;
+      job.status = 'error';
+    }
+  })();
+  return job;
+}
+
+route('POST', /^\/api\/sources\/([a-f0-9]{16})\/scan$/, async (req, res, m, acc) => {
+  const src = store.sources.find((x) => x.id === m[1] && x.kind === 'telegram');
+  if (!src) return fail(res, 404, 'Channel not found');
+  if (!tgReady()) return fail(res, 400, 'Connect Telegram first');
+  const running = tgSyncing.get(src.id);
+  if (running && jobs.has(running) && jobs.get(running).status === 'running') return fail(res, 409, 'This channel is already being checked. Wait for it to finish (or stop it) first.');
+  const { count } = await readJson(req);
+  json(res, { jobId: tgDeepScan(src, Math.max(0, Math.min(5000, Number(count) || 0)), acc).id });
+}, 'owner');
 
 route('POST', /^\/api\/telegram\/channels$/, async (req, res, m, acc) => {
   if (!tgReady()) return fail(res, 400, 'Connect Telegram first');
