@@ -1191,7 +1191,7 @@ function renderSettings() {
   }
   const s = state.server;
   const b = s.storageBreakdown || {};
-  const z = state.settings.zipLevel ?? 6;
+  const z = state.settings.zipLevel ?? 1;
   const total = s.storage || 1;
   const bar = (n, cls) => `<div class="${cls}" style="width:${Math.max(0.5, (100 * (n || 0)) / (s.disk ? s.disk.total : total))}%"></div>`;
   return `
@@ -1225,7 +1225,7 @@ function renderSettings() {
     <div class="section-title">Signing</div>
     <div class="list">
       <div class="setting"><span>IPA compression</span>
-        <select data-act="zip-level">${[0, 1, 3, 6, 9].map((n) => `<option value="${n}" ${n === Number(z) ? 'selected' : ''}>${n === 0 ? 'None (fastest)' : n === 9 ? 'Max (smallest)' : 'Level ' + n}</option>`).join('')}</select>
+        <select data-act="zip-level">${[0, 1, 3, 6, 9].map((n) => `<option value="${n}" ${n === Number(z) ? 'selected' : ''}>${n === 0 ? 'None (fastest)' : n === 9 ? 'Max (smallest)' : n === 1 ? 'Level 1 (fast, default)' : 'Level ' + n}</option>`).join('')}</select>
       </div>
       <label class="setting"><span>Remove signed file after it installs<br><span class="hint">Frees the space right away. Re-sign any time.</span></span>
         <span class="switch"><input type="checkbox" data-act="delete-after-install" ${state.settings.deleteAfterInstall !== false ? 'checked' : ''}><span></span></span></label>
