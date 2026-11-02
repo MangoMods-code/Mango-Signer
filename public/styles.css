@@ -145,7 +145,7 @@ main { padding: 4px 16px calc(96px + var(--safe-b)); max-width: 680px; margin: 0
 .btn.block { width: 100%; display: block; }
 .btn.big { padding: 16px; font-size: 17px; border-radius: 15px; }
 
-input[type=text], input[type=password], input[type=url], select {
+input[type=text], input[type=password], input[type=url], input[type=tel], input[type=number], select {
   width: 100%; border: 1px solid var(--line); background: var(--bg-2); border-radius: 12px;
   padding: 12px 14px; outline: none; font-size: 16px;
 }
@@ -669,3 +669,13 @@ html[data-accent="red"] { --mango: #ff5c5c; --mango-2: #ff9b9b; --accent-2: #f03
 .alert-ic { width: 34px; height: 34px; flex: none; display: grid; place-items: center; font-size: 20px; border-radius: 10px; background: var(--card-2); }
 .vote.fav { font-size: 18px; min-width: 44px; justify-content: center; }
 .vote.fav.on { color: #ff5c8a; border-color: rgba(255, 92, 138, .5); background: rgba(255, 92, 138, .12); }
+
+/* ---------- V1.7 owner tools ---------- */
+.stat-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.stat-grid > div { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 12px 10px; display: flex; flex-direction: column; gap: 2px; }
+.stat-grid b { font-size: 22px; }
+.stat-grid span { font-size: 12px; color: var(--muted); line-height: 1.25; }
+.chart { width: 100%; height: auto; display: block; }
+.chart-lbl { fill: var(--muted); font-size: 10px; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+.rank { width: 22px; flex: none; color: var(--muted); font-weight: 700; text-align: center; }

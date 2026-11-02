@@ -623,7 +623,7 @@ function filteredApps() {
   else if (cat === 'missing') apps = apps.filter((a) => a.missing);
   else if (cat === 'cloud:github') apps = apps.filter((a) => a.cloud === 'github');
   else if (cat === 'cloud:link') apps = apps.filter((a) => a.cloud === 'link');
-  else if (cat.startsWith('src:')) apps = apps.filter((a) => a.cloud === 'source' && a.sourceName === cat.slice(4));
+  else if (cat.startsWith('src:')) apps = apps.filter((a) => isSrcApp(a) && a.sourceName === cat.slice(4));
   else if (cat.startsWith('tag:')) apps = apps.filter((a) => (a.tags || []).includes(cat.slice(4)));
   else if (cat !== 'all') apps = apps.filter((a) => a.categoryId === cat);
   const by = {
@@ -652,12 +652,14 @@ function appBadges(a, { compact = false } = {}) {
 // Where an app's file lives. Users only see the source name; you also see GitHub / link-only.
 function cloudBadge(a) {
   if (a.cloud === 'source') return `<span class="badge cloud">☁ ${esc(a.sourceName || 'Source')}</span>`;
+  if (a.cloud === 'telegram') return `<span class="badge cloud">✈️ ${esc(a.sourceName || 'Telegram')}</span>`;
   if (!isOwner()) return '';
   if (a.cloud === 'github') return '<span class="badge cloud">☁ GitHub</span>';
   if (a.cloud === 'link') return '<span class="badge cloud">🔗 Link</span>';
   return '';
 }
-const storedLabel = (a) => ({ source: `Linked from ${a.sourceName || 'a source'} (not stored here)`, github: 'Your GitHub repo (not stored here)', link: 'Download link (not stored here)' }[a.cloud] || 'This server');
+const isSrcApp = (a) => a.cloud === 'source' || a.cloud === 'telegram';
+const storedLabel = (a) => ({ telegram: `Telegram: ${a.sourceName || 'a channel'} (not stored here)`, source: `Linked from ${a.sourceName || 'a source'} (not stored here)`, github: 'Your GitHub repo (not stored here)', link: 'Download link (not stored here)' }[a.cloud] || 'This server');
 
 function getLabel(a) {
   if (hasUpdate(a)) return 'Update';
@@ -755,7 +757,7 @@ function libCount(key) {
   if (key === 'none') return A.filter((a) => !catById(a.categoryId)).length;
   if (key === 'hidden') return A.filter((a) => !a.published).length;
   if (key.startsWith('tag:')) return A.filter((a) => (a.tags || []).includes(key.slice(4))).length;
-  if (key.startsWith('src:')) return A.filter((a) => a.cloud === 'source' && a.sourceName === key.slice(4)).length;
+  if (key.startsWith('src:')) return A.filter((a) => isSrcApp(a) && a.sourceName === key.slice(4)).length;
   if (key === 'cloud:github') return A.filter((a) => a.cloud === 'github').length;
   if (key === 'cloud:link') return A.filter((a) => a.cloud === 'link').length;
   if (key === 'missing') return A.filter((a) => a.missing).length;
@@ -764,11 +766,11 @@ function libCount(key) {
 // Everything you can filter by, grouped for the Filters sheet.
 function filterGroups() {
   const tags = [...new Set(state.apps.flatMap((a) => a.tags || []))].sort();
-  const srcNames = [...new Set(state.apps.filter((a) => a.cloud === 'source' && a.sourceName).map((a) => a.sourceName))].sort();
+  const srcNames = [...new Set(state.apps.filter((a) => isSrcApp(a) && a.sourceName).map((a) => a.sourceName))].sort();
   const g = [
     { title: 'Show', items: [['all', '📱 All'], ['favorites', '♥ Favorites'], ['installed', '✓ Installed'], ['updates', '⬆ Updates'], ['new', '🆕 New'], ['featured', '★ Featured']] },
     { title: 'Categories', items: state.categories.map((c) => [c.id, `${c.emoji} ${c.name}`]) },
-    { title: 'Sources', items: srcNames.map((n) => [`src:${n}`, `☁ ${n}`]) },
+    { title: 'Sources', items: srcNames.map((n) => [`src:${n}`, `${state.apps.some((a) => a.cloud === 'telegram' && a.sourceName === n) ? '✈️' : '☁'} ${n}`]) },
     { title: 'Tags', items: tags.map((t) => [`tag:${t}`, `# ${t}`]) },
   ];
   if (isOwner()) g.push({ title: 'Owner', items: [['cloud:github', '☁ On GitHub'], ['cloud:link', '🔗 Links'], ['none', 'Uncategorized'], ['hidden', 'Hidden'], ['missing', '⚠ Removed']] });
@@ -1127,6 +1129,12 @@ function renderSettings() {
       <div class="setting"><span>Your signed apps</span><span class="value">${state.signed.length}</span></div>
       <div class="setting"><span>Users</span><span class="value">${state.users.length}</span></div>
     </div>
+    <div class="section-title">Owner tools</div>
+    <div class="list">
+      <button class="row" data-act="stats"><span class="row-main" style="font-weight:600">📊 Stats &amp; activity</span><span class="value muted">›</span></button>
+      <button class="row" data-act="broadcast"><span class="row-main" style="font-weight:600">📣 Message everyone</span><span class="value muted">›</span></button>
+      <button class="row" data-act="backup"><span class="row-main" style="font-weight:600">💾 Backup &amp; restore</span><span class="value muted">${state.settings.lastBackup ? ago(state.settings.lastBackup) : 'never'} ›</span></button>
+    </div>
     ${accountSection()}
     <p class="footer-note">🥭 Mango Signer · signing powered by zsign (MIT)<br>© 2026 MangoMods · All rights reserved</p>`;
 }
@@ -1168,6 +1176,9 @@ function bindView(view) {
         'add-source': addSourceSheet,
         tweaks: tweaksSheet,
         'my-security': mySecuritySheet,
+        stats: statsSheet,
+        broadcast: broadcastSheet,
+        backup: backupSheet,
         'security-log': securityLogSheet,
         dupes: duplicatesSheet,
         filters: filterSheet,
@@ -1175,6 +1186,7 @@ function bindView(view) {
         'lib-more': () => { state.lib.limit += 40; const y = window.scrollY; render(); window.scrollTo(0, y); },
         source: () => sourceSheet(idv),
         github: githubSheet,
+        telegram: telegramSheet,
         announce: announcementSheet,
         appearance: appearanceSheet,
         tour: () => tourSheet(true),
@@ -1241,7 +1253,9 @@ const rawGithub = (u) => String(u).replace(/^https:\/\/github\.com\/([^/]+)\/([^
 
 function cloudSettingsHtml() {
   const g = state.github || {};
-  const srcs = state.sources || [];
+  const srcs = (state.sources || []).filter((x) => x.kind !== 'telegram');
+  const tgc = (state.sources || []).filter((x) => x.kind === 'telegram');
+  const t = state.telegram || {};
   return `<div class="list">
       ${srcs.map((src) => `
         <button class="row" data-act="source" data-id="${src.id}">
@@ -1251,6 +1265,11 @@ function cloudSettingsHtml() {
           <span class="value muted">›</span>
         </button>`).join('')}
       <button class="row" data-act="add-source"><span class="row-main" style="font-weight:600;color:var(--accent)">＋ Add a source</span><span class="value muted">AltStore / ESign repos</span></button>
+      <button class="row" data-act="telegram">
+        <span class="row-main"><span class="row-title">✈️ Telegram channels</span>
+          <span class="row-sub">${t.connected ? `${tgc.length} channel${tgc.length === 1 ? '' : 's'} · ${tgc.reduce((n, c) => n + (c.apps || 0), 0)} apps${t.error ? ' · ⚠ ' + esc(t.error) : ''}` : 'Pull new .ipa posts from channels automatically'}</span></span>
+        <span class="value ${t.connected ? '' : 'muted'}">${t.connected ? '<span class="badge good">On</span>' : 'Off ›'}</span>
+      </button>
       <button class="row" data-act="github">
         <span class="row-main"><span class="row-title">GitHub storage</span>
           <span class="row-sub">${g.connected ? `${esc(g.owner)}/${esc(g.repo)} · ${g.apps} app${g.apps === 1 ? '' : 's'}${g.lastError ? ' · ⚠ ' + esc(g.lastError) : ''}` : 'Keep your own IPAs in a private repo instead of here'}</span></span>
@@ -1296,7 +1315,8 @@ function addSourceSheet() {
 function sourceSheet(sid) {
   const src = (state.sources || []).find((x) => x.id === sid);
   if (!src) return toast('Source not found', true);
-  const apps = state.apps.filter((a) => a.cloud === 'source' && a.sourceName === src.name);
+  if (src.kind === 'telegram') return tgChannelSheet(sid);
+  const apps = state.apps.filter((a) => isSrcApp(a) && a.sourceName === src.name);
   const missing = apps.filter((a) => a.missing).length;
   openSheet(`
     <div class="sheet-head">${iconHtml(src.iconURL || null, src.name, true)}<div class="row-main"><h2>${esc(src.name)}</h2><div class="row-sub">${esc(src.subtitle || 'App source')}</div></div></div>
@@ -1336,6 +1356,198 @@ function sourceSheet(sid) {
     $('#srcDel', el).onclick = async () => {
       if (!confirm(`Remove ${src.name}? Its ${apps.length} app${apps.length === 1 ? '' : 's'} leave the library. People who installed them keep them.`)) return;
       try { await api('DELETE', `/api/sources/${sid}`); closeSheet(); toast('Source removed'); await refresh(); } catch (e) { toast(e.message, true); }
+    };
+  });
+}
+
+// ---------- Telegram channels ----------
+function telegramSheet(step) {
+  const t = state.telegram || {};
+  if (!t.connected) {
+    const pending = step || t.pending;
+    if (pending === 'code' || pending === 'password') {
+      const pw = pending === 'password';
+      openSheet(`
+        <h2>✈️ ${pw ? 'Two-step password' : 'Enter the code'}</h2>
+        <p class="muted small" style="margin-top:-6px">${pw ? 'Your Telegram account has a two-step verification password. Enter it to finish.' : 'Telegram just sent a login code to your Telegram app (check the chat named "Telegram"), or by text.'}</p>
+        <div class="field"><input type="${pw ? 'password' : 'text'}" id="tgVal" ${pw ? 'autocomplete="current-password"' : 'inputmode="numeric" autocomplete="one-time-code" maxlength="8"'} placeholder="${pw ? 'Password' : '12345'}"></div>
+        <button class="btn primary big block" id="tgGo">${pw ? 'Finish' : 'Sign in'}</button>
+        <button class="link-btn block" id="tgBack" type="button">Start over</button>`, (el) => {
+        $('#tgBack', el).onclick = async () => { await api('DELETE', '/api/telegram').catch(() => {}); await refresh(); telegramSheet('start'); };
+        $('#tgGo', el).onclick = async (e) => {
+          const b = e.currentTarget; b.disabled = true; b.textContent = 'Checking…';
+          try {
+            const r = await api('POST', pw ? '/api/telegram/password' : '/api/telegram/code', pw ? { password: $('#tgVal', el).value } : { code: $('#tgVal', el).value });
+            await refresh();
+            if (r.needPassword) return telegramSheet('password');
+            toast('Telegram connected ✈️');
+            telegramSheet();
+          } catch (err) { toast(err.message, true); b.disabled = false; b.textContent = pw ? 'Finish' : 'Sign in'; }
+        };
+        setTimeout(() => $('#tgVal', el).focus(), 350);
+      });
+      return;
+    }
+    openSheet(`
+      <h2>✈️ Telegram channels</h2>
+      <p class="muted small" style="margin-top:-6px">Mango signs in to Telegram as you and watches channels you pick. When a channel posts an .ipa, it's added to your library (or updates the app that's already there). Only you sign in — everyone else just sees the apps.</p>
+      <ol class="gh-steps">
+        <li>On your iPhone, open <b>my.telegram.org</b> in Safari and log in with your Telegram phone number (the code arrives in Telegram).</li>
+        <li>Tap <b>API development tools</b>. Fill in any app title and short name (e.g. <span class="mono">Mango</span> / <span class="mono">mangosigner</span>), pick any platform, and tap <b>Create application</b>.</li>
+        <li>Copy the <b>App api_id</b> (a number) and <b>App api_hash</b> (32 letters and numbers) into the boxes below.</li>
+      </ol>
+      <div class="field"><label>API ID</label><input type="text" id="tgId" inputmode="numeric" placeholder="1234567" autocomplete="off"></div>
+      <div class="field"><label>API hash</label><input type="text" id="tgHash" placeholder="0123456789abcdef…" autocapitalize="off" autocorrect="off" autocomplete="off"></div>
+      <div class="field"><label>Your Telegram phone number</label><input type="tel" id="tgPhone" placeholder="+1 555 123 4567" autocomplete="tel"><div class="hint">With the country code. A spare Telegram account works too, and keeps your main one safer.</div></div>
+      <button class="btn primary big block" id="tgSend">Send login code</button>
+      <p class="hint" style="margin-top:10px">Your login is stored encrypted on your server. Telegram will show "Mango Signer" under Settings › Devices, and you can end it there any time.</p>`, (el) => {
+      $('#tgSend', el).onclick = async (e) => {
+        const b = e.currentTarget; b.disabled = true; b.textContent = 'Sending…';
+        try {
+          await api('POST', '/api/telegram/login', { apiId: $('#tgId', el).value, apiHash: $('#tgHash', el).value, phone: $('#tgPhone', el).value });
+          await refresh();
+          telegramSheet('code');
+        } catch (err) { toast(err.message, true); b.disabled = false; b.textContent = 'Send login code'; }
+      };
+    });
+    return;
+  }
+  const chans = (state.sources || []).filter((x) => x.kind === 'telegram');
+  openSheet(`
+    <h2>✈️ Telegram channels</h2>
+    ${t.error ? `<p class="warning bad">${esc(t.error)}</p>` : ''}
+    <div class="card sub-card"><div class="row-main"><div class="row-title">Signed in as ${esc((t.me && t.me.name) || 'you')} <span class="badge good">Connected</span></div>
+      <div class="row-sub">${esc([t.me && t.me.username ? '@' + t.me.username : '', t.me && t.me.phone].filter(Boolean).join(' · '))}</div></div></div>
+    ${chans.length ? `<div class="list">${chans.map((c) => `
+      <button class="row" data-ch="${c.id}"><span class="app-icon tw-icon">✈️</span>
+        <span class="row-main"><span class="row-title">${esc(c.name)}</span>
+        <span class="row-sub">${c.lastError ? `<span style="color:var(--red)">⚠ ${esc(c.lastError)}</span>` : `${c.apps} app${c.apps === 1 ? '' : 's'} · ${c.lastSync ? 'checked ' + ago(c.lastSync) : 'not checked yet'}${c.options && c.options.storage === 'github' ? ' · GitHub copies' : ''}`}</span></span>
+        <span class="value muted">›</span></button>`).join('')}</div>` : ''}
+    <button class="file-btn" id="tgAdd" style="margin-top:12px">${ICONS.plus}<div class="row-main"><div class="row-title">Add a channel</div><div class="row-sub">Its @username or t.me link</div></div></button>
+    <p class="hint" style="margin:10px 4px 0">Channels are checked every 10 minutes. Only posts with an .ipa file are looked at.</p>
+    <div class="actions"><button class="btn block danger" id="tgOff">Disconnect Telegram</button></div>`, (el) => {
+    el.querySelectorAll('[data-ch]').forEach((b) => { b.onclick = () => tgChannelSheet(b.dataset.ch); });
+    $('#tgAdd', el).onclick = () => tgChannelSheet(null);
+    $('#tgOff', el).onclick = async () => {
+      if (!confirm('Disconnect Telegram? Mango signs out of your account. Apps from channels stay listed but can\'t be signed until you connect again (unless they were copied to GitHub).')) return;
+      try { await api('DELETE', '/api/telegram'); await refresh(); toast('Disconnected'); closeSheet(); } catch (e) { toast(e.message, true); }
+    };
+  });
+}
+
+function tgOptionsHtml(o = {}, src = {}) {
+  const gh = state.github && state.github.connected;
+  return `
+    <div class="field"><label>Where the files live</label>
+      <select id="tcStore">
+        <option value="telegram" ${o.storage !== 'github' ? 'selected' : ''}>On Telegram (link only, uses no storage)</option>
+        <option value="github" ${o.storage === 'github' ? 'selected' : ''} ${gh ? '' : 'disabled'}>Copy to my GitHub storage${gh ? '' : ' (connect GitHub first)'}</option>
+      </select>
+      <div class="hint">Link only is fastest to set up. A GitHub copy keeps working even if the channel deletes the post.</div></div>
+    <div class="group">
+      ${toggle('tcMine', 'Update apps I added myself', 'If the channel posts a newer version of an app you uploaded, replace yours with it', !!o.updateMine)}
+      ${toggle('tcName', 'Also match by app name', 'For channels that change the bundle ID between builds', !!o.matchName)}
+      ${toggle('tcNotes', 'Use the post\'s text as “What\'s new”', 'Promo lines (Tap Here, links, @mentions) are left out', o.captionNotes !== false)}
+      ${toggle('tcAuto', 'Check automatically', 'Every 10 minutes', o.autoSync !== false)}
+      ${toggle('tcShow', 'Show its apps to everyone', 'Off = only you can see them until you turn it on', src.showInLibrary !== false)}
+    </div>
+    <div class="field" style="margin-top:12px"><label>Only import posts that mention</label><input type="text" id="tcWords" value="${esc(o.keywords || '')}" placeholder="Optional, e.g. mortal kombat, youtube" autocapitalize="off"><div class="hint">Comma-separated. Leave empty to import every .ipa.</div></div>
+    <div class="field"><label>Category for new apps</label>${categorySelectHtml(src.categoryId || '').replace('id="eCat"', 'id="tcCat"').replace('<option value="__new">+ New category…</option>', '')}</div>`;
+}
+const readTgOptions = (el) => ({
+  storage: $('#tcStore', el).value, updateMine: $('#tcMine', el).checked, matchName: $('#tcName', el).checked,
+  captionNotes: $('#tcNotes', el).checked, autoSync: $('#tcAuto', el).checked, keywords: $('#tcWords', el).value,
+});
+
+function tgRunSheet(title, jobId, back) {
+  closeSheet.locked = true;
+  $('#sheet').classList.add('locked');
+  openSheet(`<div class="progress-wrap"><div class="spinner"></div><h2 id="trTitle" style="margin:0 0 4px">${esc(title)}</h2><p class="muted small" id="trSub">This can take a while for big files</p><div class="bar hidden" id="trBar"><div></div></div><div class="log" id="trLog"></div></div>`);
+  const body = $('#sheetBody');
+  waitJob(jobId, (j) => {
+    const log = $('#trLog', body);
+    log.textContent = j.log.join('\n'); log.scrollTop = log.scrollHeight;
+    if (j.progress != null) { $('#trBar', body).classList.remove('hidden'); $('#trBar > div', body).style.width = `${Math.round(j.progress * 100)}%`; } else $('#trBar', body).classList.add('hidden');
+  }).then(async (r) => {
+    closeSheet.locked = false; $('#sheet').classList.remove('locked');
+    await refresh().catch(() => {});
+    const bits = [r.added && `${r.added} new`, r.updated && `${r.updated} updated`, r.removed && `${r.removed} removed`, r.failed && `${r.failed} failed`].filter(Boolean);
+    toast(bits.length ? bits.join(' · ') : 'Nothing new', !!r.failed && !r.added && !r.updated);
+    back();
+  }).catch(async (e) => {
+    closeSheet.locked = false; $('#sheet').classList.remove('locked');
+    await refresh().catch(() => {});
+    toast(e.message, true);
+    back();
+  });
+}
+
+function tgChannelSheet(sid) {
+  const src = sid ? (state.sources || []).find((x) => x.id === sid) : null;
+  if (!src) {
+    openSheet(`
+      <h2>Add a Telegram channel</h2>
+      <div class="field"><label>Channel</label><input type="text" id="tcRef" placeholder="@channelname or https://t.me/channelname" autocapitalize="off" autocorrect="off"><div class="hint">Public channels work right away. For a private one, join it in Telegram first and use its @username.</div></div>
+      <div class="field"><label>Import recent posts</label>
+        <select id="tcBack">${[[0, 'None — only new posts from now on'], [5, 'Last 5 .ipa posts'], [10, 'Last 10'], [25, 'Last 25'], [50, 'Last 50']].map(([n, l]) => `<option value="${n}" ${n === 10 ? 'selected' : ''}>${l}</option>`).join('')}</select>
+        <div class="hint">If the same app was posted several times, only its newest version is kept.</div></div>
+      ${tgOptionsHtml({}, {})}
+      <button class="btn primary big block" id="tcAdd" style="margin-top:12px">Add channel</button>`, (el) => {
+      $('#tcAdd', el).onclick = async (e) => {
+        const b = e.currentTarget; b.disabled = true; b.textContent = 'Finding the channel…';
+        try {
+          const { jobId } = await api('POST', '/api/telegram/channels', {
+            ref: $('#tcRef', el).value, showInLibrary: $('#tcShow', el).checked, categoryId: $('#tcCat', el).value || null,
+            options: { ...readTgOptions(el), backfill: Number($('#tcBack', el).value) },
+          });
+          await refresh();
+          tgRunSheet('Importing…', jobId, telegramSheet);
+        } catch (err) { toast(err.message, true); b.disabled = false; b.textContent = 'Add channel'; }
+      };
+    });
+    return;
+  }
+  const apps = state.apps.filter((a) => a.cloud === 'telegram' && a.sourceName === src.name);
+  const r = src.lastResult;
+  openSheet(`
+    <div class="sheet-head"><span class="app-icon big tw-icon">✈️</span><div class="row-main"><h2>${esc(src.name)}</h2><div class="row-sub">${src.username ? '@' + esc(src.username) : 'Telegram channel'}</div></div></div>
+    ${src.lastError ? `<p class="warning bad">Last check failed: ${esc(src.lastError)}</p>` : ''}
+    <dl class="kv card" style="margin:0">
+      <dt>Apps</dt><dd>${src.apps}</dd>
+      <dt>Last check</dt><dd>${src.lastSync ? ago(src.lastSync) : 'never'}</dd>
+      ${r ? `<dt>Last result</dt><dd>${esc([`${r.added} new`, `${r.updated} updated`, r.same ? `${r.same} already had` : '', r.failed ? `${r.failed} failed` : ''].filter(Boolean).join(' · '))}</dd>` : ''}
+    </dl>
+    <div class="actions">
+      <button class="btn primary block" id="tcSync">Check for new posts now</button>
+      ${apps.length ? `<button class="btn block" id="tcBrowse">See its ${apps.length} app${apps.length === 1 ? '' : 's'}</button>` : ''}
+    </div>
+    <div class="section-title">Settings</div>
+    ${tgOptionsHtml(src.options || {}, src)}
+    <div class="field"><label>Name in your library</label><input type="text" id="tcNameIn" value="${esc(src.name)}" maxlength="60"></div>
+    <div class="actions">
+      <button class="btn primary block" id="tcSave">Save settings</button>
+      <button class="btn block" id="tcRescan">Re-scan recent posts</button>
+      <button class="btn block" id="tcBackBtn">Back</button>
+      <button class="btn block danger" id="tcDel">Remove channel</button>
+    </div>`, (el) => {
+    $('#tcBackBtn', el).onclick = () => telegramSheet();
+    $('#tcSync', el).onclick = async () => {
+      try { const { jobId } = await api('POST', `/api/sources/${src.id}/sync`); tgRunSheet(`Checking ${src.name}…`, jobId, () => tgChannelSheet(src.id)); } catch (e) { toast(e.message, true); }
+    };
+    $('#tcRescan', el).onclick = async () => {
+      if (!confirm('Look through the recent posts again? Apps you already have are skipped unless the post is a newer version.')) return;
+      try { const { jobId } = await api('POST', `/api/sources/${src.id}/sync?rescan=1`); tgRunSheet(`Re-scanning ${src.name}…`, jobId, () => tgChannelSheet(src.id)); } catch (e) { toast(e.message, true); }
+    };
+    if ($('#tcBrowse', el)) $('#tcBrowse', el).onclick = () => { closeSheet(); state.lib.cat = `src:${src.name}`; state.lib.q = ''; switchTab('library'); };
+    $('#tcSave', el).onclick = async () => {
+      try {
+        await api('PATCH', `/api/sources/${src.id}`, { name: $('#tcNameIn', el).value, showInLibrary: $('#tcShow', el).checked, categoryId: $('#tcCat', el).value || null, options: readTgOptions(el) });
+        await refresh(); toast('Saved'); tgChannelSheet(src.id);
+      } catch (e) { toast(e.message, true); }
+    };
+    $('#tcDel', el).onclick = async () => {
+      if (!confirm(`Remove ${src.name}? Its ${apps.length} app${apps.length === 1 ? '' : 's'} leave the library. People who installed them keep them.`)) return;
+      try { await api('DELETE', `/api/sources/${src.id}`); await refresh(); toast('Channel removed'); telegramSheet(); } catch (e) { toast(e.message, true); }
     };
   });
 }
@@ -1467,7 +1679,7 @@ function certBanner() {
   return '';
 }
 
-const ALERT_ICONS = { update: '⬆️', request: '🙋', cert: '🔐', security: '🔒', user: '👋', storage: '💾' };
+const ALERT_ICONS = { broadcast: '📣', update: '⬆️', request: '🙋', cert: '🔐', security: '🔒', user: '👋', storage: '💾' };
 function alertsSheet() {
   const list = state.alerts;
   const unreadIds = list.filter((a) => !a.read).map((a) => a.id);
@@ -1546,6 +1758,93 @@ function securityLogSheet() {
         try { await api('DELETE', '/api/security-log'); await refresh(); securityLogSheet(); } catch (e) { toast(e.message, true); }
       };
     }
+  });
+}
+
+// ---------- owner tools ----------
+function barChart(days, series) {
+  const W = 340, H = 120, n = days.length, bw = W / n;
+  const max = Math.max(1, ...days.map((_, i) => series.reduce((t, s) => t + s.values[i], 0)));
+  let bars = '';
+  days.forEach((d, i) => {
+    let y = H;
+    for (const s of series) {
+      const h = (s.values[i] / max) * (H - 4);
+      if (h > 0) { y -= h; bars += `<rect x="${(i * bw + 1).toFixed(1)}" y="${y.toFixed(1)}" width="${(bw - 2).toFixed(1)}" height="${h.toFixed(1)}" rx="2" fill="${s.color}"><title>${d}: ${s.values[i]} ${s.name}</title></rect>`; }
+    }
+  });
+  return `<svg viewBox="0 0 ${W} ${H + 16}" class="chart" role="img" aria-label="Last 30 days">
+    <line x1="0" y1="${H}" x2="${W}" y2="${H}" stroke="var(--line)"/>${bars}
+    <text x="0" y="${H + 13}" class="chart-lbl">${days[0].slice(5)}</text><text x="${W}" y="${H + 13}" text-anchor="end" class="chart-lbl">today</text>
+    <text x="0" y="10" class="chart-lbl">${max}</text></svg>
+    <div class="legend">${series.map((s) => `<span><i style="background:${s.color}"></i>${s.name} ${s.values.reduce((a, b) => a + b, 0)}</span>`).join('')}</div>`;
+}
+async function statsSheet() {
+  let st;
+  try { st = await api('GET', '/api/stats'); } catch (e) { return toast(e.message, true); }
+  const t = st.totals;
+  const ACT = { install: '📲', sign: '✍️', user: '👋', request: '🙋' };
+  openSheet(`
+    <h2>📊 Stats &amp; activity</h2>
+    <div class="stat-grid">
+      <div><b>${t.users}</b><span>users</span></div>
+      <div><b>${t.activeUsers7d}</b><span>active this week</span></div>
+      <div><b>${t.installs30d}</b><span>installs (30d)</span></div>
+      <div><b>${t.signs30d}</b><span>signs (30d)</span></div>
+      <div><b>${t.apps}</b><span>apps · ${t.cloudApps} cloud</span></div>
+      <div><b>${t.installsAll}</b><span>installs all time</span></div>
+    </div>
+    <div class="section-title">Last 30 days</div>
+    <div class="card">${barChart(st.days, [{ name: 'installs', values: st.installs, color: 'var(--mango)' }, { name: 'signs', values: st.signs, color: '#5aa0ff' }, { name: 'new users', values: st.signups, color: 'var(--leaf)' }])}</div>
+    ${st.topApps.length ? `<div class="section-title">Most installed (30 days)</div><div class="list">${st.topApps.map((x, i) => {
+      const a = state.apps.find((y) => y.id === x.appId);
+      return `<button class="row" ${a ? `data-open="${a.id}"` : ''}><span class="rank">${i + 1}</span>${a ? appIcon(a) : ''}<span class="row-main"><span class="row-title">${esc(x.name)}</span></span><span class="value">${x.count}</span></button>`;
+    }).join('')}</div>` : ''}
+    <div class="section-title">Recent activity</div>
+    ${st.activity.length ? `<div class="list">${st.activity.map((x) => `<div class="row"><span class="alert-ic">${ACT[x.kind] || '•'}</span><div class="row-main"><div class="row-title" style="font-weight:500">${esc(x.text)}</div><div class="row-sub muted small">${ago(x.at)}</div></div></div>`).join('')}</div>` : '<p class="hint">Nothing yet.</p>'}`, (el) => {
+    el.querySelectorAll('[data-open]').forEach((b) => { b.onclick = () => appSheet(b.dataset.open); });
+  });
+}
+function broadcastSheet() {
+  const n = state.users.filter((u) => !u.disabled).length;
+  openSheet(`
+    <h2>📣 Message everyone</h2>
+    <p class="muted small" style="margin-top:-6px">Sends a 🔔 alert to all ${n} user${n === 1 ? '' : 's'}. For a banner everyone sees at the top of the app, use 📣 Announcement in Settings › Library instead.</p>
+    <div class="field"><label>Title</label><input type="text" id="bcTitle" maxlength="100" placeholder="e.g. New certificate next week"></div>
+    <div class="field"><label>Message</label><textarea id="bcBody" rows="4" maxlength="400" placeholder="Optional details"></textarea></div>
+    <button class="btn primary big block" id="bcSend">Send to ${n} user${n === 1 ? '' : 's'}</button>`, (el) => {
+    $('#bcSend', el).onclick = async () => {
+      try { const { sent } = await api('POST', '/api/broadcast', { title: $('#bcTitle', el).value, body: $('#bcBody', el).value }); closeSheet(); toast(`Sent to ${sent} user${sent === 1 ? '' : 's'}`); } catch (e) { toast(e.message, true); }
+    };
+  });
+}
+function backupSheet() {
+  const onServer = state.apps.filter((a) => !a.cloud).length;
+  openSheet(`
+    <h2>💾 Backup &amp; restore</h2>
+    <p class="muted small" style="margin-top:-6px">A backup is one .zip with your settings, users, library details, categories, collections, certificates, tweaks and icons. Keep it somewhere private — it has everyone's certificates in it.</p>
+    ${onServer ? `<p class="warning">${onServer} app${onServer === 1 ? ' is' : 's are'} stored on this server. Their .ipa files aren't included (they're too big) — move them to GitHub storage first if you want them safe.</p>` : ''}
+    <a class="btn primary big block" id="bkGet" href="/api/backup" download>Download backup</a>
+    <div class="section-title">Restore</div>
+    <p class="hint" style="margin:0 4px 10px">Replaces everything on this server with the backup, then restarts (about 30 seconds). Use it to move to a new Railway project or undo a mistake.</p>
+    <button class="btn block danger" id="bkRestore">Restore from a backup…</button>
+    <div id="addProgress"></div>`, (el) => {
+    $('#bkGet', el).onclick = () => { api('PATCH', '/api/settings', { lastBackup: true }).then((d) => { state.settings = d.settings; }).catch(() => {}); toast('Downloading backup…'); };
+    $('#bkRestore', el).onclick = async () => {
+      const f = await pickFile('');
+      if (!f) return;
+      if (!/\.zip$/i.test(f.name)) return toast('Pick a Mango backup .zip', true);
+      if (!confirm('Replace everything on this server with this backup? This can\'t be undone.')) return;
+      const box = $('#addProgress', el);
+      box.innerHTML = '<p class="muted small center">Uploading…</p>';
+      try {
+        const up = await uploadFile(f);
+        box.innerHTML = '<p class="muted small center">Restoring…</p>';
+        const r = await api('POST', '/api/restore', { uploadId: up.uploadId });
+        box.innerHTML = `<p class="muted small center">Restored ${r.apps} apps and ${r.users} users. Restarting…</p>`;
+        setTimeout(() => location.reload(), 9000);
+      } catch (e) { box.innerHTML = ''; toast(e.message, true); }
+    };
   });
 }
 
@@ -1670,7 +1969,7 @@ function duplicatesSheet() {
       <div class="list">${g.map((a) => `
         <div class="row" data-open="${a.id}">${appIcon(a)}
           <div class="row-main"><div class="row-title">${esc(a.name)}</div>
-            <div class="row-sub">v${esc(shownVersion(a) || '?')} · ${fmtSize(a.size)} · ${esc(a.cloud === 'source' ? a.sourceName || 'source' : a.cloud === 'github' ? 'GitHub' : a.cloud === 'link' ? 'link' : 'this server')} · ${a.installCount || 0} installs</div>
+            <div class="row-sub">v${esc(shownVersion(a) || '?')} · ${fmtSize(a.size)} · ${esc(isSrcApp(a) ? a.sourceName || 'source' : a.cloud === 'github' ? 'GitHub' : a.cloud === 'link' ? 'link' : 'this server')} · ${a.installCount || 0} installs</div>
             <div class="row-sub">${a.updatedAt && a.updatedAt !== a.addedAt ? 'Updated' : 'Added'} ${ago(a.updatedAt || a.addedAt)}</div></div>
           <button class="pill danger-pill" data-del="${a.id}">Delete</button>
         </div>`).join('')}</div>`).join('') : '<div class="empty" style="padding:30px 10px"><h3>No duplicates 🎉</h3></div>'}`, (el) => {
@@ -1903,7 +2202,7 @@ function appSheet(appId) {
       <dt>Size</dt><dd>${fmtSize(a.size)}</dd>
       <dt>Extensions</dt><dd>${a.extensions || 0}${a.hasWatch ? ' + Watch app' : ''}</dd>
       <dt>${a.updatedAt && a.updatedAt !== a.addedAt ? 'Updated' : 'Added'}</dt><dd>${ago(a.updatedAt || a.addedAt)}</dd>
-      ${a.cloud === 'source' ? `<dt>Source</dt><dd>☁ ${esc(a.sourceName || '—')}</dd>` : ''}
+      ${isSrcApp(a) ? `<dt>${a.cloud === 'telegram' ? 'Telegram' : 'Source'}</dt><dd>${a.cloud === 'telegram' ? '✈️' : '☁'} ${esc(a.sourceName || '—')}</dd>` : ''}
       ${owner ? `<dt>Stored on</dt><dd>${esc(storedLabel(a))}</dd>` : ''}
       ${owner && a.remoteUrl ? `<dt>Link</dt><dd class="mono small-break">${esc(a.remoteUrl)}</dd>` : ''}
     </dl>
@@ -1916,7 +2215,7 @@ function appSheet(appId) {
       <button class="btn block" id="aEdit">Edit details, tags &amp; sign settings</button>
       <button class="btn block" id="aShots">Screenshots (${shots.length})</button>
       <button class="btn block" id="aCols">Add to collection</button>
-      ${a.cloud === 'source' ? `<p class="hint center">Updates come in by themselves when ${esc(a.sourceName || 'the source')} adds a new version.</p>` : '<button class="btn block" id="aUpdate">Update IPA (new version)</button>'}
+      ${isSrcApp(a) ? `<p class="hint center">Updates come in by themselves when ${esc(a.sourceName || 'the source')} ${a.cloud === 'telegram' ? 'posts' : 'adds'} a new version.</p>` : '<button class="btn block" id="aUpdate">Update IPA (new version)</button>'}
       ${!a.cloud && state.github.connected ? `<button class="btn block" id="aMoveGh">☁ Move to GitHub (frees ${fmtSize(a.size)})</button>` : ''}
       <a class="btn block" href="/api/apps/${a.id}/download">Download original .ipa</a>
       <button class="btn block danger" id="aDelete">Delete</button>
