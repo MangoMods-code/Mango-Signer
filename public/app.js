@@ -5,6 +5,7 @@ const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(
 const state = {
   tab: 'library', account: null, apps: [], categories: [], certs: [], signed: [], users: [], invites: [], settings: {}, server: {},
   sources: [], github: { connected: false }, tweaks: [], presets: [], substrate: { installed: false },
+  alerts: [], favorites: [], mySignins: [], securityLog: [],
   udidState: null,
   lib: { q: '', cat: 'all', sort: 'smart', select: false, selected: new Set(), limit: 40 },
 };
@@ -586,6 +587,12 @@ function render() {
   const actions = { library: isOwner() ? addAppSheet : null, certs: addCertSheet, users: newInviteSheet };
   top.innerHTML = actions[state.tab] ? ICONS.plus : '';
   top.onclick = actions[state.tab] || null;
+  top.classList.toggle('hidden', !actions[state.tab]);
+  const unread = state.alerts.filter((x) => !x.read).length;
+  $('#bellBtn').classList.toggle('hidden', !state.alerts.length);
+  $('#bellDot').classList.toggle('hidden', !unread);
+  $('#bellDot').textContent = unread > 9 ? '9+' : unread || '';
+  $('#bellBtn').onclick = alertsSheet;
   const view = $('#view');
   view.innerHTML = announcementHtml() + { library: renderLibrary, signed: renderSigned, certs: renderCerts, users: renderUsers, settings: renderSettings }[state.tab]();
   bindView(view);
@@ -608,6 +615,7 @@ function filteredApps() {
   }
   if (cat === 'featured') apps = apps.filter((a) => a.featured);
   else if (cat === 'installed') apps = apps.filter((a) => a.installed);
+  else if (cat === 'favorites') apps = apps.filter(isFav);
   else if (cat === 'updates') apps = apps.filter(hasUpdate);
   else if (cat === 'new') apps = apps.filter((a) => isNewApp(a) || isUpdatedApp(a));
   else if (cat === 'none') apps = apps.filter((a) => !a.categoryId || !catById(a.categoryId));
@@ -740,6 +748,7 @@ function libCount(key) {
   const A = state.apps;
   if (key === 'all') return A.length;
   if (key === 'installed') return A.filter((a) => a.installed).length;
+  if (key === 'favorites') return A.filter(isFav).length;
   if (key === 'updates') return A.filter(hasUpdate).length;
   if (key === 'new') return A.filter((a) => isNewApp(a) || isUpdatedApp(a)).length;
   if (key === 'featured') return A.filter((a) => a.featured).length;
@@ -757,7 +766,7 @@ function filterGroups() {
   const tags = [...new Set(state.apps.flatMap((a) => a.tags || []))].sort();
   const srcNames = [...new Set(state.apps.filter((a) => a.cloud === 'source' && a.sourceName).map((a) => a.sourceName))].sort();
   const g = [
-    { title: 'Show', items: [['all', '📱 All'], ['installed', '✓ Installed'], ['updates', '⬆ Updates'], ['new', '🆕 New'], ['featured', '★ Featured']] },
+    { title: 'Show', items: [['all', '📱 All'], ['favorites', '♥ Favorites'], ['installed', '✓ Installed'], ['updates', '⬆ Updates'], ['new', '🆕 New'], ['featured', '★ Featured']] },
     { title: 'Categories', items: state.categories.map((c) => [c.id, `${c.emoji} ${c.name}`]) },
     { title: 'Sources', items: srcNames.map((n) => [`src:${n}`, `☁ ${n}`]) },
     { title: 'Tags', items: tags.map((t) => [`tag:${t}`, `# ${t}`]) },
@@ -766,7 +775,7 @@ function filterGroups() {
   return g.map((x) => ({ ...x, items: x.items.filter(([k]) => k === 'all' || libCount(k) > 0 || (x.title === 'Categories' && isOwner())) })).filter((x) => x.items.length);
 }
 const filterLabel = (key) => (filterGroups().flatMap((x) => x.items).find(([k]) => k === key) || [key, key])[1];
-const PRIMARY_FILTERS = ['all', 'installed', 'updates', 'featured'];
+const PRIMARY_FILTERS = ['all', 'favorites', 'installed', 'updates', 'featured'];
 
 function filterSheet() {
   const cols = state.collections.filter((c) => c.appIds.some((x) => state.apps.some((a) => a.id === x)));
@@ -789,15 +798,16 @@ function filterSheet() {
 
 function renderLibrary() {
   const { q, cat, sort } = state.lib;
-  const primary = [['all', 'All'], ['installed', '✓ Installed'], ['updates', '⬆ Updates'], ['featured', '★ Featured']]
+  const primary = [['all', 'All'], ['favorites', '♥'], ['installed', '✓ Installed'], ['updates', '⬆ Updates'], ['featured', '★ Featured']]
     .filter(([k]) => k === 'all' || k === cat || libCount(k) > 0);
   const extraOn = !PRIMARY_FILTERS.includes(cat);
+  const certWarn = certBanner();
   const setup = !isOwner() && !state.certs.length
     ? `<p class="warning" data-act="go-certs" style="margin:0 0 12px;cursor:pointer">Add your certificate in the Certificates tab to start signing →</p>` : '';
   const view = libView();
-  return `${setup}
+  return `${setup}${certWarn}
     ${state.apps.length ? `
-    <div class="searchbar">${ICONS.search}<input type="search" id="libSearch" placeholder="Search ${state.apps.length} apps" value="${esc(q)}" autocapitalize="off" autocorrect="off"></div>
+    <div class="searchbar">${ICONS.search}<input type="search" id="libSearch" placeholder="Search ${state.apps.length} app${state.apps.length === 1 ? '' : 's'}" value="${esc(q)}" autocapitalize="off" autocorrect="off"></div>
     <div class="chips-row compact" id="libChips">
       ${primary.map(([k, l]) => `<button class="fchip ${cat === k ? 'on' : ''}" data-cat="${esc(k)}">${esc(l)}${k === 'all' ? '' : ` <span>${libCount(k)}</span>`}</button>`).join('')}
       ${extraOn ? `<button class="fchip on" data-act="clear-filter" aria-label="Clear filter">${esc(filterLabel(cat))} <span>${libCount(cat)}</span> ✕</button>` : ''}
@@ -996,9 +1006,9 @@ function renderUsers() {
         <div class="row" data-act="invite" data-id="${esc(i.code)}">
           <div class="row-main">
             <div class="row-title mono" style="font-size:16px">${esc(i.code)}</div>
-            <div class="row-sub">${esc(i.note || 'No note')} · ${i.uses}/${i.maxUses} used</div>
+            <div class="row-sub">${esc(i.note || 'No note')} · ${i.uses}/${i.maxUses} used${i.expiresAt && new Date(i.expiresAt) > new Date() ? ` · expires ${fmtDate(i.expiresAt)}` : ''}</div>
           </div>
-          ${i.uses >= i.maxUses ? '<span class="badge">Used up</span>' : '<span class="badge good">Active</span>'}
+          ${i.uses >= i.maxUses ? '<span class="badge">Used up</span>' : i.expiresAt && new Date(i.expiresAt) < new Date() ? '<span class="badge">Expired</span>' : '<span class="badge good">Active</span>'}
         </div>`).join('')}</div>`
     : `<div class="card"><p class="muted" style="margin:0 0 12px">Make an invite code and send it to someone so they can create an account.</p><button class="btn primary block" data-act="new-invite">New Invite</button></div>`;
   const users = state.users.length
@@ -1035,6 +1045,8 @@ function accountSection() {
       ${a.udid ? '<button class="row" data-act="copy-udid"><span class="row-main" style="font-weight:600">Copy my UDID</span></button><button class="row" data-act="unlink-device"><span class="row-main" style="color:var(--red);font-weight:600">Unlink iPhone</span></button>'
         : '<a class="row" href="/udid/profile.mobileconfig?intent=link" style="text-decoration:none"><span class="row-main" style="color:var(--mango);font-weight:600">Link this iPhone</span></a>'}
       ${!isOwner() ? '<button class="row" data-act="change-password"><span class="row-main" style="font-weight:600">Change Password</span></button>' : ''}
+      <button class="row" data-act="my-security"><span class="row-main" style="font-weight:600">🛡 Sign-ins &amp; security</span><span class="value muted">${state.mySignins.length ? esc(ago(state.mySignins[0].at)) : ''} ›</span></button>
+      ${!isOwner() && state.settings.signsPerDay ? `<div class="setting"><span>Signs today</span><span class="value">${state.settings.signsToday || 0} of ${state.settings.signsPerDay}</span></div>` : ''}
       ${state.server.passwordSet !== false ? '<button class="row" data-act="logout"><span class="row-main" style="color:var(--red);font-weight:600">Log Out</span></button>' : ''}
     </div>
     <p class="hint" style="margin:8px 4px 0">${a.udid ? 'Your iPhone can sign in without a password, and Mango checks whether it\'s in your profiles.' : 'Linking downloads a quick profile: open Settings › Profile Downloaded › Install, and you\'ll come back here.'}</p>
@@ -1097,6 +1109,10 @@ function renderSettings() {
       <div class="setting"><span>Signed apps kept per user</span>
         <select data-act="max-signed">${[3, 5, 10, 20, 50].map((n) => `<option value="${n}" ${n === Number(state.settings.maxSignedPerUser) ? 'selected' : ''}>${n}</option>`).join('')}</select>
       </div>
+      <div class="setting"><span>Signs per user per day<br><span class="hint">You can change it per person on their page</span></span>
+        <select data-act="signs-per-day">${[[0, 'No limit'], [3, '3'], [5, '5'], [10, '10'], [20, '20'], [50, '50']].map(([n, l]) => `<option value="${n}" ${n === Number(state.settings.signsPerDay || 0) ? 'selected' : ''}>${l}</option>`).join('')}</select>
+      </div>
+      <button class="row" data-act="security-log"><span class="row-main" style="font-weight:600">🛡 Security log</span><span class="value ${state.securityLog.some((e) => !e.ok && Date.now() - new Date(e.at) < 864e5) ? '' : 'muted'}" ${state.securityLog.some((e) => !e.ok && Date.now() - new Date(e.at) < 864e5) ? 'style="color:var(--red)"' : ''}>${state.securityLog.filter((e) => !e.ok && Date.now() - new Date(e.at) < 864e5).length ? `${state.securityLog.filter((e) => !e.ok && Date.now() - new Date(e.at) < 864e5).length} failed today` : ''} ›</span></button>
       <label class="setting"><span>Sign in with iPhone (UDID)</span>
         <span class="switch"><input type="checkbox" data-act="udid-login" ${state.settings.udidLogin ? 'checked' : ''}><span></span></span></label>
     </div>
@@ -1133,6 +1149,7 @@ function bindView(view) {
     }
     if (act === 'delete-after-install') { el.onchange = () => saveSetting({ deleteAfterInstall: el.checked }, el.checked ? 'Signed files are removed after installing' : 'Signed files are kept after installing'); return; }
     if (act === 'retention') { el.onchange = () => saveSetting({ signedRetentionDays: Number(el.value) }); return; }
+    if (act === 'signs-per-day') { el.onchange = () => saveSetting({ signsPerDay: Number(el.value) }, Number(el.value) ? `Limit: ${el.value} signs per day` : 'No daily limit'); return; }
     if (act === 'udid-login') { el.onchange = () => saveSetting({ udidLogin: el.checked }, el.checked ? 'iPhone sign-in on' : 'iPhone sign-in off'); return; }
     if (el.tagName === 'A') return;
     el.onclick = (e) => {
@@ -1150,6 +1167,8 @@ function bindView(view) {
         'manage-cols': manageCollectionsSheet,
         'add-source': addSourceSheet,
         tweaks: tweaksSheet,
+        'my-security': mySecuritySheet,
+        'security-log': securityLogSheet,
         dupes: duplicatesSheet,
         filters: filterSheet,
         'clear-filter': () => { state.lib.cat = 'all'; state.lib.limit = 40; saveLibPrefs(); render(); },
@@ -1431,6 +1450,102 @@ function moveToGithubSheet(ids, label) {
       await refresh().catch(() => {});
       ids && ids.length === 1 ? appSheet(ids[0]) : githubSheet();
     };
+  });
+}
+
+// ---------- favorites, alerts & security ----------
+const isFav = (a) => state.favorites.includes(a.id);
+
+// A heads-up at the top of the library when your default certificate is about to stop working.
+function certBanner() {
+  const c = state.certs.find((x) => x.isDefault) || state.certs[0];
+  if (!c) return '';
+  const left = daysLeft(certExpiry(c));
+  if (c.check && c.check.status === 'revoked') return `<p class="warning bad" data-act="go-certs" style="margin:0 0 12px;cursor:pointer">🚫 ${esc(c.label)} was revoked, so apps signed with it won't open. Add a new certificate →</p>`;
+  if (left !== null && left < 0) return `<p class="warning bad" data-act="go-certs" style="margin:0 0 12px;cursor:pointer">⚠️ ${esc(c.label)} has expired. Add a new certificate →</p>`;
+  if (left !== null && left <= 7) return `<p class="warning" data-act="go-certs" style="margin:0 0 12px;cursor:pointer">⏳ ${esc(c.label)} expires ${left === 0 ? 'today' : `in ${left} day${left === 1 ? '' : 's'}`}. Apps signed with it stop opening then →</p>`;
+  return '';
+}
+
+const ALERT_ICONS = { update: '⬆️', request: '🙋', cert: '🔐', security: '🔒', user: '👋', storage: '💾' };
+function alertsSheet() {
+  const list = state.alerts;
+  const unreadIds = list.filter((a) => !a.read).map((a) => a.id);
+  openSheet(`
+    <h2>🔔 Alerts</h2>
+    ${list.length ? `<div class="list">${list.map((a) => `
+      <button class="row alert-row ${a.read ? '' : 'unread'}" data-alert="${a.id}">
+        <span class="alert-ic">${ALERT_ICONS[a.kind] || '🔔'}</span>
+        <span class="row-main"><span class="row-title">${esc(a.title.replace(/^\p{Extended_Pictographic}\uFE0F?\s*/u, ''))}</span>${a.body ? `<span class="row-sub">${esc(a.body)}</span>` : ''}<span class="row-sub muted small">${ago(a.at)}</span></span>
+      </button>`).join('')}</div>
+      <button class="btn block" id="alClear" style="margin-top:12px">Clear all</button>` : '<div class="empty" style="padding:30px 10px"><h3>No alerts</h3><p>Updates to apps you installed, answers to your requests and certificate warnings show up here.</p></div>'}`, (el) => {
+    el.querySelectorAll('[data-alert]').forEach((b) => {
+      b.onclick = () => {
+        const a = list.find((x) => x.id === b.dataset.alert);
+        if (a.kind === 'update' && a.appId && state.apps.some((x) => x.id === a.appId)) return appSheet(a.appId);
+        if (a.kind === 'request' && a.appId && state.apps.some((x) => x.id === a.appId)) return appSheet(a.appId);
+        if (a.kind === 'request' && a.requestId && (state.requests || []).some((r) => r.id === a.requestId)) return requestSheet(a.requestId);
+        if (a.kind === 'cert') { closeSheet(); return switchTab('certs'); }
+        if (a.kind === 'user' && a.userId && state.users.some((u) => u.id === a.userId)) return userSheet(a.userId);
+        if (a.kind === 'security' && isOwner()) return securityLogSheet();
+        if (a.kind === 'storage') { closeSheet(); return switchTab('settings'); }
+      };
+    });
+    if ($('#alClear', el)) {
+      $('#alClear', el).onclick = async () => {
+        try { await api('DELETE', '/api/alerts'); state.alerts = []; closeSheet(); render(); toast('Cleared'); } catch (e) { toast(e.message, true); }
+      };
+    }
+  });
+  if (unreadIds.length) {
+    api('POST', '/api/alerts/read', { ids: unreadIds }).then(() => {
+      for (const a of state.alerts) if (unreadIds.includes(a.id)) a.read = true;
+      render();
+    }).catch(() => {});
+  }
+}
+
+const SIGNIN_LABEL = { login: 'Signed in', 'login-udid': 'Signed in with iPhone', 'signout-all': 'Signed out other devices', signup: 'Joined', locked: 'Locked' };
+function signinRow(e) {
+  return `<div class="row"><span class="alert-ic">${e.ok ? (e.type === 'signout-all' ? '🚪' : '✅') : '⛔'}</span>
+    <div class="row-main"><div class="row-title">${esc(e.ok ? SIGNIN_LABEL[e.type] || e.type : e.type === 'locked' ? 'Locked after wrong passwords' : 'Wrong password')}</div>
+      <div class="row-sub">${esc(e.device || '')}${e.ip ? ' · ' + esc(e.ip) : ''}</div><div class="row-sub muted small">${ago(e.at)}${e.detail && e.ok ? ' · ' + esc(e.detail) : ''}</div></div></div>`;
+}
+function mySecuritySheet() {
+  openSheet(`
+    <h2>🛡 Sign-ins &amp; security</h2>
+    <p class="muted small" style="margin-top:-6px">Recent sign-ins to your account. If you see one that wasn't you, sign out everywhere and ${isOwner() ? 'change APP_PASSWORD on Railway' : 'change your password'}.</p>
+    ${state.mySignins.length ? `<div class="list">${state.mySignins.map(signinRow).join('')}</div>` : '<p class="hint">No sign-ins recorded yet.</p>'}
+    <div class="actions" style="margin-top:12px">
+      <button class="btn block" id="msOut">Sign out everywhere else</button>
+      ${!isOwner() ? '<button class="btn block" id="msPw">Change Password</button>' : ''}
+    </div>
+    <p class="hint" style="margin:8px 4px 0">Signing out everywhere else keeps you signed in here. Accounts lock for 15 minutes after ${8} wrong passwords in a row.</p>`, (el) => {
+    $('#msOut', el).onclick = async () => {
+      if (!confirm('Sign out every other phone and browser?')) return;
+      try { await api('POST', '/api/account/signout-others'); toast('Signed out everywhere else'); await refresh(); mySecuritySheet(); } catch (e) { toast(e.message, true); }
+    };
+    if ($('#msPw', el)) $('#msPw', el).onclick = changePasswordSheet;
+  });
+}
+function securityLogSheet() {
+  const log = state.securityLog;
+  const failsToday = log.filter((e) => !e.ok && Date.now() - new Date(e.at) < 864e5);
+  openSheet(`
+    <h2>🛡 Security log</h2>
+    <p class="muted small" style="margin-top:-6px">Every sign-in, wrong password, lockout and new account, newest first.${failsToday.length ? ` <b style="color:var(--red)">${failsToday.length} failed in the last day.</b>` : ''}</p>
+    ${log.length ? `<div class="list">${log.slice(0, 120).map((e) => `
+      <div class="row"><span class="alert-ic">${e.ok ? (e.type === 'signup' ? '👋' : e.type === 'signout-all' ? '🚪' : '✅') : '⛔'}</span>
+        <div class="row-main"><div class="row-title">${esc(e.user)} <span class="muted small">${esc(e.ok ? SIGNIN_LABEL[e.type] || e.type : e.type === 'locked' ? 'locked' : 'failed')}</span></div>
+          <div class="row-sub">${esc(e.device || '')}${e.ip ? ' · ' + esc(e.ip) : ''}</div>
+          <div class="row-sub muted small">${ago(e.at)}${e.detail ? ' · ' + esc(e.detail) : ''}</div></div></div>`).join('')}</div>
+      <button class="btn block" id="slClear" style="margin-top:12px">Clear log</button>` : '<p class="hint">Nothing yet.</p>'}`, (el) => {
+    if ($('#slClear', el)) {
+      $('#slClear', el).onclick = async () => {
+        if (!confirm('Clear the security log?')) return;
+        try { await api('DELETE', '/api/security-log'); await refresh(); securityLogSheet(); } catch (e) { toast(e.message, true); }
+      };
+    }
   });
 }
 
@@ -1758,6 +1873,7 @@ function appSheet(appId) {
     ${shotList.length ? `<div class="shots">${shotList.map((src, i) => `<button class="shot" data-shot="${i}"><img class="fade-img" loading="lazy" referrerpolicy="no-referrer" onload="this.classList.add('loaded')" onerror="this.closest('.shot').remove()" src="${esc(src)}" alt="Screenshot ${i + 1}"></button>`).join('')}</div>` : ''}
 
     <div class="vote-row">
+      <button class="vote fav ${isFav(a) ? 'on' : ''}" id="aFav" aria-label="Favorite">${isFav(a) ? '♥' : '♡'}</button>
       <span class="muted small">Do you like it?</span>
       <button class="vote ${a.myVote > 0 ? 'on' : ''}" data-vote="1">👍 <b>${a.likes}</b></button>
       <button class="vote down ${a.myVote < 0 ? 'on' : ''}" data-vote="-1">👎 <b>${a.dislikes}</b></button>
@@ -1814,6 +1930,15 @@ function appSheet(appId) {
         runSign(a, { ...signOptsFromDefaults(a), versionIndex: Number(b.dataset.ver) }, { icon: null, dylibs: [] });
       };
     });
+    $('#aFav', el).onclick = async () => {
+      const on = !isFav(a);
+      try {
+        await api('POST', `/api/apps/${a.id}/favorite`, { on });
+        state.favorites = on ? [...state.favorites, a.id] : state.favorites.filter((x) => x !== a.id);
+        toast(on ? '♥ Added to Favorites' : 'Removed from Favorites');
+        appSheet(a.id); render();
+      } catch (e) { toast(e.message, true); }
+    };
     el.querySelectorAll('[data-vote]').forEach((b) => {
       b.onclick = async () => {
         const v = Number(b.dataset.vote);
@@ -3064,10 +3189,13 @@ function newInviteSheet() {
     <div class="field"><label>How many people can use it</label>
       <select id="iUses">${[1, 2, 5, 10, 25, 100].map((n) => `<option value="${n}">${n === 1 ? '1 person' : n + ' people'}</option>`).join('')}</select>
     </div>
+    <div class="field"><label>Expires</label>
+      <select id="iExp">${[[0, 'Never'], [1, 'In 1 day'], [7, 'In 7 days'], [30, 'In 30 days']].map(([n, l]) => `<option value="${n}" ${n === 7 ? 'selected' : ''}>${l}</option>`).join('')}</select>
+    </div>
     <button class="btn primary big block" id="iMake">Create Invite</button>`, (el) => {
     $('#iMake', el).onclick = async () => {
       try {
-        const { invite, signupUrl } = await api('POST', '/api/invites', { note: $('#iNote', el).value, maxUses: Number($('#iUses', el).value) });
+        const { invite, signupUrl } = await api('POST', '/api/invites', { note: $('#iNote', el).value, maxUses: Number($('#iUses', el).value), expiresDays: Number($('#iExp', el).value) });
         await refresh();
         showInvite(invite, signupUrl);
       } catch (e) { toast(e.message, true); }
@@ -3113,10 +3241,17 @@ function userSheet(uid) {
       <dt>Joined</dt><dd>${fmtDate(u.createdAt)}</dd>
       <dt>Last seen</dt><dd>${ago(u.lastLogin)}</dd>
       ${u.invite ? `<dt>Invite</dt><dd class="mono">${esc(u.invite)}</dd>` : ''}
+      <dt>Signs today</dt><dd>${u.signsToday || 0}</dd>
     </dl>
+    <div class="list" style="margin-top:12px">
+      <div class="setting"><span>Signs per day</span>
+        <select id="uLimit">${[['', `Everyone's limit (${Number(state.settings.signsPerDay) || 'none'})`], ['0', 'No limit'], ['3', '3'], ['5', '5'], ['10', '10'], ['20', '20'], ['50', '50']].map(([v, l]) => `<option value="${v}" ${String(u.signLimit ?? '') === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
+    </div>
+    ${(u.recentSignins || []).length ? `<div class="section-title">Recent sign-ins</div><div class="list">${u.recentSignins.map(signinRow).join('')}</div>` : ''}
     <div class="actions" style="margin-top:12px">
       ${u.udid ? '<button class="btn block" id="uCopy">Copy UDID</button>' : ''}
       <button class="btn block" id="uReset">Reset password</button>
+      <button class="btn block" id="uSignOut">Sign them out everywhere</button>
       ${u.udid ? '<button class="btn block" id="uUnlink">Unlink iPhone</button>' : ''}
       <button class="btn block" id="uToggle">${u.disabled ? 'Turn account on' : 'Turn account off'}</button>
       <button class="btn block danger" id="uDelete">Delete account</button>
@@ -3130,6 +3265,10 @@ function userSheet(uid) {
       if (pw) patch({ password: pw }, 'Password reset — they\'ll need to sign in again');
     };
     if ($('#uUnlink', el)) $('#uUnlink', el).onclick = () => patch({ unlinkDevice: true }, 'iPhone unlinked');
+    $('#uSignOut', el).onclick = () => patch({ signOut: true }, `${u.username} is signed out on every device`);
+    $('#uLimit', el).onchange = async (e) => {
+      try { await api('PATCH', `/api/users/${u.id}`, { signLimit: e.target.value === '' ? null : Number(e.target.value) }); await refresh(); toast('Saved'); } catch (err) { toast(err.message, true); }
+    };
     $('#uToggle', el).onclick = () => patch({ disabled: !u.disabled }, u.disabled ? 'Account turned on' : 'Account turned off');
     $('#uDelete', el).onclick = async () => {
       if (!confirm(`Delete ${u.username}? Their certificates and signed apps are removed too.`)) return;
@@ -3258,6 +3397,11 @@ async function boot() {
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && !$('#app').classList.contains('hidden') && $('#sheet').classList.contains('hidden') && !uploadFile.active) refresh().catch(() => {});
 });
+
+// Keep alerts and the library fresh while the app is open (skipped while a sheet or upload is open).
+setInterval(() => {
+  if (document.visibilityState === 'visible' && !$('#app').classList.contains('hidden') && $('#sheet').classList.contains('hidden') && !uploadFile.active) refresh().catch(() => {});
+}, 3 * 60_000);
 
 checkForUpdate();
 boot().catch((e) => toast(e.message, true));

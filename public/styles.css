@@ -657,3 +657,15 @@ html[data-accent="red"] { --mango: #ff5c5c; --mango-2: #ff9b9b; --accent-2: #f03
 .bulk-bar button.primary { background: var(--mango); color: var(--on-accent, #1b1205); }
 .row-main > span.row-title, .row-main > span.row-sub { display: block; }
 .fopt.zero { opacity: .55; }
+
+/* ---------- V1.6 alerts & security ---------- */
+.top-actions { display: flex; gap: 10px; align-items: center; }
+.icon-btn.bell { position: relative; font-size: 19px; line-height: 1; }
+.bell-dot { position: absolute; top: -3px; right: -3px; min-width: 18px; height: 18px; padding: 0 5px; box-sizing: border-box; border-radius: 9px; background: var(--red); color: #fff; font: 700 11px/18px -apple-system, system-ui, sans-serif; font-style: normal; text-align: center; box-shadow: 0 0 0 2px var(--bg); animation: pop .35s var(--spring, ease); }
+@keyframes pop { from { transform: scale(.3); } to { transform: scale(1); } }
+.alert-row { align-items: flex-start; text-align: left; }
+.alert-row.unread { background: rgba(255, 159, 28, .08); }
+.alert-row.unread .row-title::after { content: ''; display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--mango); margin-left: 8px; vertical-align: 2px; }
+.alert-ic { width: 34px; height: 34px; flex: none; display: grid; place-items: center; font-size: 20px; border-radius: 10px; background: var(--card-2); }
+.vote.fav { font-size: 18px; min-width: 44px; justify-content: center; }
+.vote.fav.on { color: #ff5c8a; border-color: rgba(255, 92, 138, .5); background: rgba(255, 92, 138, .12); }
