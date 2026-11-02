@@ -143,15 +143,21 @@ async def r_channel(q, body):
 
 
 async def r_posts(q, body):
-    """Newest-first list of posts that have a file. min_id = only posts after that id."""
+    """Newest-first list of posts that have a file.
+    min_id = only posts after that id; offset_id = only posts before that id (for paging back through history)."""
     e = await entity(q.get("ref", [""])[0])
     limit = max(1, min(400, int(q.get("limit", ["50"])[0])))
     min_id = int(q.get("min_id", ["0"])[0])
+    offset_id = int(q.get("offset_id", ["0"])[0])
     out = []
-    async for msg in client.iter_messages(e, limit=limit, min_id=min_id):
+    oldest = None
+    scanned = 0
+    async for msg in client.iter_messages(e, limit=limit, min_id=min_id, offset_id=offset_id):
+        scanned += 1
+        oldest = msg.id if oldest is None else min(oldest, msg.id)
         if msg.document:
             out.append(post_view(msg))
-    return {"posts": out}
+    return {"posts": out, "oldest": oldest, "scanned": scanned}
 
 
 async def r_messages(q, body):
