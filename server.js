@@ -471,7 +471,7 @@ function appView(a, acc) {
     extra.cloud = remote.kind; // 'link' | 'source' | 'github'
     extra.sourceName = src ? src.name : null;
     extra.missing = !!remote.missing;
-    extra.versions = (remote.versions || []).map((v) => ({ version: v.version, date: v.date, size: v.size, notes: (v.notes || '').slice(0, 400), channel: v.channel }));
+    extra.versions = (remote.kind === 'source' ? mergedVersions(a) : remote.versions || []).map((v) => ({ version: v.version, date: v.date, size: v.size, notes: (v.notes || '').slice(0, 400), channel: v.channel, manualId: v.manualId || undefined }));
     extra.remoteScreens = remote.screenshots || [];
     if (isOwner(acc)) extra.remoteUrl = remote.kind === 'github' ? null : remote.url;
   }
@@ -1138,6 +1138,10 @@ async function deleteApp(appId, { keepRemote = false } = {}) {
   const i = store.apps.findIndex((a) => a.id === appId);
   if (i < 0) return false;
   const app = store.apps[i];
+  if (!keepRemote) {
+    const gh = ghClient();
+    for (const v of app.manualVersions || []) if (gh && v.storage && v.storage.kind === 'github') await gh.deleteAsset(v.storage.assetId).catch(() => {});
+  }
   if (!keepRemote && app.remote && (app.remote.kind === 'github' || app.remote.ghAssetId)) {
     const gh = ghClient();
     if (gh) await gh.deleteAsset(app.remote.assetId || app.remote.ghAssetId).catch((e) => console.error('GitHub delete:', e.message));
@@ -1221,9 +1225,15 @@ function remoteDownload(app, versionIndex = 0) {
     if (!gh) throw httpError(400, 'GitHub storage is not connected. Reconnect it in Settings › GitHub storage.');
     return { ...gh.download(r.assetId), size: app.size, version: app.version };
   }
-  if (r.kind === 'source' && Array.isArray(r.versions) && r.versions.length) {
-    const v = r.versions[Math.min(versionIndex, r.versions.length - 1)];
-    return { url: v.url, headers: null, size: v.size || (versionIndex ? 0 : app.size), version: v.version };
+  if (r.kind === 'source' && (Array.isArray(r.versions) && r.versions.length || (app.manualVersions || []).length)) {
+    const list = mergedVersions(app);
+    const v = list[Math.min(versionIndex, list.length - 1)];
+    if (v.storage && v.storage.kind === 'github') {
+      const gh = ghClient();
+      if (!gh) throw httpError(400, 'This version is in your GitHub storage, which is not connected. Reconnect it in Settings › GitHub storage.');
+      return { ...gh.download(v.storage.assetId), size: v.size, version: v.version };
+    }
+    return { url: v.url || (v.storage && v.storage.url), headers: null, size: v.size || (versionIndex ? 0 : app.size), version: v.version };
   }
   return { url: r.url, headers: null, size: app.size, version: app.version };
 }
@@ -1373,7 +1383,10 @@ async function syncSource(src) {
   let added = 0, updated = 0;
   for (const s of parsed.apps) {
     seen.add(s.key);
-    const v = s.versions[0];
+    const existing = byKey.get(s.key);
+    if (existing) dropSupersededManual(existing, s.versions);
+    // Your own newer uploads (added with "Add a newer version") count as part of the source.
+    const v = existing ? mergedVersions(existing, s.versions)[0] : s.versions[0];
     const fields = {
       name: s.name, developer: s.developer, description: s.description,
       bundleId: s.bundleId, version: v.version, size: v.size, minOS: v.minOS,
@@ -1406,7 +1419,7 @@ async function syncSource(src) {
   }
   let removed = 0;
   for (const a of mine) {
-    if (!seen.has(a.remote.key)) { if (!a.remote.missing) removed++; a.remote.missing = true; } else delete a.remote.missing;
+    if (!seen.has(a.remote.key) && !(a.manualVersions || []).length) { if (!a.remote.missing) removed++; a.remote.missing = true; } else delete a.remote.missing;
   }
   Object.assign(src, {
     name: src.customName || parsed.name, iconURL: parsed.iconURL, subtitle: parsed.subtitle,
@@ -1513,7 +1526,8 @@ async function ghSync() {
   let added = 0, failed = [];
   for (const asset of assets) {
     if (byAsset.has(String(asset.id))) { byAsset.delete(String(asset.id)); continue; }
-    if (/^tg-/.test(asset.name) || store.apps.some((a) => a.remote && String(a.remote.ghAssetId) === String(asset.id))) continue; // a Telegram channel's copy
+    if (/^(tg|mv)-/.test(asset.name) || store.apps.some((a) => (a.remote && String(a.remote.ghAssetId) === String(asset.id))
+      || (a.manualVersions || []).some((v) => v.storage && String(v.storage.assetId) === String(asset.id)))) continue; // a channel copy or your newer version of a source app
     try {
       const dl = gh.download(asset.id);
       const meta = await inspectLink(dl.url, dl.headers);
@@ -2105,6 +2119,133 @@ route('POST', /^\/api\/apps\/auto-categorize$/, async (req, res, m, acc) => {
     job.result = result;
     job.status = 'done';
   })().catch((e) => { job.error = e.message; job.status = 'error'; });
+}, 'owner');
+
+// ----- your own newer versions of source apps -----
+// "Add a newer version" on a source app: your file goes to GitHub storage (or stays a link), becomes the
+// newest version, and the source's older versions stay pickable. If the source later posts that version
+// (or a newer one), the source takes over again and your copy is cleaned up.
+function versionCmp(a, b) {
+  const pa = String(a || '').split(/[^0-9]+/).filter(Boolean).map(Number);
+  const pb = String(b || '').split(/[^0-9]+/).filter(Boolean).map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d) return d;
+  }
+  return 0;
+}
+function mergedVersions(app, sourceVersions) {
+  const src = (sourceVersions || (app.remote && app.remote.versions) || []).map((v) => ({ ...v }));
+  const man = (app.manualVersions || [])
+    .filter((m) => !src.some((v) => versionCmp(v.version, m.version) === 0))
+    .map((m) => ({ version: m.version, date: m.date, size: m.size, minOS: m.minOS, notes: m.notes, channel: 'Added by you', storage: m.storage, url: m.storage && m.storage.url, manualId: m.id }));
+  return [...man, ...src].sort((x, y) => versionCmp(y.version, x.version) || String(y.date || '').localeCompare(String(x.date || '')));
+}
+function dropSupersededManual(app, sourceVersions) {
+  if (!(app.manualVersions || []).length) return;
+  const keep = [];
+  for (const m of app.manualVersions) {
+    if ((sourceVersions || []).some((v) => versionCmp(v.version, m.version) === 0)) {
+      if (m.storage && m.storage.kind === 'github') { const gh = ghClient(); if (gh) gh.deleteAsset(m.storage.assetId).catch(() => {}); }
+    } else keep.push(m);
+  }
+  app.manualVersions = keep;
+}
+function applyNewest(app) {
+  const newest = mergedVersions(app)[0];
+  if (!newest) return;
+  const locked = new Set(app.locked || []);
+  const old = app.versionOverride || app.version;
+  app.version = newest.version;
+  if (newest.size) app.size = newest.size;
+  if (newest.minOS) app.minOS = newest.minOS;
+  if (newest.notes && !locked.has('notes')) app.notes = newest.notes;
+  if (old !== app.version && versionCmp(app.version, old) > 0) {
+    app.previousVersion = old;
+    app.updatedAt = new Date().toISOString();
+    notifyUpdate(app, old);
+  }
+}
+
+route('POST', /^\/api\/apps\/([a-f0-9]{16})\/versions$/, async (req, res, m, acc) => {
+  const app = store.apps.find((a) => a.id === m[1]);
+  if (!app) return fail(res, 404, 'App not found');
+  if (!app.remote || app.remote.kind !== 'source') return fail(res, 400, 'Use "Update IPA" for apps that aren\'t from a source');
+  const b = await readJson(req);
+  const notes = String(b.notes || '').trim().slice(0, 1500);
+  let file = null, u = null;
+  if (b.uploadId) file = tmpPath(b.uploadId, acc);
+  else if (b.url) u = parseLink(b.url);
+  else return fail(res, 400, 'Pick an .ipa or paste a link');
+  const linkOnly = !file && b.linkOnly !== false;
+  const g = ghSettings();
+  if (!linkOnly && (!ghClient() || !g.releaseId)) {
+    if (file) await rmQuiet(file);
+    return fail(res, 400, 'Connect GitHub storage first (Settings › Cloud Library), or add it as a link');
+  }
+  const job = newJob(acc);
+  job.cancellable = true;
+  json(res, { jobId: job.id });
+  (async () => {
+    let tmp = file;
+    try {
+      let meta;
+      if (linkOnly) {
+        job.log.push(`Reading ${u.hostname}…`);
+        meta = await inspectLink(u.toString(), null, job);
+      } else {
+        if (!tmp) tmp = await downloadToTmp(u, job);
+        job.log.push('Reading app info…');
+        meta = await inspectOrFail(tmp);
+      }
+      // A different bundle ID is fine for mods, but a different bundle ID *and* name is almost surely the wrong file.
+      const sameName = [app.name, app.originalName].some((n) => normName(n) && (normName(n).includes(normName(meta.name)) || normName(meta.name).includes(normName(n))));
+      if (app.bundleId && meta.bundleId && meta.bundleId.toLowerCase() !== app.bundleId.toLowerCase() && !sameName && !b.force) {
+        throw new Error(`That file is ${meta.name} (${meta.bundleId}), not ${app.name}. Check you picked the right .ipa.`);
+      }
+      const all = mergedVersions(app);
+      if (all.some((v) => versionCmp(v.version, meta.version) === 0)) throw new Error(`Version ${meta.version} is already in the list`);
+      let storage;
+      if (linkOnly) storage = { kind: 'link', url: u.toString() };
+      else {
+        const gh = ghClient();
+        const size = (await fsp.stat(tmp)).size;
+        const safe = `mv-${(app.originalName || app.name).replace(/[^\w.\-]+/g, '_')}-${meta.version || 'v'}-${id().slice(0, 6)}.ipa`;
+        job.log.push(`Saving ${meta.version} to GitHub…`);
+        const asset = await gh.uploadAsset(g.releaseId, safe, tmp, size, (p) => { job.progress = p; }, job.signal);
+        job.progress = null;
+        storage = { kind: 'github', assetId: asset.id, name: asset.name };
+      }
+      app.manualVersions = [...(app.manualVersions || []), {
+        id: id(), version: meta.version || '?', build: meta.build || '', minOS: meta.minOS || '', size: meta.size || 0,
+        date: new Date().toISOString().slice(0, 10), notes, storage, addedAt: new Date().toISOString(),
+      }];
+      applyNewest(app);
+      store.save();
+      job.log.push(`✓ ${app.name} ${meta.version} added`);
+      job.result = { app: appView(app, acc) };
+      job.status = 'done';
+    } catch (e) {
+      job.error = job.cancelled ? 'Cancelled' : e.message;
+      job.status = 'error';
+    } finally {
+      if (tmp) await rmQuiet(tmp);
+    }
+  })();
+}, 'owner');
+
+route('DELETE', /^\/api\/apps\/([a-f0-9]{16})\/versions\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
+  const app = store.apps.find((a) => a.id === m[1]);
+  if (!app) return fail(res, 404, 'App not found');
+  const v = (app.manualVersions || []).find((x) => x.id === m[2]);
+  if (!v) return fail(res, 404, 'Version not found');
+  app.manualVersions = app.manualVersions.filter((x) => x.id !== m[2]);
+  if (v.storage && v.storage.kind === 'github') { const gh = ghClient(); if (gh) await gh.deleteAsset(v.storage.assetId).catch(() => {}); }
+  const before = app.version;
+  applyNewest(app);
+  if (app.version !== before) { app.previousVersion = null; app.updatedAt = new Date().toISOString(); }
+  store.save();
+  json(res, { app: appView(app, acc) });
 }, 'owner');
 
 // ----- Telegram channels -----
