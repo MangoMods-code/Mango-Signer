@@ -207,9 +207,19 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function waitJob(jobId, onUpdate) {
   waitJob.active = jobId;
   try {
+    let misses = 0;
     for (;;) {
       await sleep(900);
-      const j = await api('GET', `/api/jobs/${jobId}`);
+      let j;
+      try {
+        j = await api('GET', `/api/jobs/${jobId}`);
+        misses = 0;
+      } catch (e) {
+        // Phone locked or the app was in the background: the job keeps running on the server, so just try again.
+        if (/not found/i.test(e.message) || ++misses > 120) throw e;
+        await sleep(Math.min(10000, 1000 * misses));
+        continue;
+      }
       onUpdate && onUpdate(j);
       // Any "Cancel" button in the open sheet shows while the job can still be stopped.
       document.querySelectorAll('#sheetBody .job-cancel').forEach((b) => b.classList.toggle('hidden', !j.cancellable));
@@ -234,6 +244,7 @@ async function refresh() {
   const d = await api('GET', '/api/state');
   Object.assign(state, d);
   render();
+  if (!pollTasks.timer) pollTasks();
 }
 
 // ---------- helpers ----------
@@ -1483,19 +1494,27 @@ const readTgOptions = (el) => ({
 function tgRunSheet(title, jobId, back) {
   closeSheet.locked = true;
   $('#sheet').classList.add('locked');
-  openSheet(`<div class="progress-wrap"><div class="spinner"></div><h2 id="trTitle" style="margin:0 0 4px">${esc(title)}</h2><p class="muted small" id="trSub">This can take a while for big files</p><div class="bar hidden" id="trBar"><div></div></div><div class="log" id="trLog"></div>${cancelBtnHtml('Stop')}</div>`);
+  openSheet(`<div class="progress-wrap"><div class="spinner"></div><h2 id="trTitle" style="margin:0 0 4px">${esc(title)}</h2><p class="muted small" id="trSub">This can take a while for big files</p><p class="muted small" id="trCount"></p><div class="bar hidden" id="trBar"><div></div></div><div class="log" id="trLog"></div>${cancelBtnHtml('Stop')}
+    <button class="btn block" id="trBg" type="button" style="margin-top:8px">Keep going in the background</button>
+    <p class="hint center">It runs on your server, so you can leave the app or lock your phone. Check on it from the ⏳ button.</p></div>`);
+  $('#trBg', $('#sheetBody')).onclick = () => { closeSheet.locked = false; $('#sheet').classList.remove('locked'); tgRunSheet.detached = jobId; closeSheet(); pollTasks(true); };
   const body = $('#sheetBody');
+  tgRunSheet.detached = null;
   waitJob(jobId, (j) => {
+    if (tgRunSheet.detached === jobId || !document.body.contains(body) || !$('#trLog', body)) return;
+    if (j.counter) $('#trCount', body).textContent = `${j.counter.done.toLocaleString()}${j.counter.total ? ' / ' + j.counter.total.toLocaleString() : ''} ${j.counter.label}`;
     const log = $('#trLog', body);
     log.textContent = j.log.join('\n'); log.scrollTop = log.scrollHeight;
     if (j.progress != null) { $('#trBar', body).classList.remove('hidden'); $('#trBar > div', body).style.width = `${Math.round(j.progress * 100)}%`; } else $('#trBar', body).classList.add('hidden');
   }).then(async (r) => {
+    if (tgRunSheet.detached === jobId) return refresh().catch(() => {});
     closeSheet.locked = false; $('#sheet').classList.remove('locked');
     await refresh().catch(() => {});
-    const bits = [r.added && `${r.added} new`, r.updated && `${r.updated} updated`, r.same && `${r.same} already had`, r.older && `${r.older} older skipped`, r.removed && `${r.removed} removed`, r.failed && `${r.failed} failed`].filter(Boolean);
+    const bits = [r.added && `${r.added} new`, r.updated && `${r.updated} updated`, (r.same || r.known) && `${(r.same || 0) + (r.known || 0)} already had`, r.older && `${r.older} older skipped`, r.removed && `${r.removed} removed`, r.failed && `${r.failed} failed`].filter(Boolean);
     toast(bits.length ? bits.join(' · ') : 'Nothing new', !!r.failed && !r.added && !r.updated);
     back();
   }).catch(async (e) => {
+    if (tgRunSheet.detached === jobId) return refresh().catch(() => {});
     closeSheet.locked = false; $('#sheet').classList.remove('locked');
     await refresh().catch(() => {});
     if (e.cancelled) { toast('Stopped. Apps that finished importing were kept.'); return back(); }
@@ -1513,6 +1532,10 @@ function tgScanSheet(src) {
     <div class="field"><label>How far back</label>
       <select id="dsCount">${sizes.map(([n, l]) => `<option value="${n}" ${n === 100 ? 'selected' : ''}>${l}</option>`).join('')}</select>
       <div class="hint">${src.deepest ? `Last deep scan went back ${src.deepest} posts. ` : ''}Bigger scans take longer, and you can stop any time. Apps found so far are kept.</div></div>
+    <div class="group">
+      ${toggle('dsQuick', 'Quick mode', 'Skips older reposts of the same app by file name, without opening them. Much faster on big channels.', true)}
+      ${toggle('dsRecheck', 'Re-check posts already checked', 'Off = posts looked at in an earlier scan are skipped instantly', false)}
+    </div>
     ${src.options && src.options.keywords ? `<p class="hint">Only posts that mention: ${esc(src.options.keywords)} (change this in the channel's settings).</p>` : ''}
     ${src.options && src.options.storage === 'github' ? '<p class="warning">This channel copies files to GitHub, so a big scan can take a long time. Switch it to "On Telegram" in the channel settings first if you want it fast.</p>' : ''}
     <button class="btn primary big block" id="dsGo">Start scanning</button>
@@ -1520,7 +1543,7 @@ function tgScanSheet(src) {
     $('#dsBack', el).onclick = () => tgChannelSheet(src.id);
     $('#dsGo', el).onclick = async () => {
       try {
-        const { jobId } = await api('POST', `/api/sources/${src.id}/scan`, { count: Number($('#dsCount', el).value) });
+        const { jobId } = await api('POST', `/api/sources/${src.id}/scan`, { count: Number($('#dsCount', el).value), quick: $('#dsQuick', el).checked, recheck: $('#dsRecheck', el).checked });
         tgRunSheet(`Scanning ${src.name}…`, jobId, () => tgChannelSheet(src.id));
       } catch (e) { toast(e.message, true); }
     };
@@ -1886,6 +1909,71 @@ function backupSheet() {
         box.innerHTML = `<p class="muted small center">Restored ${r.apps} apps and ${r.users} users. Restarting…</p>`;
         setTimeout(() => location.reload(), 9000);
       } catch (e) { box.innerHTML = ''; toast(e.message, true); }
+    };
+  });
+}
+
+// ---------- background tasks ----------
+// Scans, imports and signing run on the server. This little ⏳ button shows what's still going,
+// so you can leave the app and check back later.
+async function pollTasks(force) {
+  clearTimeout(pollTasks.timer);
+  if (!state.account) return;
+  try {
+    const { jobs } = await api('GET', '/api/jobs');
+    state.tasks = jobs;
+  } catch { /* offline: try again later */ }
+  drawTaskPill();
+  const active = (state.tasks || []).some((j) => ['running', 'queued'].includes(j.status));
+  // While a channel scan is adding apps, refresh the library now and then so new apps show up.
+  if (active && state.tasks.some((j) => /^(Scanning|Checking)/.test(j.title) && j.status === 'running') && $('#sheet').classList.contains('hidden') && Date.now() - (pollTasks.lastRefresh || 0) > 20000) {
+    pollTasks.lastRefresh = Date.now();
+    api('GET', '/api/state').then((d) => { Object.assign(state, d); render(); }).catch(() => {});
+  }
+  pollTasks.timer = active || force ? setTimeout(() => pollTasks(), active ? 4000 : 15000) : null;
+}
+function drawTaskPill() {
+  let pill = $('#taskPill');
+  if (!pill) {
+    pill = document.createElement('button');
+    pill.id = 'taskPill';
+    pill.className = 'task-pill hidden';
+    pill.onclick = tasksSheet;
+    document.body.appendChild(pill);
+  }
+  const active = (state.tasks || []).filter((j) => ['running', 'queued'].includes(j.status));
+  pill.classList.toggle('hidden', !active.length);
+  if (!active.length) return;
+  const j = active[0];
+  const pct = j.progress != null ? ` ${Math.round(j.progress * 100)}%` : j.counter ? ` ${j.counter.done.toLocaleString()}${j.counter.total ? '/' + j.counter.total.toLocaleString() : ''}` : '';
+  pill.innerHTML = `<span class="mini-spin"></span><span>${esc(j.title)}${pct}${active.length > 1 ? ` · +${active.length - 1}` : ''}</span>`;
+  if ($('#sheetBody .tasks-list')) tasksSheet(true);
+}
+function tasksSheet(redraw) {
+  const list = state.tasks || [];
+  const html = `
+    <h2>⏳ Running on your server</h2>
+    <p class="muted small" style="margin-top:-6px">These keep going even if you close the app.</p>
+    <div class="list tasks-list">${list.map((j) => `
+      <div class="row task-row">
+        <div class="row-main">
+          <div class="row-title">${esc(j.title)} <span class="badge ${j.status === 'done' ? 'good' : j.status === 'error' ? 'bad' : ''}">${{ running: 'Running', queued: 'Waiting', done: 'Done', error: 'Failed', cancelled: 'Stopped' }[j.status] || j.status}</span></div>
+          ${j.counter ? `<div class="row-sub">${j.counter.done.toLocaleString()}${j.counter.total ? ' / ' + j.counter.total.toLocaleString() : ''} ${esc(j.counter.label)}</div>` : ''}
+          ${j.progress != null && j.status === 'running' ? `<div class="bar" style="margin:6px 0 2px"><div style="width:${Math.round(j.progress * 100)}%"></div></div>` : ''}
+          <div class="row-sub">${esc(j.error || j.last || '')}</div>
+          <div class="row-sub muted small">started ${ago(new Date(j.started).toISOString())}</div>
+        </div>
+        ${j.cancellable && j.status === 'running' ? `<button class="pill danger-pill" data-stop="${j.id}">Stop</button>` : ''}
+      </div>`).join('') || '<p class="hint">Nothing running right now.</p>'}</div>`;
+  if (redraw === true && $('#sheetBody .tasks-list')) { $('#sheetBody').innerHTML = html; bindTasks($('#sheetBody')); return; }
+  openSheet(html, bindTasks);
+  pollTasks(true);
+}
+function bindTasks(el) {
+  el.querySelectorAll('[data-stop]').forEach((b) => {
+    b.onclick = async () => {
+      b.disabled = true;
+      try { await api('POST', `/api/jobs/${b.dataset.stop}/cancel`); toast('Stopping…'); pollTasks(true); } catch (e) { toast(e.message, true); }
     };
   });
 }

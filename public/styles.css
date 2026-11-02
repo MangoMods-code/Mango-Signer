@@ -693,3 +693,15 @@ html[data-accent="red"] { --mango: #ff5c5c; --mango-2: #ff9b9b; --accent-2: #f03
 .log { max-height: 45vh; overflow-wrap: anywhere; word-break: normal; }
 .job-cancel { color: var(--red); }
 .link-btn.inline { display: inline; padding: 0; margin: 0 0 0 4px; font-size: inherit; }
+
+/* ---------- V1.7.5 background tasks ---------- */
+.task-pill {
+  position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(88px + var(--safe-b, 0px)); z-index: 15;
+  display: flex; align-items: center; gap: 10px; max-width: calc(100% - 32px); padding: 9px 16px 9px 10px;
+  border: 1px solid var(--line); border-radius: 999px; background: var(--card); color: var(--text);
+  font: 600 13px/1.2 inherit; box-shadow: 0 8px 26px rgba(0, 0, 0, .35); cursor: pointer;
+}
+.task-pill span:last-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.task-pill .mini-spin { width: 18px; height: 18px; border-width: 2.5px; }
+.task-row { align-items: flex-start; }
+.task-row .bar { height: 6px; }
