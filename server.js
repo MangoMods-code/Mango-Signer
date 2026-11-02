@@ -22,6 +22,7 @@ const macho = require('./lib/macho');
 const deb = require('./lib/deb');
 const zipLib = require('./lib/zip');
 const telegram = require('./lib/telegram');
+const appstore = require('./lib/appstore');
 
 const WHATS_NEW = require('./lib/whats-new');
 const VERSION = WHATS_NEW[0].version; // the real version of this code
@@ -1080,8 +1081,8 @@ route('PATCH', /^\/api\/apps\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
   const app = store.apps.find((a) => a.id === m[1]);
   if (!app) return fail(res, 404, 'App not found');
   const b = await readJson(req);
-  if (app.remote && app.remote.kind === 'source') {
-    // Remember what you changed so the next source sync doesn't undo it.
+  {
+    // Remember what you changed so the next source/channel sync or auto-categorize doesn't undo it.
     const changed = ['name', 'description', 'developer', 'notes', 'published', 'categoryId'].filter((k) => b[k] !== undefined && b[k] !== app[k]);
     if (changed.length) lockFields(app, changed);
   }
@@ -1455,7 +1456,7 @@ route('PATCH', /^\/api\/sources\/([a-f0-9]{16})$/, async (req, res, m) => {
   if (typeof b.name === 'string' && b.name.trim()) { src.customName = b.name.trim().slice(0, 60); src.name = src.customName; }
   if (src.kind === 'telegram') {
     if (b.options) src.options = cleanTgOptions(b.options, src.options);
-    if (b.categoryId !== undefined) src.categoryId = b.categoryId && catExists(b.categoryId) ? b.categoryId : null;
+    if (b.categoryId !== undefined) src.categoryId = ['__auto', '__none'].includes(b.categoryId) ? b.categoryId : b.categoryId && catExists(b.categoryId) ? b.categoryId : '__auto';
   }
   store.save();
   json(res, { source: sourceView(src) });
@@ -2030,6 +2031,72 @@ route('DELETE', /^\/api\/presets\/([a-f0-9]{16})$/, async (req, res, m, acc) => 
   json(res, { ok: true });
 });
 
+// ----- automatic categories -----
+// Your keyword rules win; otherwise the App Store's category is used (Games, Social Networking, …).
+const AS_TTL = 30 * 864e5;
+async function appStoreInfo(app) {
+  const key = (app.bundleId || '').toLowerCase() || 'name:' + String(app.originalName || app.name).toLowerCase();
+  const cache = (store.data.appStoreCache = store.data.appStoreCache || {});
+  const hit = cache[key];
+  if (hit && Date.now() - hit.at < (hit.data ? AS_TTL : 3 * 864e5)) return hit.data;
+  const data = await appstore.lookup({ bundleId: app.bundleId, name: app.originalName || app.name }).catch(() => null);
+  cache[key] = { at: Date.now(), data };
+  const keys = Object.keys(cache);
+  if (keys.length > 3000) for (const k of keys.slice(0, keys.length - 3000)) delete cache[k];
+  return data;
+}
+function ruleCategory(text) {
+  const t = ` ${String(text || '').toLowerCase()} `;
+  for (const r of store.settings.catRules || []) {
+    if (!store.categories.some((c) => c.id === r.categoryId)) continue;
+    if (r.words.split(',').map((w) => w.trim()).filter(Boolean).some((w) => t.includes(w))) return r.categoryId;
+  }
+  return null;
+}
+async function autoCategory(app, extraText = '') {
+  const byRule = ruleCategory(`${app.name} ${app.originalName || ''} ${app.fileName || ''} ${extraText}`);
+  const info = await appStoreInfo(app);
+  if (byRule) return { categoryId: byRule, info, how: 'rule' };
+  if (info && info.genre) return { categoryId: categoryIdFor(info.genre), info, how: 'appstore' };
+  return { categoryId: null, info, how: null };
+}
+
+route('POST', /^\/api\/apps\/auto-categorize$/, async (req, res, m, acc) => {
+  const b = await readJson(req);
+  const list = store.apps.filter((a) => (Array.isArray(b.ids) ? b.ids.includes(a.id) : true)
+    && (b.all || !a.categoryId || !store.categories.some((c) => c.id === a.categoryId))
+    && !(a.locked || []).includes('categoryId'));
+  const job = newJob(acc);
+  json(res, { jobId: job.id, count: list.length });
+  (async () => {
+    const result = { sorted: 0, byRule: 0, byAppStore: 0, unknown: 0, filled: 0 };
+    for (const [i, app] of list.entries()) {
+      job.progress = list.length ? i / list.length : 1;
+      const r = await autoCategory(app, app.notes || '');
+      if (r.categoryId && r.categoryId !== app.categoryId) {
+        app.categoryId = r.categoryId;
+        result.sorted++;
+        if (r.how === 'rule') result.byRule++; else result.byAppStore++;
+        job.log.push(`${app.name} → ${(store.categories.find((c) => c.id === r.categoryId) || {}).name}`);
+      } else if (!r.categoryId) { result.unknown++; job.log.push(`${app.name}: not found`); }
+      // Fill in blanks from the App Store while we're at it.
+      if (r.info && b.fill !== false) {
+        let filled = false;
+        if (!app.developer && r.info.developer && !(app.locked || []).includes('developer')) { app.developer = r.info.developer.slice(0, 80); filled = true; }
+        if (!app.description && r.info.description && !(app.locked || []).includes('description')) { app.description = r.info.description.slice(0, 1500); filled = true; }
+        if (app.remote && !(app.remote.screenshots || []).length && r.info.screenshots.length && !(app.screenshots || []).length) { app.remote.screenshots = r.info.screenshots; filled = true; }
+        if (filled) result.filled++;
+      }
+      if (i % 10 === 9) store.save();
+      if (r.info === undefined) await new Promise((x) => setTimeout(x, 50));
+    }
+    store.save();
+    job.progress = 1;
+    job.result = result;
+    job.status = 'done';
+  })().catch((e) => { job.error = e.message; job.status = 'error'; });
+}, 'owner');
+
 // ----- Telegram channels -----
 // Mango signs in to Telegram as you (through lib/telegram_helper.py) and watches channels for new .ipa posts.
 // Files stay on Telegram (or get copied to your GitHub storage) — nothing is kept on this server.
@@ -2159,6 +2226,11 @@ async function tgImportPost(src, post, job) {
     for (const [k, val] of Object.entries(metaFields(meta))) if (!locked.has(k)) app[k] = val;
     if (notes && !locked.has('notes')) app.notes = notes;
     if (meta.icon && !app.customIcon) await fsp.writeFile(path.join(dirs.apps, app.id + '.png'), meta.icon);
+    if (old && old.screenshots) remote.screenshots = old.screenshots;
+    if ((!app.categoryId || !catExists(app.categoryId)) && !locked.has('categoryId') && (!src.categoryId || src.categoryId === '__auto')) {
+      const r = await autoCategory(app, post.text);
+      if (r.categoryId) app.categoryId = r.categoryId;
+    }
     Object.assign(app, { remote, previousVersion: oldShown, updatedAt: new Date().toISOString(), versionOverride: locked.has('versionOverride') ? app.versionOverride : null });
     // The old copy isn't needed anymore.
     const gh = ghClient();
@@ -2174,6 +2246,16 @@ async function tgImportPost(src, post, job) {
     description: cleanCaption(lines.slice(0, 12).join('\n')).slice(0, 600), notes,
     published: src.showInLibrary !== false, categoryId: src.categoryId && catExists(src.categoryId) ? src.categoryId : null,
   });
+  if (!src.categoryId || src.categoryId === '__auto') {
+    const r = await autoCategory(rec, post.text);
+    rec.categoryId = r.categoryId;
+    if (r.info) {
+      rec.developer = r.info.developer.slice(0, 80);
+      if (r.info.description) rec.description = r.info.description;
+      remote.screenshots = r.info.screenshots;
+    }
+    if (r.categoryId) job.log.push(`  → ${(store.categories.find((c) => c.id === r.categoryId) || {}).name}${r.how === 'rule' ? ' (your rule)' : ' (App Store)'}`);
+  }
   if (meta.icon) await fsp.writeFile(path.join(dirs.apps, rec.id + '.png'), meta.icon);
   store.apps.unshift(rec);
   job.log.push(`+ ${rec.name} ${rec.version}`);
@@ -2255,7 +2337,7 @@ route('POST', /^\/api\/telegram\/channels$/, async (req, res, m, acc) => {
   if (store.sources.some((x) => x.kind === 'telegram' && String(x.ref).toLowerCase() === ref.toLowerCase())) return fail(res, 400, 'That channel is already added');
   const src = {
     id: id(), kind: 'telegram', ref, url: ch.username ? `https://t.me/${ch.username}` : '', name: ch.title, username: ch.username,
-    showInLibrary: b.showInLibrary !== false, categoryId: b.categoryId && catExists(b.categoryId) ? b.categoryId : null,
+    showInLibrary: b.showInLibrary !== false, categoryId: ['__auto', '__none'].includes(b.categoryId) ? b.categoryId : b.categoryId && catExists(b.categoryId) ? b.categoryId : '__auto',
     options: cleanTgOptions(b.options), addedAt: new Date().toISOString(), lastMsgId: 0,
   };
   store.sources.push(src);
@@ -2914,6 +2996,12 @@ route('PATCH', /^\/api\/settings$/, async (req, res) => {
   if (b.deleteAfterInstall !== undefined) store.settings.deleteAfterInstall = !!b.deleteAfterInstall;
   if (b.signedRetentionDays !== undefined) store.settings.signedRetentionDays = Math.min(365, Math.max(0, Number(b.signedRetentionDays) || 0));
   if (b.lastBackup) store.settings.lastBackup = new Date().toISOString();
+  if (Array.isArray(b.catRules)) {
+    store.settings.catRules = b.catRules.slice(0, 40).map((r) => ({
+      words: String(r.words || '').split(',').map((w) => w.trim().toLowerCase()).filter(Boolean).slice(0, 20).join(', '),
+      categoryId: store.categories.some((c) => c.id === r.categoryId) ? r.categoryId : null,
+    })).filter((r) => r.words && r.categoryId);
+  }
   if (b.signsPerDay !== undefined) store.settings.signsPerDay = Math.min(500, Math.max(0, Number(b.signsPerDay) || 0));
   store.save();
   const { github: _gh, ...settings } = store.settings;
