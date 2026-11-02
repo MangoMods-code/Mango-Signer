@@ -9,6 +9,8 @@ Upload an `.ipa`, add a `.p12` + `.mobileprovision`, tap **Sign**, then **Instal
 - **App Library** – the owner uploads apps (or imports from a link); invited users browse, search, sign and install them
 - **Organization** – categories with emoji, featured apps, search, sorting, bulk select, full app editing, Update IPA, and default sign settings per app
 - **Cloud Library** – add AltStore/SideStore/ESign-style sources, link-only apps, or keep your own IPAs in a (private) GitHub repo's release, so app files don't sit on your Railway volume. Files are downloaded only while signing and deleted right after. Older versions from sources can be picked when signing
+- **Telegram channels** – sign in once and Mango watches channels you pick: new `.ipa` posts are added to the library (or update the existing app), kept as links on Telegram or copied to your GitHub storage
+- **Owner tools** – stats & activity, message everyone, one-tap backup & restore
 - **Tweaks** – a tweaks library (jailbreak `.deb` or `.dylib`), per-app default tweaks, automatic CydiaSubstrate/ElleKit bundling for tweaks that need it
 - **Presets & batch signing** – save sign settings as presets, select several apps and Get them all at once, import certificates from a `.zip`
 - **Alerts & security** – 🔔 alerts inbox (updates, requests, certificate expiry and revokes, new users, lockouts, low storage), ♥ favorites, security log, account lockout, sign out everywhere, expiring invites, daily sign limits
@@ -45,6 +47,12 @@ The owner signs in with the password only (leave username blank). Everyone else 
 3. In Mango go to **Settings › Cloud Library › GitHub storage**, enter `owner/repo` and the token.
 
 Mango creates a release tagged `mango-library` and keeps each app as a release asset (up to 2 GB each). You can also drop `.ipa` files onto that release on github.com and tap **Sync**. The token is stored encrypted and never sent to the browser.
+
+## Telegram channels (optional)
+Uses [Telethon](https://github.com/LonamiWebs/Telethon) (MIT), installed in the Docker build.
+1. On my.telegram.org › **API development tools**, create an app and copy its **api_id** and **api_hash**.
+2. In Mango go to **Settings › Cloud Library › ✈️ Telegram channels**, enter them with your phone number, then the code Telegram sends you (and your two-step password if you use one).
+3. Tap **Add a channel** and paste its @username or t.me link. Each channel has its own settings: where files live (Telegram or GitHub), whether it may update apps you uploaded yourself, matching by name, keyword filter, and automatic checks every 10 minutes.
 
 ## Notes
 - JIT can't be switched on from a website; signing with **JIT support** lets tools like StikDebug attach to the app.

@@ -21,6 +21,7 @@ const github = require('./lib/github');
 const macho = require('./lib/macho');
 const deb = require('./lib/deb');
 const zipLib = require('./lib/zip');
+const telegram = require('./lib/telegram');
 
 const WHATS_NEW = require('./lib/whats-new');
 const VERSION = WHATS_NEW[0].version; // the real version of this code
@@ -779,6 +780,7 @@ route('GET', /^\/api\/state$/, async (req, res, m, acc) => {
     out.invites = store.invites;
     out.sources = store.sources.map(sourceView);
     out.github = ghView();
+    out.telegram = tgView();
     out.securityLog = store.securityLog.slice(-200).reverse();
     out.server = { ...out.server, zsign: zsignVersion, passwordSet: !!APP_PASSWORD, storage: await storageUsed(), storageBreakdown: await storageBreakdown(), disk: diskInfo() };
   } else {
@@ -1004,6 +1006,7 @@ route('POST', /^\/api\/apps\/([a-f0-9]{16})\/replace$/, async (req, res, m, acc)
   if (!app) return fail(res, 404, 'App not found');
   const { uploadId, url, linkOnly } = await readJson(req);
   if (app.remote && app.remote.kind === 'source') return fail(res, 400, 'Apps from a source update themselves when the source does');
+  if (app.remote && app.remote.kind === 'telegram') return fail(res, 400, 'Apps from a Telegram channel update themselves when the channel posts a new version');
   if (uploadId) {
     const oldRemote = app.remote;
     delete app.remote;
@@ -1127,9 +1130,9 @@ async function deleteApp(appId, { keepRemote = false } = {}) {
   const i = store.apps.findIndex((a) => a.id === appId);
   if (i < 0) return false;
   const app = store.apps[i];
-  if (!keepRemote && app.remote && app.remote.kind === 'github') {
+  if (!keepRemote && app.remote && (app.remote.kind === 'github' || app.remote.ghAssetId)) {
     const gh = ghClient();
-    if (gh) await gh.deleteAsset(app.remote.assetId).catch((e) => console.error('GitHub delete:', e.message));
+    if (gh) await gh.deleteAsset(app.remote.assetId || app.remote.ghAssetId).catch((e) => console.error('GitHub delete:', e.message));
   }
   store.apps.splice(i, 1);
   for (const suffix of ['.ipa', '.png', '-custom.png']) await rmQuiet(path.join(dirs.apps, appId + suffix));
@@ -1177,7 +1180,7 @@ route('GET', /^\/api\/apps\/([a-f0-9]{16})\/download$/, async (req, res, m) => {
   const app = store.apps.find((a) => a.id === m[1]);
   if (!app) return fail(res, 404, 'App not found');
   if (app.remote) {
-    const dl = remoteDownload(app);
+    const dl = await resolveDownload(remoteDownload(app));
     if (!dl.headers) { res.writeHead(302, { Location: dl.url }); return res.end(); }
     // Private GitHub file: pass it through so the token stays on the server.
     const r = await fetchAuthed(dl.url, dl.headers);
@@ -1196,6 +1199,15 @@ route('GET', /^\/api\/apps\/([a-f0-9]{16})\/download$/, async (req, res, m) => {
 // Link-only apps keep just a download link (and a small icon). The .ipa is fetched only while signing.
 function remoteDownload(app, versionIndex = 0) {
   const r = app.remote;
+  if (r.kind === 'telegram') {
+    if (r.ghAssetId) {
+      const gh = ghClient();
+      if (!gh) throw httpError(400, 'GitHub storage is not connected. Reconnect it in Settings › GitHub storage.');
+      return { ...gh.download(r.ghAssetId), size: app.size, version: app.version };
+    }
+    if (!tgReady()) throw httpError(400, 'Telegram is not connected, so apps from Telegram channels can\'t be downloaded. Connect it in Settings › Telegram.');
+    return { telegram: { ref: r.ref, msgId: r.msgId }, size: app.size, version: app.version };
+  }
   if (r.kind === 'github') {
     const gh = ghClient();
     if (!gh) throw httpError(400, 'GitHub storage is not connected. Reconnect it in Settings › GitHub storage.');
@@ -1206,6 +1218,13 @@ function remoteDownload(app, versionIndex = 0) {
     return { url: v.url, headers: null, size: v.size || (versionIndex ? 0 : app.size), version: v.version };
   }
   return { url: r.url, headers: null, size: app.size, version: app.version };
+}
+
+// Telegram files get a fresh local URL each time (the helper may have restarted on a new port).
+async function resolveDownload(dl) {
+  if (!dl.telegram) return dl;
+  const f = await tg.file(dl.telegram.ref, dl.telegram.msgId);
+  return { ...dl, url: f.url, headers: f.headers };
 }
 
 // Fetches a link that may need a login header. The header is only sent to the first address:
@@ -1245,6 +1264,10 @@ async function fetchToFile(url, headers, dest, job, label) {
   } catch (e) {
     await rmQuiet(dest);
     throw e;
+  }
+  if (total && got < total) {
+    await rmQuiet(dest);
+    throw new Error(`The download stopped early (${gb(got)} of ${gb(total)}). Try again.`);
   }
   return got;
 }
@@ -1403,9 +1426,14 @@ route('POST', /^\/api\/sources$/, async (req, res) => {
   }
 }, 'owner');
 
-route('POST', /^\/api\/sources\/([a-f0-9]{16})\/sync$/, async (req, res, m) => {
+route('POST', /^\/api\/sources\/([a-f0-9]{16})\/sync$/, async (req, res, m, acc) => {
   const src = store.sources.find((x) => x.id === m[1]);
   if (!src) return fail(res, 404, 'Source not found');
+  if (src.kind === 'telegram') {
+    if (!tgReady()) return fail(res, 400, 'Connect Telegram first');
+    if (req.url.includes('rescan=1')) { src.lastMsgId = 0; src.failures = {}; }
+    return json(res, { jobId: tgSync(src, acc).id, source: sourceView(src) });
+  }
   try {
     const result = await syncSource(src);
     json(res, { source: sourceView(src), result });
@@ -1425,6 +1453,10 @@ route('PATCH', /^\/api\/sources\/([a-f0-9]{16})$/, async (req, res, m) => {
     for (const a of store.apps) if (a.remote && a.remote.sourceId === src.id && !(a.locked || []).includes('published')) a.published = b.showInLibrary;
   }
   if (typeof b.name === 'string' && b.name.trim()) { src.customName = b.name.trim().slice(0, 60); src.name = src.customName; }
+  if (src.kind === 'telegram') {
+    if (b.options) src.options = cleanTgOptions(b.options, src.options);
+    if (b.categoryId !== undefined) src.categoryId = b.categoryId && catExists(b.categoryId) ? b.categoryId : null;
+  }
   store.save();
   json(res, { source: sourceView(src) });
 }, 'owner');
@@ -1440,7 +1472,7 @@ route('DELETE', /^\/api\/sources\/([a-f0-9]{16})$/, async (req, res, m) => {
 
 // Keep sources fresh: check them every 6 hours.
 setInterval(async () => {
-  for (const src of store.sources) {
+  for (const src of store.sources.filter((x) => x.kind !== 'telegram')) {
     try { await syncSource(src); } catch (e) { src.lastError = e.message; store.save(); }
   }
 }, 6 * 60 * 60 * 1000).unref();
@@ -1472,6 +1504,7 @@ async function ghSync() {
   let added = 0, failed = [];
   for (const asset of assets) {
     if (byAsset.has(String(asset.id))) { byAsset.delete(String(asset.id)); continue; }
+    if (/^tg-/.test(asset.name) || store.apps.some((a) => a.remote && String(a.remote.ghAssetId) === String(asset.id))) continue; // a Telegram channel's copy
     try {
       const dl = gh.download(asset.id);
       const meta = await inspectLink(dl.url, dl.headers);
@@ -1580,7 +1613,10 @@ route('POST', /^\/api\/github\/move$/, async (req, res, m, acc) => {
 // ----- daily sign limits -----
 const today = () => new Date().toISOString().slice(0, 10);
 function signsToday(uid) { const c = store.data.signCounts[uid]; return c && c.day === today() ? c.n : 0; }
-function countSign(uid) {
+function countSign(uid, appId) {
+  store.data.signLog = store.data.signLog || [];
+  store.data.signLog.push({ at: new Date().toISOString(), uid, appId });
+  if (store.data.signLog.length > 6000) store.data.signLog.splice(0, store.data.signLog.length - 6000);
   const c = store.data.signCounts[uid];
   store.data.signCounts[uid] = c && c.day === today() ? { day: c.day, n: c.n + 1 } : { day: today(), n: 1 };
 }
@@ -1668,6 +1704,104 @@ function storageAlert() {
 setTimeout(() => { certAlerts().catch(() => {}); storageAlert(); }, 20_000);
 setInterval(() => { certAlerts().catch(() => {}); storageAlert(); }, 3 * 3600_000);
 setInterval(() => certAlerts({ checkRevoked: true }).catch(() => {}), 12 * 3600_000);
+
+// ----- owner tools: stats, activity, broadcast, backup -----
+const nameOf = (uid) => (uid === 'owner' ? 'you' : (findUser(uid) || {}).username || 'deleted user');
+const appName = (aid) => (store.apps.find((a) => a.id === aid) || {}).name || 'deleted app';
+route('GET', /^\/api\/stats$/, (req, res) => {
+  const days = [];
+  for (let i = 29; i >= 0; i--) days.push(new Date(Date.now() - i * 864e5).toISOString().slice(0, 10));
+  const perDay = (list) => { const m = Object.fromEntries(days.map((d) => [d, 0])); for (const x of list) { const d = String(x.at).slice(0, 10); if (d in m) m[d]++; } return days.map((d) => m[d]); };
+  const since = (ms) => (x) => Date.now() - new Date(x.at) < ms;
+  const signs = store.data.signLog || [];
+  const installs = store.installLog;
+  const signups = store.securityLog.filter((e) => e.type === 'signup');
+  const top = new Map();
+  for (const l of installs.filter(since(30 * 864e5))) top.set(l.appId, (top.get(l.appId) || 0) + 1);
+  const active = new Set([...installs.filter(since(7 * 864e5)), ...signs.filter(since(7 * 864e5)).map((x) => ({ ownerId: x.uid }))].map((x) => x.ownerId));
+  active.delete('owner');
+  const activity = [
+    ...installs.slice(-60).map((l) => ({ at: l.at, kind: 'install', text: `${nameOf(l.ownerId)} installed ${l.name || appName(l.appId)}${l.shownVersion || l.version ? ' ' + (l.shownVersion || l.version) : ''}` })),
+    ...signs.slice(-60).map((x) => ({ at: x.at, kind: 'sign', text: `${nameOf(x.uid)} signed ${appName(x.appId)}` })),
+    ...signups.slice(-20).map((e) => ({ at: e.at, kind: 'user', text: `${e.user} joined` })),
+    ...store.requests.slice(-20).map((r) => ({ at: r.createdAt, kind: 'request', text: `${r.username} asked for ${r.name}` })),
+  ].sort((a, b) => String(b.at).localeCompare(String(a.at))).slice(0, 60);
+  json(res, {
+    days, installs: perDay(installs), signs: perDay(signs), signups: perDay(signups),
+    topApps: [...top.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10).map(([aid, n]) => ({ appId: aid, name: appName(aid), count: n })),
+    totals: {
+      users: store.users.length, activeUsers7d: active.size, apps: store.apps.length, cloudApps: store.apps.filter((a) => a.remote).length,
+      installs30d: installs.filter(since(30 * 864e5)).length, signs30d: signs.filter(since(30 * 864e5)).length, installsAll: installs.length,
+      certs: store.certs.length, tweaks: store.tweaks.length,
+    },
+    activity,
+  });
+}, 'owner');
+
+route('POST', /^\/api\/broadcast$/, async (req, res) => {
+  const b = await readJson(req);
+  const title = String(b.title || '').trim().slice(0, 100);
+  if (!title) return fail(res, 400, 'Write a title for the message');
+  const users = store.users.filter((u) => !u.disabled);
+  for (const u of users) addAlert(u.id, 'broadcast', `📣 ${title}`, String(b.body || '').trim().slice(0, 400));
+  store.save();
+  json(res, { sent: users.length });
+}, 'owner');
+
+// Everything needed to rebuild your server: settings, users, library info, certificates, tweaks and icons.
+// App files stored on this server (.ipa) and signed copies are left out to keep it small.
+route('GET', /^\/api\/backup$/, (req, res) => {
+  store.save();
+  const items = ['db.json', 'certs', 'tweaks', 'apps', '.secret'].filter((f) => fs.existsSync(path.join(DATA_DIR, f)));
+  const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-');
+  res.writeHead(200, { 'Content-Type': 'application/zip', 'Content-Disposition': `attachment; filename="mango-backup-${stamp}.zip"`, 'Cache-Control': 'no-store' });
+  const z = spawn('zip', ['-r', '-q', '-', ...items, '-x', 'apps/*.ipa'], { cwd: DATA_DIR });
+  z.stdout.pipe(res);
+  z.on('error', () => res.end());
+}, 'owner');
+
+route('POST', /^\/api\/restore$/, async (req, res, m, acc) => {
+  const { uploadId } = await readJson(req);
+  const file = tmpPath(uploadId, acc);
+  const dir = path.join(dirs.work, 'restore-' + id());
+  try {
+    await fsp.mkdir(dir, { recursive: true });
+    if (await run('unzip', ['-qq', '-o', file, '-d', dir], { timeout: 120000 }).then((r) => r.code) !== 0) throw httpError(400, "That isn't a Mango backup (.zip)");
+    let db;
+    try { db = JSON.parse(await fsp.readFile(path.join(dir, 'db.json'), 'utf8')); } catch { throw httpError(400, "That zip doesn't have a Mango backup in it (db.json is missing)"); }
+    if (!db || !Array.isArray(db.apps) || !db.settings) throw httpError(400, "That backup's db.json doesn't look right");
+    const hasSecret = fs.existsSync(path.join(dir, '.secret'));
+    if (!hasSecret && !process.env.SESSION_SECRET && db.certs && db.certs.length) {
+      // Encrypted values (cert passwords, tokens) need the secret they were saved with.
+      const cur = path.join(DATA_DIR, '.secret');
+      if (!fs.existsSync(cur)) throw httpError(400, 'This backup has no .secret file, so its certificate passwords can\'t be read here');
+    }
+    for (const sub of ['certs', 'tweaks', 'apps']) {
+      if (!fs.existsSync(path.join(dir, sub))) continue;
+      await fsp.rm(path.join(DATA_DIR, sub + '.old'), { recursive: true, force: true });
+      if (fs.existsSync(path.join(DATA_DIR, sub))) {
+        // Keep this server's app files (.ipa) — the backup doesn't have them.
+        if (sub === 'apps') {
+          for (const f of await fsp.readdir(path.join(DATA_DIR, 'apps'))) if (f.endsWith('.ipa')) await fsp.rename(path.join(DATA_DIR, 'apps', f), path.join(dir, 'apps', f)).catch(() => {});
+        }
+        await fsp.rename(path.join(DATA_DIR, sub), path.join(DATA_DIR, sub + '.old'));
+      }
+      await fsp.cp(path.join(dir, sub), path.join(DATA_DIR, sub), { recursive: true });
+      await fsp.rm(path.join(DATA_DIR, sub + '.old'), { recursive: true, force: true });
+    }
+    if (hasSecret && !process.env.SESSION_SECRET) await fsp.copyFile(path.join(dir, '.secret'), path.join(DATA_DIR, '.secret'));
+    await fsp.writeFile(path.join(DATA_DIR, 'db.json.tmp'), JSON.stringify(db, null, 2));
+    await fsp.rename(path.join(DATA_DIR, 'db.json.tmp'), path.join(DATA_DIR, 'db.json'));
+    json(res, { ok: true, apps: db.apps.length, users: (db.users || []).length, restarting: true });
+    // Restart so everything (including the secret) is loaded fresh. Railway brings the server straight back.
+    setTimeout(() => process.exit(1), 800);
+  } catch (e) {
+    fail(res, e.status || 400, e.message);
+  } finally {
+    await rmQuiet(file);
+    await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}, 'owner');
 
 // ----- tweaks library -----
 // Tweaks are small (.dylib files, usually under 1 MB), so they're kept on the server.
@@ -1895,6 +2029,249 @@ route('DELETE', /^\/api\/presets\/([a-f0-9]{16})$/, async (req, res, m, acc) => 
   store.save();
   json(res, { ok: true });
 });
+
+// ----- Telegram channels -----
+// Mango signs in to Telegram as you (through lib/telegram_helper.py) and watches channels for new .ipa posts.
+// Files stay on Telegram (or get copied to your GitHub storage) — nothing is kept on this server.
+const tg = telegram.createHelper();
+const tgSettings = () => store.settings.telegram || null;
+const tgReady = () => !!(tgSettings() && tgSettings().sessionEnc);
+function tgCreds(extra = {}) {
+  const t = tgSettings();
+  return { apiId: decrypt(t.apiIdEnc), apiHash: decrypt(t.apiHashEnc), session: t.sessionEnc ? decrypt(t.sessionEnc) : '', ...extra };
+}
+if (tgReady()) tg.start(tgCreds()).catch((e) => console.error('Telegram:', e.message));
+
+const tgView = () => {
+  const t = tgSettings();
+  if (!t) return { connected: false };
+  return { connected: !!t.sessionEnc, pending: !t.sessionEnc ? t.pending || 'code' : null, me: t.me || null, running: tg.running, error: t.sessionEnc && !tg.running ? tg.lastError : null };
+};
+
+route('POST', /^\/api\/telegram\/login$/, async (req, res) => {
+  const b = await readJson(req);
+  const apiId = String(b.apiId || '').trim();
+  const apiHash = String(b.apiHash || '').trim();
+  if (!/^\d{3,12}$/.test(apiId)) return fail(res, 400, 'The API ID is a number from my.telegram.org');
+  if (!/^[a-f0-9]{32}$/i.test(apiHash)) return fail(res, 400, 'The API hash is 32 letters and numbers from my.telegram.org');
+  tg.stop();
+  try {
+    await tg.start({ apiId, apiHash, session: '' });
+    const r = await tg.call('POST', '/login/start', { phone: b.phone });
+    store.settings.telegram = { apiIdEnc: encrypt(apiId), apiHashEnc: encrypt(apiHash), pending: 'code' };
+    store.save();
+    json(res, { ok: true, via: r.via, telegram: tgView() });
+  } catch (e) {
+    tg.stop();
+    fail(res, e.status || 400, e.message);
+  }
+}, 'owner');
+
+async function finishTgLogin(res, r) {
+  if (r.needPassword) {
+    store.settings.telegram.pending = 'password';
+    store.save();
+    return json(res, { needPassword: true, telegram: tgView() });
+  }
+  Object.assign(store.settings.telegram, { sessionEnc: encrypt(r.session), me: r.me, pending: null, connectedAt: new Date().toISOString() });
+  tg.setSession(r.session);
+  store.save();
+  json(res, { ok: true, telegram: tgView() });
+}
+route('POST', /^\/api\/telegram\/code$/, async (req, res) => {
+  if (!tgSettings() || !tg.running) return fail(res, 400, 'Start again: enter your API details and phone number');
+  const { code } = await readJson(req);
+  try { await finishTgLogin(res, await tg.call('POST', '/login/code', { code })); } catch (e) { fail(res, e.status || 400, e.message); }
+}, 'owner');
+route('POST', /^\/api\/telegram\/password$/, async (req, res) => {
+  if (!tgSettings() || !tg.running) return fail(res, 400, 'Start again: enter your API details and phone number');
+  const { password } = await readJson(req);
+  try { await finishTgLogin(res, await tg.call('POST', '/login/password', { password })); } catch (e) { fail(res, e.status || 400, e.message); }
+}, 'owner');
+route('DELETE', /^\/api\/telegram$/, async (req, res) => {
+  if (tgReady()) await tg.call('POST', '/logout').catch(() => {});
+  tg.stop();
+  delete store.settings.telegram;
+  store.save();
+  json(res, { telegram: tgView() });
+}, 'owner');
+
+const TG_DEFAULTS = { storage: 'telegram', updateMine: false, matchName: false, backfill: 10, keywords: '', autoSync: true, captionNotes: true };
+function cleanTgOptions(o = {}, base = TG_DEFAULTS) {
+  return {
+    storage: o.storage === 'github' ? 'github' : o.storage === 'telegram' ? 'telegram' : base.storage,
+    updateMine: typeof o.updateMine === 'boolean' ? o.updateMine : base.updateMine,
+    matchName: typeof o.matchName === 'boolean' ? o.matchName : base.matchName,
+    backfill: o.backfill !== undefined ? Math.max(0, Math.min(100, Number(o.backfill) || 0)) : base.backfill,
+    keywords: typeof o.keywords === 'string' ? o.keywords.slice(0, 300) : base.keywords,
+    autoSync: typeof o.autoSync === 'boolean' ? o.autoSync : base.autoSync,
+    captionNotes: typeof o.captionNotes === 'boolean' ? o.captionNotes : base.captionNotes,
+  };
+}
+
+// Channel captions are full of promo lines; keep the useful part for "What's new".
+function cleanCaption(text) {
+  return String(text || '')
+    .split('\n')
+    .filter((l) => !/tap here|t\.me\/|https?:\/\/|@\w{4,}|subscribe|join (our|the)|group chat|youtube|tiktok|channel|buy your|certificate|shop/i.test(l))
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+    .slice(0, 1500);
+}
+const normName = (n) => String(n || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
+async function tgImportPost(src, post, job) {
+  const opts = src.options;
+  const f = await tg.file(src.ref, post.id);
+  const meta = await ipa.inspect({ url: f.url, headers: f.headers });
+  if (!meta.bundleId) throw new Error("couldn't read the app inside");
+  const bid = meta.bundleId.toLowerCase();
+  const mine = (a) => a.remote && a.remote.kind === 'telegram' && a.remote.sourceId === src.id;
+  let app = store.apps.find((a) => mine(a) && (a.bundleId || '').toLowerCase() === bid)
+    || (opts.matchName ? store.apps.find((a) => mine(a) && normName(a.originalName || a.name) === normName(meta.name)) : null)
+    || (opts.updateMine ? store.apps.find((a) => (a.bundleId || '').toLowerCase() === bid && (!a.remote || ['github', 'link'].includes(a.remote.kind))) : null);
+  const notes = opts.captionNotes ? cleanCaption(post.text) : '';
+  if (app && app.version === meta.version && (app.build || '') === (meta.build || '')) {
+    if (mine(app) && !app.remote.ghAssetId) { app.remote.msgId = post.id; app.remote.missing = false; }
+    job.log.push(`= ${meta.name} ${meta.version} is already in the library`);
+    return 'same';
+  }
+  // Where the file lives: on Telegram (just the post), or copied once to your GitHub storage.
+  const remote = { kind: 'telegram', sourceId: src.id, ref: src.ref, msgId: post.id, postDate: post.date };
+  if (opts.storage === 'github') {
+    const g = ghSettings();
+    const gh = ghClient();
+    if (!gh || !g.releaseId) throw new Error('this channel saves to GitHub, but GitHub storage is not connected');
+    job.log.push(`Copying ${meta.name} ${meta.version} to GitHub…`);
+    const r = await fetchAuthed(f.url, f.headers);
+    if (!r.ok || !r.body) throw new Error(`couldn't read the file from Telegram (HTTP ${r.status})`);
+    const size = Number(r.headers.get('content-length')) || meta.size;
+    const safe = `tg-${normName(meta.name).slice(0, 40) || 'app'}-${meta.version || 'v'}-${id().slice(0, 6)}.ipa`;
+    const asset = await gh.uploadStream(g.releaseId, safe, r.body, size, (p) => { job.progress = p; });
+    job.progress = null;
+    remote.ghAssetId = asset.id;
+  }
+  if (app) {
+    const old = app.remote;
+    const locked = new Set(app.locked || []);
+    const oldShown = app.versionOverride || app.version;
+    for (const [k, val] of Object.entries(metaFields(meta))) if (!locked.has(k)) app[k] = val;
+    if (notes && !locked.has('notes')) app.notes = notes;
+    if (meta.icon && !app.customIcon) await fsp.writeFile(path.join(dirs.apps, app.id + '.png'), meta.icon);
+    Object.assign(app, { remote, previousVersion: oldShown, updatedAt: new Date().toISOString(), versionOverride: locked.has('versionOverride') ? app.versionOverride : null });
+    // The old copy isn't needed anymore.
+    const gh = ghClient();
+    if (old && gh && (old.kind === 'github' || old.ghAssetId)) gh.deleteAsset(old.assetId || old.ghAssetId).catch(() => {});
+    await rmQuiet(path.join(dirs.apps, app.id + '.ipa'));
+    notifyUpdate(app, oldShown);
+    job.log.push(`⬆ ${app.name} ${oldShown || '?'} → ${meta.version}`);
+    return 'updated';
+  }
+  const lines = String(post.text || '').split('\n').map((l) => l.trim()).filter(Boolean);
+  const rec = newLibraryRecord(meta, {
+    source: 'telegram', remote, fileName: (post.file && post.file.name) || 'app.ipa',
+    description: cleanCaption(lines.slice(0, 12).join('\n')).slice(0, 600), notes,
+    published: src.showInLibrary !== false, categoryId: src.categoryId && catExists(src.categoryId) ? src.categoryId : null,
+  });
+  if (meta.icon) await fsp.writeFile(path.join(dirs.apps, rec.id + '.png'), meta.icon);
+  store.apps.unshift(rec);
+  job.log.push(`+ ${rec.name} ${rec.version}`);
+  return 'added';
+}
+const catExists = (cid) => store.categories.some((c) => c.id === cid);
+
+const tgSyncing = new Map();
+function tgSync(src, acc) {
+  if (tgSyncing.has(src.id) && jobs.has(tgSyncing.get(src.id)) && jobs.get(tgSyncing.get(src.id)).status === 'running') return jobs.get(tgSyncing.get(src.id));
+  const job = newJob(acc || OWNER());
+  tgSyncing.set(src.id, job.id);
+  (async () => {
+    const result = { added: 0, updated: 0, same: 0, skipped: 0, failed: 0, removed: 0 };
+    try {
+      if (!tgReady()) throw new Error('Telegram is not connected');
+      const opts = src.options;
+      const first = !src.lastMsgId;
+      job.log.push(first ? `Looking through ${src.name}'s recent posts…` : `Checking ${src.name} for new posts…`);
+      const { posts } = await tg.posts(src.ref, src.lastMsgId || 0, first ? 400 : 200);
+      const words = opts.keywords.split(',').map((w) => w.trim().toLowerCase()).filter(Boolean);
+      let ipas = posts.filter((p) => p.file && /\.ipa$/i.test(p.file.name));
+      if (words.length) ipas = ipas.filter((p) => words.some((w) => `${p.file.name}\n${p.text}`.toLowerCase().includes(w)));
+      result.skipped = posts.length - ipas.length;
+      if (first) ipas = ipas.slice(0, opts.backfill);
+      // Newest post per app wins, so older builds in the same batch are skipped.
+      ipas.reverse();
+      src.failures = src.failures || {};
+      let maxDone = src.lastMsgId || 0;
+      let blocked = false;
+      for (const [i, p] of ipas.entries()) {
+        job.log.push(`(${i + 1}/${ipas.length}) ${p.file.name}`);
+        try {
+          const r = await tgImportPost(src, p, job);
+          result[r]++;
+          delete src.failures[p.id];
+          store.save();
+        } catch (e) {
+          src.failures[p.id] = (src.failures[p.id] || 0) + 1;
+          result.failed++;
+          job.log.push(`✕ ${p.file.name}: ${e.message}`);
+          // Try a failed post again next time (up to 3 times), so a hiccup doesn't skip an app forever.
+          if (src.failures[p.id] < 3 && !blocked) { blocked = true; maxDone = Math.min(maxDone || p.id - 1, p.id - 1); }
+        }
+        if (!blocked) maxDone = Math.max(maxDone, p.id);
+      }
+      const newest = posts.length ? Math.max(...posts.map((p) => p.id)) : 0;
+      src.lastMsgId = blocked ? maxDone : Math.max(src.lastMsgId || 0, newest);
+      // Posts deleted from the channel: hide those apps (unless they were copied to GitHub).
+      const linked = store.apps.filter((a) => a.remote && a.remote.kind === 'telegram' && a.remote.sourceId === src.id && !a.remote.ghAssetId);
+      if (linked.length) {
+        const { exists } = await tg.exists(src.ref, linked.map((a) => a.remote.msgId));
+        for (const a of linked) {
+          const gone = !exists.includes(a.remote.msgId);
+          if (gone && !a.remote.missing) result.removed++;
+          a.remote.missing = gone;
+        }
+      }
+      Object.assign(src, { lastSync: new Date().toISOString(), lastError: null, lastResult: result });
+      store.save();
+      job.result = result;
+      job.status = 'done';
+    } catch (e) {
+      src.lastError = e.message;
+      store.save();
+      job.error = e.message;
+      job.status = 'error';
+    }
+  })();
+  return job;
+}
+
+route('POST', /^\/api\/telegram\/channels$/, async (req, res, m, acc) => {
+  if (!tgReady()) return fail(res, 400, 'Connect Telegram first');
+  const b = await readJson(req);
+  let ch;
+  try { ch = await tg.channel(b.ref); } catch (e) { return fail(res, e.status || 400, e.message); }
+  const ref = ch.username || String(ch.id);
+  if (store.sources.some((x) => x.kind === 'telegram' && String(x.ref).toLowerCase() === ref.toLowerCase())) return fail(res, 400, 'That channel is already added');
+  const src = {
+    id: id(), kind: 'telegram', ref, url: ch.username ? `https://t.me/${ch.username}` : '', name: ch.title, username: ch.username,
+    showInLibrary: b.showInLibrary !== false, categoryId: b.categoryId && catExists(b.categoryId) ? b.categoryId : null,
+    options: cleanTgOptions(b.options), addedAt: new Date().toISOString(), lastMsgId: 0,
+  };
+  store.sources.push(src);
+  store.save();
+  const job = tgSync(src, acc);
+  json(res, { source: sourceView(src), jobId: job.id });
+}, 'owner');
+
+// Check channels for new posts every 10 minutes, one at a time.
+setInterval(async () => {
+  if (!tgReady()) return;
+  for (const src of store.sources.filter((x) => x.kind === 'telegram' && x.options && x.options.autoSync !== false)) {
+    const job = tgSync(src);
+    while (job.status === 'running') await new Promise((r) => setTimeout(r, 2000));
+  }
+}, 10 * 60_000);
 
 // ----- screenshots -----
 const IMG_TYPES = [
@@ -2382,7 +2759,7 @@ route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
   }
 
   const job = newJob(acc);
-  countSign(acc.id);
+  countSign(acc.id, app.id);
   signingNow.set(runKey, job.id);
   json(res, { jobId: job.id });
 
@@ -2394,7 +2771,7 @@ route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
     try {
       // Signing unpacks the app and writes a new copy, so it needs roughly twice the app's size free
       // (three times for link-only apps, which are downloaded first).
-      const dl = app.remote ? remoteDownload(app, versionIndex) : null;
+      const dl = app.remote ? await resolveDownload(remoteDownload(app, versionIndex)) : null;
       const appSize = (dl && dl.size) || app.size || 0;
       const need = Math.round(appSize * (dl ? 3.3 : 2.3)) + 64 * 1048576;
       let disk = diskInfo();
@@ -2536,6 +2913,7 @@ route('PATCH', /^\/api\/settings$/, async (req, res) => {
   if (b.udidLogin !== undefined) store.settings.udidLogin = !!b.udidLogin;
   if (b.deleteAfterInstall !== undefined) store.settings.deleteAfterInstall = !!b.deleteAfterInstall;
   if (b.signedRetentionDays !== undefined) store.settings.signedRetentionDays = Math.min(365, Math.max(0, Number(b.signedRetentionDays) || 0));
+  if (b.lastBackup) store.settings.lastBackup = new Date().toISOString();
   if (b.signsPerDay !== undefined) store.settings.signsPerDay = Math.min(500, Math.max(0, Number(b.signsPerDay) || 0));
   store.save();
   const { github: _gh, ...settings } = store.settings;

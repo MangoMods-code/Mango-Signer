@@ -13,8 +13,11 @@ RUN git init /zsign && cd /zsign \
 # ---- App ----
 FROM node:22-bookworm-slim
 RUN apt-get update \
- && apt-get install -y --no-install-recommends openssl libssl3 ca-certificates zip unzip \
+ && apt-get install -y --no-install-recommends openssl libssl3 ca-certificates zip unzip python3 python3-pip \
  && rm -rf /var/lib/apt/lists/*
+# Telegram channels: Telethon talks to Telegram; cryptg makes big downloads much faster (optional).
+RUN pip3 install --no-cache-dir --break-system-packages "telethon>=1.36,<2" \
+ && (pip3 install --no-cache-dir --break-system-packages cryptg || echo "cryptg unavailable: Telegram downloads will be slower")
 COPY --from=zsign /zsign/bin/zsign /usr/local/bin/zsign
 WORKDIR /app
 COPY package.json ./
