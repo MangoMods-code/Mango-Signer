@@ -1631,8 +1631,96 @@ function categoryIdFor(name) {
   return cat.id;
 }
 
+// ----- GitHub repos as sources -----
+// "Follow" a developer's GitHub repo: every release with an .ipa attached becomes a version, so new
+// releases show up as updates, whatever the file is called (BuildBox-2.1.3.ipa, BuildBox-2.1.4.ipa…).
+function parseGithubRepo(input) {
+  let u;
+  try { u = new URL(String(input).trim()); } catch { return null; }
+  if (!/^(www\.)?github\.com$/i.test(u.hostname)) return null;
+  const parts = u.pathname.split('/').filter(Boolean);
+  if (parts.length < 2) return null;
+  const [owner, repoRaw, kind] = parts;
+  if (kind && !['releases', 'tags'].includes(kind)) return null; // a file inside the repo: treat as a normal source link
+  if (/\.json$/i.test(u.pathname)) return null;
+  const repo = repoRaw.replace(/\.git$/i, '');
+  if (!/^[\w.-]+$/.test(owner) || !/^[\w.-]+$/.test(repo)) return null;
+  return { owner, repo, url: `https://github.com/${owner}/${repo}` };
+}
+async function githubApi(pathname) {
+  const headers = { 'User-Agent': 'Mango-Signer', Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' };
+  const g = ghSettings();
+  // Your GitHub token (if connected) gives a much higher hourly limit; fall back to no token if it can't read the repo.
+  const token = g && g.tokenEnc ? (() => { try { return decrypt(g.tokenEnc); } catch { return null; } })() : null;
+  const api = (process.env.GITHUB_API || 'https://api.github.com').replace(/\/$/, '');
+  for (const auth of token ? [true, false] : [false]) {
+    const r = await fetch(api + pathname, { headers: auth ? { ...headers, Authorization: `Bearer ${token}` } : headers, signal: AbortSignal.timeout(30000) });
+    if (auth && (r.status === 401 || r.status === 403 || r.status === 404)) { r.body && r.body.cancel().catch(() => {}); continue; }
+    if (r.status === 404) throw new Error("Couldn't find that GitHub repo (or it's private)");
+    if (r.status === 403 && r.headers.get('x-ratelimit-remaining') === '0') throw new Error('GitHub says to slow down. Try again in an hour (connecting GitHub storage raises the limit).');
+    if (!r.ok) throw new Error(`GitHub: HTTP ${r.status}`);
+    return r.json();
+  }
+  throw new Error("Couldn't read that GitHub repo");
+}
+// The same app across releases: the file name without its version numbers ("BuildBox-2.1.3.ipa" -> "buildbox").
+const ipaVariant = (name) => String(name).replace(/\.ipa$/i, '').toLowerCase().replace(/v?\d+([._-]\d+)*/g, ' ').replace(/[^a-z]+/g, ' ').trim() || 'app';
+async function githubRepoSource(src) {
+  const { owner, repo } = src.repo;
+  const [info, releases] = await Promise.all([
+    githubApi(`/repos/${owner}/${repo}`).catch(() => null),
+    githubApi(`/repos/${owner}/${repo}/releases?per_page=30`),
+  ]);
+  const byVariant = new Map();
+  for (const rel of releases) {
+    if (rel.draft) continue;
+    for (const a of rel.assets || []) {
+      if (!/\.ipa$/i.test(a.name)) continue;
+      const key = ipaVariant(a.name);
+      if (!byVariant.has(key)) byVariant.set(key, []);
+      byVariant.get(key).push({
+        version: String(rel.tag_name || rel.name || '').replace(/^v(?=\d)/i, '').slice(0, 60),
+        date: rel.published_at || rel.created_at || '', url: a.browser_download_url, size: a.size || 0,
+        notes: String(rel.body || '').slice(0, 1500), channel: rel.prerelease ? 'beta' : '', assetId: a.id, assetName: a.name,
+      });
+    }
+  }
+  if (!byVariant.size) throw new Error(`${owner}/${repo} has no releases with an .ipa file attached`);
+  const known = store.apps.filter((a) => a.remote && a.remote.sourceId === src.id);
+  const apps = [];
+  for (const [variant, versions] of byVariant) {
+    const list = versions.slice(0, 15);
+    const newest = list.find((v) => !v.channel) || list[0];
+    if (newest !== list[0]) { list.splice(list.indexOf(newest), 1); list.unshift(newest); }
+    const key = `gh:${variant}`;
+    const app = known.find((a) => a.remote.key === key);
+    let meta = app && app.remote.inspected && app.remote.inspected.assetId === newest.assetId ? app.remote.inspected : null;
+    if (!meta) {
+      // Read the newest .ipa's name, bundle ID, real version and icon (just the bits needed, not the whole file).
+      try {
+        const m = await inspectLink(newest.url, null);
+        meta = { assetId: newest.assetId, name: m.name, bundleId: m.bundleId, version: m.version, minOS: m.minOS, icon: m.icon || null };
+      } catch (e) {
+        meta = { assetId: newest.assetId, name: '', bundleId: '', version: '', error: e.message };
+      }
+    }
+    if (meta.version) newest.version = meta.version; // the app's own version, so update checks compare like with like
+    apps.push({
+      key, name: meta.name || (info && info.name) || repo, bundleId: meta.bundleId || '',
+      developer: owner, subtitle: '', description: String((info && info.description) || '').slice(0, 1500),
+      iconURL: '', tint: '', category: '', screenshots: [],
+      versions: list.map(({ assetId: _a, assetName: _n, ...v }) => ({ ...v, minOS: v === newest ? meta.minOS || '' : '' })),
+      _meta: meta,
+    });
+  }
+  return {
+    name: (info && info.name) || repo, identifier: `github:${owner}/${repo}`, iconURL: (info && info.owner && info.owner.avatar_url) || '',
+    subtitle: (info && info.description) || `GitHub releases from ${owner}`, apps,
+  };
+}
+
 async function syncSource(src) {
-  const parsed = sources.parseSource(await fetchJson(src.url));
+  const parsed = src.kind === 'ghrepo' ? await githubRepoSource(src) : sources.parseSource(await fetchJson(src.url));
   const mine = store.apps.filter((a) => a.remote && a.remote.kind === 'source' && a.remote.sourceId === src.id);
   const byKey = new Map(mine.map((a) => [a.remote.key, a]));
   const seen = new Set();
@@ -1656,6 +1744,7 @@ async function syncSource(src) {
         categoryId: categoryIdFor(s.category), notes: v.notes || '',
       });
       store.apps.push(app);
+      await saveRepoMeta(app, s);
       added++;
       continue;
     }
@@ -1666,6 +1755,7 @@ async function syncSource(src) {
     app.iconURL = s.iconURL || app.iconURL;
     app.hasIcon = app.hasIcon || !!app.iconURL;
     app.remote = remote;
+    await saveRepoMeta(app, s);
     if (oldVersion && v.version && oldVersion !== v.version) {
       app.previousVersion = app.versionOverride || oldVersion;
       app.updatedAt = new Date().toISOString();
@@ -1685,14 +1775,28 @@ async function syncSource(src) {
   return { added, updated, removed, total: parsed.apps.length };
 }
 
+// GitHub repo apps: keep what was read from the .ipa (so it's only read again for a new release) and its icon.
+async function saveRepoMeta(app, s) {
+  if (!s._meta) return;
+  const { icon, ...meta } = s._meta;
+  if (icon && !app.customIcon && app.remote.inspected?.assetId !== meta.assetId) {
+    await fsp.writeFile(path.join(dirs.apps, app.id + '.png'), shrinkPng(Buffer.from(icon), 180)).catch(() => {});
+    app.hasIcon = true;
+    app.iconVersion = Date.now();
+  } else if (app.remote.inspected && app.remote.inspected.assetId === meta.assetId) app.hasIcon = app.hasIcon || fs.existsSync(path.join(dirs.apps, app.id + '.png'));
+  app.remote.inspected = meta;
+}
+
 const sourceView = ({ done: _d, failures: _f, ...src }) => ({ ...src, apps: store.apps.filter((a) => a.remote && a.remote.sourceId === src.id && !a.remote.missing).length });
 
 route('POST', /^\/api\/sources$/, async (req, res) => {
   const b = await readJson(req);
   let url;
-  try { url = sources.normalizeSourceUrl(b.url); } catch (e) { return fail(res, 400, e.message); }
-  if (store.sources.some((x) => x.url === url)) return fail(res, 400, 'That source is already added');
-  const src = { id: id(), url, name: 'Source', showInLibrary: b.showInLibrary !== false, addedAt: new Date().toISOString() };
+  const repo = parseGithubRepo(b.url);
+  try { url = repo ? repo.url : sources.normalizeSourceUrl(b.url); } catch (e) { return fail(res, 400, e.message); }
+  if (store.sources.some((x) => x.url.toLowerCase() === url.toLowerCase())) return fail(res, 400, 'That source is already added');
+  const src = { id: id(), url, name: repo ? repo.repo : 'Source', showInLibrary: b.showInLibrary !== false, addedAt: new Date().toISOString() };
+  if (repo) Object.assign(src, { kind: 'ghrepo', repo: { owner: repo.owner, repo: repo.repo } });
   try {
     store.sources.push(src);
     const result = await syncSource(src);
@@ -1748,12 +1852,14 @@ route('DELETE', /^\/api\/sources\/([a-f0-9]{16})$/, async (req, res, m) => {
   json(res, { ok: true });
 }, 'owner');
 
-// Keep sources fresh: check them every 6 hours.
+// Keep sources fresh: GitHub repos every 3 hours, other sources every 6.
 setInterval(async () => {
   for (const src of store.sources.filter((x) => x.kind !== 'telegram')) {
+    const every = src.kind === 'ghrepo' ? 3 : 6;
+    if (src.lastSync && Date.now() - new Date(src.lastSync) < (every - 0.5) * 3600_000) continue;
     try { await syncSource(src); } catch (e) { src.lastError = e.message; store.save(); }
   }
-}, 6 * 60 * 60 * 1000).unref();
+}, 30 * 60 * 1000).unref();
 
 // ----- GitHub storage -----
 function ghSettings() { return store.settings.github || null; }
