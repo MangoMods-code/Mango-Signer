@@ -4,6 +4,7 @@ const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(
 
 const state = {
   tab: 'library', account: null, apps: [], categories: [], certs: [], signed: [], users: [], invites: [], settings: {}, server: {},
+  sources: [], github: { connected: false },
   udidState: null,
   lib: { q: '', cat: 'all', sort: 'smart', select: false, selected: new Set() },
 };
@@ -558,6 +559,8 @@ function renderTabs() {
   nav.innerHTML = tabs.map(([key, label]) => {
     let dot = '';
     if (key === 'certs' && state.certs.some((c) => (c.check && c.check.status === 'revoked') || (daysLeft(certExpiry(c)) ?? 99) < 7)) dot = '<i class="dot"></i>';
+    if (key === 'users' && (state.requests || []).some((r) => r.status === 'pending')) dot = '<i class="dot"></i>';
+    if (key === 'library' && state.apps.some(hasUpdate)) dot = '<i class="dot mango"></i>';
     return `<button data-tab="${key}" class="${state.tab === key ? 'active' : ''}">${TAB_ICONS[key]}${dot}<span>${label}</span></button>`;
   }).join('');
   nav.querySelectorAll('button').forEach((b) => { b.onclick = () => switchTab(b.dataset.tab); });
@@ -573,48 +576,110 @@ function render() {
   top.innerHTML = actions[state.tab] ? ICONS.plus : '';
   top.onclick = actions[state.tab] || null;
   const view = $('#view');
-  view.innerHTML = { library: renderLibrary, signed: renderSigned, certs: renderCerts, users: renderUsers, settings: renderSettings }[state.tab]();
+  view.innerHTML = announcementHtml() + { library: renderLibrary, signed: renderSigned, certs: renderCerts, users: renderUsers, settings: renderSettings }[state.tab]();
   bindView(view);
   if (state.tab === 'library') bindLibrary(view);
 }
 
 // ---------- library ----------
+const DAY = 864e5;
+const isNewApp = (a) => Date.now() - new Date(a.addedAt) < 3 * DAY;
+const isUpdatedApp = (a) => !isNewApp(a) && a.updatedAt && a.previousVersion && Date.now() - new Date(a.updatedAt) < 3 * DAY;
+const hasUpdate = (a) => a.installed && a.installed.version && shownVersion(a) && a.installed.version !== shownVersion(a);
+function libView() { try { return localStorage.getItem('mango.libView') || 'list'; } catch { return 'list'; } }
+
 function filteredApps() {
   const { q, cat, sort } = state.lib;
   let apps = state.apps.slice();
   if (q) {
     const needle = q.toLowerCase();
-    apps = apps.filter((a) => [a.name, a.bundleId, a.description, a.developer, a.notes, shownVersion(a), catLabel(a.categoryId)].some((f) => (f || '').toLowerCase().includes(needle)));
+    apps = apps.filter((a) => [a.name, a.bundleId, a.description, a.developer, a.notes, a.sourceName, shownVersion(a), catLabel(a.categoryId), ...(a.tags || [])].some((f) => (f || '').toLowerCase().includes(needle)));
   }
   if (cat === 'featured') apps = apps.filter((a) => a.featured);
+  else if (cat === 'installed') apps = apps.filter((a) => a.installed);
+  else if (cat === 'updates') apps = apps.filter(hasUpdate);
+  else if (cat === 'new') apps = apps.filter((a) => isNewApp(a) || isUpdatedApp(a));
   else if (cat === 'none') apps = apps.filter((a) => !a.categoryId || !catById(a.categoryId));
   else if (cat === 'hidden') apps = apps.filter((a) => !a.published);
+  else if (cat === 'missing') apps = apps.filter((a) => a.missing);
+  else if (cat === 'cloud:github') apps = apps.filter((a) => a.cloud === 'github');
+  else if (cat === 'cloud:link') apps = apps.filter((a) => a.cloud === 'link');
+  else if (cat.startsWith('src:')) apps = apps.filter((a) => a.cloud === 'source' && a.sourceName === cat.slice(4));
+  else if (cat.startsWith('tag:')) apps = apps.filter((a) => (a.tags || []).includes(cat.slice(4)));
   else if (cat !== 'all') apps = apps.filter((a) => a.categoryId === cat);
   const by = {
     smart: (x, y) => (y.featured - x.featured) || x.name.localeCompare(y.name),
     name: (x, y) => x.name.localeCompare(y.name),
     newest: (x, y) => String(y.updatedAt || y.addedAt).localeCompare(String(x.updatedAt || x.addedAt)),
+    popular: (x, y) => (y.installCount || 0) - (x.installCount || 0) || (y.likes - y.dislikes) - (x.likes - x.dislikes),
+    rating: (x, y) => (y.likes - y.dislikes) - (x.likes - x.dislikes) || (y.installCount || 0) - (x.installCount || 0),
     size: (x, y) => y.size - x.size,
   };
   return apps.sort(by[sort] || by.smart);
 }
 
+function appBadges(a, { compact = false } = {}) {
+  const b = [];
+  if (hasUpdate(a)) b.push('<span class="badge mango">⬆ Update</span>');
+  else if (a.installed) b.push('<span class="badge good">✓ Installed</span>');
+  if (isNewApp(a)) b.push('<span class="badge new">NEW</span>');
+  else if (isUpdatedApp(a)) b.push('<span class="badge new">UPDATED</span>');
+  if (!compact && isOwner() && !a.published) b.push('<span class="badge">Hidden</span>');
+  if (!compact && a.missing) b.push('<span class="badge bad">Removed from source</span>');
+  if (!compact) b.push(cloudBadge(a));
+  return b.join('');
+}
+
+// Where an app's file lives. Users only see the source name; you also see GitHub / link-only.
+function cloudBadge(a) {
+  if (a.cloud === 'source') return `<span class="badge cloud">☁ ${esc(a.sourceName || 'Source')}</span>`;
+  if (!isOwner()) return '';
+  if (a.cloud === 'github') return '<span class="badge cloud">☁ GitHub</span>';
+  if (a.cloud === 'link') return '<span class="badge cloud">🔗 Link</span>';
+  return '';
+}
+const storedLabel = (a) => ({ source: `Linked from ${a.sourceName || 'a source'} (not stored here)`, github: 'Your GitHub repo (not stored here)', link: 'Download link (not stored here)' }[a.cloud] || 'This server');
+
+function getLabel(a) {
+  if (hasUpdate(a)) return 'Update';
+  return 'Get';
+}
+
 function appRow(a) {
   const sel = state.lib.select;
   const checked = state.lib.selected.has(a.id);
-  const sub2 = [a.developer, fmtSize(a.size)].filter(Boolean).join(' · ');
-  const defaults = defaultsSummary(a.signDefaults);
+  const rating = a.likes + a.dislikes ? `👍 ${Math.round((100 * a.likes) / (a.likes + a.dislikes))}%` : '';
+  const sub2 = [a.developer, fmtSize(a.size), a.installCount ? `🔥 ${a.installCount}` : '', rating].filter(Boolean).join(' · ');
   return `
     <div class="row ${checked ? 'selected' : ''}" data-act="${sel ? 'toggle-select' : 'app'}" data-id="${a.id}">
       ${sel ? `<span class="check ${checked ? 'on' : ''}">${checked ? ICONS.check : ''}</span>` : ''}
       ${appIcon(a)}
       <div class="row-main">
-        <div class="row-title">${esc(a.name)}${a.featured ? '<span class="star">★</span>' : ''}${isOwner() && !a.published ? '<span class="badge">Hidden</span>' : ''}</div>
+        <div class="row-title">${esc(a.name)}${a.featured ? '<span class="star">★</span>' : ''}</div>
         <div class="row-sub">${esc(shownVersion(a) || '—')} · ${esc(a.description ? a.description.split('\n')[0] : a.bundleId)}</div>
-        <div class="row-sub">${esc(sub2)}${defaults.length ? ` · <span class="mango-text">${esc(defaults.slice(0, 2).join(', '))}${defaults.length > 2 ? '…' : ''}</span>` : ''}</div>
+        <div class="row-sub">${esc(sub2)}</div>
+        ${appBadges(a) ? `<div class="row-badges">${appBadges(a)}</div>` : ''}
       </div>
-      ${sel ? '' : `<button class="pill" data-act="sign" data-id="${a.id}">Sign</button>`}
+      ${sel ? '' : `<button class="pill" data-act="get" data-id="${a.id}">${getLabel(a)}</button>`}
     </div>`;
+}
+
+function appTile(a) {
+  return `<button class="tile" data-act="app" data-id="${a.id}">
+    <span class="tile-icon">${appIcon(a, true)}${hasUpdate(a) ? '<i class="tile-dot up">⬆</i>' : a.installed ? '<i class="tile-dot ok">✓</i>' : isNewApp(a) ? '<i class="tile-dot new">NEW</i>' : ''}</span>
+    <span class="tile-name">${esc(a.name)}</span>
+    <span class="tile-sub">${esc(shownVersion(a) || '')}</span>
+  </button>`;
+}
+
+function shelfCard(a, sub) {
+  return `<button class="shelf-card" data-act="app" data-id="${a.id}">${appIcon(a, true)}<span class="shelf-name">${esc(a.name)}</span><span class="shelf-sub">${esc(sub)}</span></button>`;
+}
+
+function appsBlock(apps) {
+  return libView() === 'grid'
+    ? `<div class="grid">${apps.map(appTile).join('')}</div>`
+    : `<div class="list">${apps.map(appRow).join('')}</div>`;
 }
 
 function libraryListHtml() {
@@ -624,53 +689,93 @@ function libraryListHtml() {
     return isOwner()
       ? `<div class="empty">${ICONS.box}<h3>No apps yet</h3><p>Add an .ipa from Files or paste a download link. Apps you add show up in the App Library for everyone you invite.</p>
         <button class="btn primary" data-act="add-app">Add App</button></div>`
-      : `<div class="empty">${ICONS.box}<h3>No apps yet</h3><p>The owner hasn't added any apps. Check back soon!</p></div>`;
+      : `<div class="empty">${ICONS.box}<h3>No apps yet</h3><p>The owner hasn't added any apps yet. Want something? Request it!</p>
+        <button class="btn primary" data-act="request-app">Request an App</button></div>`;
   }
-  if (!apps.length) return `<div class="empty" style="padding:30px 20px">${ICONS.search}<h3>Nothing found</h3><p>${q ? `No apps match “${esc(q)}”.` : 'No apps in this category yet.'}</p></div>`;
+  if (!apps.length) {
+    return `<div class="empty" style="padding:30px 20px">${ICONS.search}<h3>Nothing found</h3><p>${q ? `No apps match “${esc(q)}”.` : 'Nothing here yet.'}</p>
+      ${!isOwner() ? '<button class="btn" data-act="request-app">Request an App</button>' : ''}</div>`;
+  }
 
-  // Grouped view: featured shelf + one section per category, in your order.
+  // Grouped view: shelves up top, then one section per category, in your order.
   if (cat === 'all' && !q && state.lib.sort === 'smart' && !state.lib.select) {
-    const featured = apps.filter((a) => a.featured);
     let html = '';
-    if (featured.length) {
-      html += `<div class="section-title" style="margin-top:6px">★ Featured</div><div class="shelf">${featured.map((a) => `
-        <button class="shelf-card" data-act="app" data-id="${a.id}">${appIcon(a, true)}<span class="shelf-name">${esc(a.name)}</span><span class="shelf-sub">${esc(catLabel(a.categoryId))}</span></button>`).join('')}</div>`;
+    const updates = apps.filter(hasUpdate);
+    if (updates.length) {
+      html += `<div class="section-title" style="margin-top:6px">⬆ Updates for you <span class="count">${updates.length}</span></div><div class="shelf">${updates.map((a) => shelfCard(a, `${a.installed.version} → ${shownVersion(a)}`)).join('')}</div>`;
     }
-    const groups = state.categories.map((c) => ({ title: `${c.emoji} ${c.name}`, apps: apps.filter((a) => a.categoryId === c.id) }));
-    groups.push({ title: 'Other', apps: apps.filter((a) => !catById(a.categoryId)) });
+    const featured = apps.filter((a) => a.featured);
+    if (featured.length) {
+      html += `<div class="section-title" style="margin-top:6px">★ Featured</div><div class="shelf">${featured.map((a) => shelfCard(a, catLabel(a.categoryId))).join('')}</div>`;
+    }
+    const popular = apps.filter((a) => a.installCount > 0).sort((x, y) => y.installCount - x.installCount).slice(0, 8);
+    if (popular.length >= 2) {
+      html += `<div class="section-title">🔥 Popular</div><div class="shelf">${popular.map((a) => shelfCard(a, `${a.installCount} install${a.installCount === 1 ? '' : 's'}`)).join('')}</div>`;
+    }
+    const cols = state.collections.filter((c) => c.appIds.some((x) => apps.some((a) => a.id === x)));
+    if (cols.length) {
+      html += `<div class="section-title">📦 Collections</div><div class="shelf">${cols.map((c) => `
+        <button class="shelf-card col-card" data-act="collection" data-id="${c.id}"><span class="col-emoji">${esc(c.emoji)}</span><span class="shelf-name">${esc(c.name)}</span><span class="shelf-sub">${c.appIds.filter((x) => apps.some((a) => a.id === x)).length} apps</span></button>`).join('')}</div>`;
+    }
+    const fresh = apps.filter((a) => isNewApp(a) || isUpdatedApp(a)).sort((x, y) => String(y.updatedAt || y.addedAt).localeCompare(String(x.updatedAt || x.addedAt)));
+    if (fresh.length && fresh.length < apps.length) {
+      html += `<div class="section-title">🆕 New & updated</div><div class="shelf">${fresh.slice(0, 10).map((a) => shelfCard(a, isNewApp(a) ? 'New' : `Updated to ${shownVersion(a)}`)).join('')}</div>`;
+    }
+    const groups = state.categories.map((c) => ({ key: c.id, title: `${c.emoji} ${c.name}`, apps: apps.filter((a) => a.categoryId === c.id) }));
+    groups.push({ key: 'none', title: 'Other', apps: apps.filter((a) => !catById(a.categoryId)) });
+    // Big sources can add hundreds of apps; show the first few per category and link to the rest.
+    const PER_GROUP = 24;
     for (const g of groups.filter((x) => x.apps.length)) {
-      html += `<div class="section-title">${esc(g.title)} <span class="count">${g.apps.length}</span></div><div class="list">${g.apps.map(appRow).join('')}</div>`;
+      html += `<div class="section-title">${esc(g.title)} <span class="count">${g.apps.length}</span></div>${appsBlock(g.apps.slice(0, PER_GROUP))}`;
+      if (g.apps.length > PER_GROUP) html += `<button class="btn block see-all" data-cat-jump="${esc(g.key)}">See all ${g.apps.length} in ${esc(g.title)} ›</button>`;
     }
     return html;
   }
-  return `<div class="section-title" style="margin-top:6px">${apps.length} app${apps.length === 1 ? '' : 's'}</div><div class="list">${apps.map(appRow).join('')}</div>`;
+  return `<div class="section-title" style="margin-top:6px">${apps.length} app${apps.length === 1 ? '' : 's'}</div>${state.lib.select ? `<div class="list">${apps.map(appRow).join('')}</div>` : appsBlock(apps)}`;
 }
 
 function renderLibrary() {
   const { q, cat, sort } = state.lib;
-  const chips = [['all', 'All'], ['featured', '★ Featured'], ...state.categories.map((c) => [c.id, `${c.emoji} ${c.name}`])];
-  if (isOwner()) chips.push(['none', 'Uncategorized'], ['hidden', 'Hidden']);
+  const allTags = [...new Set(state.apps.flatMap((a) => a.tags || []))].sort();
+  const srcNames = [...new Set(state.apps.filter((a) => a.cloud === 'source' && a.sourceName).map((a) => a.sourceName))].sort();
+  const chips = [['all', 'All'], ['installed', '✓ Installed'], ['updates', '⬆ Updates'], ['new', '🆕 New'], ['featured', '★ Featured'],
+    ...state.categories.map((c) => [c.id, `${c.emoji} ${c.name}`]), ...srcNames.map((n) => [`src:${n}`, `☁ ${n}`]), ...allTags.map((t) => [`tag:${t}`, `# ${t}`])];
+  if (isOwner()) chips.push(['cloud:github', '☁ GitHub'], ['cloud:link', '🔗 Links'], ['none', 'Uncategorized'], ['hidden', 'Hidden'], ['missing', '⚠ Removed']);
   const counts = (key) => {
     if (key === 'all') return state.apps.length;
+    if (key === 'installed') return state.apps.filter((a) => a.installed).length;
+    if (key === 'updates') return state.apps.filter(hasUpdate).length;
+    if (key === 'new') return state.apps.filter((a) => isNewApp(a) || isUpdatedApp(a)).length;
     if (key === 'featured') return state.apps.filter((a) => a.featured).length;
     if (key === 'none') return state.apps.filter((a) => !catById(a.categoryId)).length;
     if (key === 'hidden') return state.apps.filter((a) => !a.published).length;
+    if (key.startsWith('tag:')) return state.apps.filter((a) => (a.tags || []).includes(key.slice(4))).length;
+    if (key.startsWith('src:')) return state.apps.filter((a) => a.cloud === 'source' && a.sourceName === key.slice(4)).length;
+    if (key === 'cloud:github') return state.apps.filter((a) => a.cloud === 'github').length;
+    if (key === 'cloud:link') return state.apps.filter((a) => a.cloud === 'link').length;
+    if (key === 'missing') return state.apps.filter((a) => a.missing).length;
     return state.apps.filter((a) => a.categoryId === key).length;
   };
   const setup = !isOwner() && !state.certs.length
     ? `<p class="warning" data-act="go-certs" style="margin:0 0 12px;cursor:pointer">Add your certificate in the Certificates tab to start signing →</p>` : '';
+  const view = libView();
   return `${setup}
     ${state.apps.length ? `
     <div class="searchbar">${ICONS.search}<input type="search" id="libSearch" placeholder="Search ${state.apps.length} apps" value="${esc(q)}" autocapitalize="off" autocorrect="off"></div>
     <div class="chips-row" id="libChips">
-      ${chips.filter(([k]) => k === 'all' || counts(k) > 0 || (isOwner() && !['featured', 'none', 'hidden'].includes(k))).map(([k, l]) => `<button class="fchip ${cat === k ? 'on' : ''}" data-cat="${k}">${esc(l)} <span>${counts(k)}</span></button>`).join('')}
+      ${chips.filter(([k]) => k === 'all' || k === cat || counts(k) > 0 || (isOwner() && state.categories.some((c) => c.id === k))).map(([k, l]) => `<button class="fchip ${cat === k ? 'on' : ''}" data-cat="${esc(k)}">${esc(l)} <span>${counts(k)}</span></button>`).join('')}
       ${isOwner() ? '<button class="fchip ghost" data-act="manage-cats">⚙︎ Edit</button>' : ''}
     </div>
     <div class="lib-tools">
       <select id="libSort">
-        ${[['smart', 'Grouped'], ['name', 'A–Z'], ['newest', 'Newest'], ['size', 'Biggest']].map(([k, l]) => `<option value="${k}" ${sort === k ? 'selected' : ''}>Sort: ${l}</option>`).join('')}
+        ${[['smart', 'Grouped'], ['popular', 'Popular'], ['rating', 'Top rated'], ['name', 'A–Z'], ['newest', 'Newest'], ['size', 'Biggest']].map(([k, l]) => `<option value="${k}" ${sort === k ? 'selected' : ''}>Sort: ${l}</option>`).join('')}
       </select>
-      ${isOwner() ? `<button class="btn small-btn" data-act="toggle-select-mode">${state.lib.select ? 'Done' : 'Select'}</button>` : ''}
+      <div class="seg" role="group" aria-label="Layout">
+        <button data-view="list" class="${view === 'list' ? 'on' : ''}" aria-label="List">☰</button>
+        <button data-view="grid" class="${view === 'grid' ? 'on' : ''}" aria-label="Grid">▦</button>
+      </div>
+      ${isOwner() ? `<button class="btn small-btn" data-act="toggle-select-mode">${state.lib.select ? 'Done' : 'Select'}</button>`
+        : '<button class="btn small-btn" data-act="request-app">Request</button>'}
     </div>` : ''}
     <div id="libList">${libraryListHtml()}</div>
     ${state.lib.select ? bulkBarHtml() : ''}`;
@@ -698,12 +803,18 @@ function bindLibrary(view) {
       bindView(list);
     };
   }
+  view.querySelectorAll('[data-cat-jump]').forEach((b) => {
+    b.onclick = () => { state.lib.cat = b.dataset.catJump; saveLibPrefs(); window.scrollTo(0, 0); render(); };
+  });
   view.querySelectorAll('.fchip[data-cat]').forEach((b) => {
     b.onclick = () => { state.lib.cat = b.dataset.cat; saveLibPrefs(); render(); };
   });
   const sort = $('#libSort', view);
   if (sort) sort.onchange = () => { state.lib.sort = sort.value; saveLibPrefs(); render(); };
   view.querySelectorAll('[data-bulk]').forEach((b) => { b.onclick = () => bulkAction(b.dataset.bulk); });
+  view.querySelectorAll('.seg [data-view]').forEach((b) => {
+    b.onclick = () => { try { localStorage.setItem('mango.libView', b.dataset.view); } catch { /* */ } render(); };
+  });
 }
 
 async function bulkAction(action) {
@@ -731,8 +842,23 @@ async function finishBulk(msg) {
   await refresh();
 }
 
+function installHistoryHtml(limit = 20) {
+  const list = (state.installs || []).slice(0, limit);
+  if (!list.length) return '';
+  return `<div class="section-title">Install history <span class="count">${state.installs.length}</span></div>
+    <div class="list">${list.map((l) => {
+      const app = state.apps.find((a) => a.id === l.appId);
+      return `<div class="row" ${app ? `data-act="app" data-id="${app.id}"` : ''}>
+        ${app ? appIcon(app) : iconHtml(null, l.name)}
+        <div class="row-main"><div class="row-title">${esc(l.name)}</div>
+          <div class="row-sub">${esc(l.shownVersion || l.version || '')} · ${esc(l.certLabel || '')}</div>
+          <div class="row-sub">${new Date(l.at).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</div></div>
+        <span class="badge good">✓</span></div>`;
+    }).join('')}</div>`;
+}
+
 function renderSigned() {
-  if (!state.signed.length) {
+  if (!state.signed.length && !(state.installs || []).length) {
     return `<div class="empty">${ICONS.down}<h3>Nothing signed yet</h3><p>Signed apps show up here, ready to install.</p>
       <button class="btn primary" data-act="go-library">Go to ${isOwner() ? 'Library' : 'App Library'}</button></div>`;
   }
@@ -758,7 +884,8 @@ function renderSigned() {
   };
   return `${notes.length ? `<p class="hint" style="margin:0 4px 10px">${notes.join(' ')}</p>` : ''}
     ${ready.length ? `<div class="section-title" style="margin-top:4px">Ready to install <span class="count">${ready.length}</span></div><div class="list">${ready.map(row).join('')}</div>` : ''}
-    ${old.length ? `<div class="section-title">File removed <span class="count">${old.length}</span></div><div class="list">${old.map(row).join('')}</div>` : ''}`;
+    ${old.length ? `<div class="section-title">File removed <span class="count">${old.length}</span></div><div class="list">${old.map(row).join('')}</div>` : ''}
+    ${installHistoryHtml()}`;
 }
 
 function certStatusBadge(c) {
@@ -838,7 +965,12 @@ function renderUsers() {
           </div>
         </div>`).join('')}</div>`
     : `<div class="empty" style="padding:24px">${ICONS.users}<p>No users yet. Share an invite code to get started.</p></div>`;
-  return `<div class="section-title" style="margin-top:4px">Invite codes</div>${invites}<div class="section-title">People <span class="count">${state.users.length}</span></div>${users}`;
+  const pending = (state.requests || []).filter((r) => r.status === 'pending');
+  const others = (state.requests || []).filter((r) => r.status !== 'pending').slice(0, 10);
+  const reqs = (state.requests || []).length
+    ? `<div class="section-title" style="margin-top:4px">App requests ${pending.length ? `<span class="count hot">${pending.length} new</span>` : ''}</div>
+       <div class="list">${[...pending, ...others].map(requestRow).join('')}</div>` : '';
+  return `${reqs}<div class="section-title" style="margin-top:${reqs ? 22 : 4}px">Invite codes</div>${invites}<div class="section-title">People <span class="count">${state.users.length}</span></div>${users}`;
 }
 
 function accountSection() {
@@ -848,6 +980,8 @@ function accountSection() {
     <div class="list">
       <div class="setting"><span>Upload speed<br><span class="hint">Saved on this device</span></span>
         <select data-act="upload-speed">${UPLOAD_MODES.map((m) => `<option value="${m.streams}" ${m.streams === uploadStreams() ? 'selected' : ''}>${m.label}</option>`).join('')}</select></div>
+      <button class="row" data-act="appearance"><span class="row-main" style="font-weight:600">🎨 Appearance</span><span class="value muted">${esc(themeLabel())} ›</span></button>
+      <button class="row" data-act="tour"><span class="row-main" style="font-weight:600">👋 Show the welcome tour</span><span class="value muted">›</span></button>
       <button class="row" data-act="whats-new"><span class="row-main" style="font-weight:600">✨ What's New</span><span class="value muted">V${esc(CLIENT_VERSION || state.server.version || '')} ›</span></button>
       <div class="setting"><span>Username</span><span class="value">${esc(a.username)}</span></div>
       <div class="setting"><span>iPhone</span><span class="value">${a.udid ? `${esc(a.deviceName || 'iPhone')}<br><span class="mono">${esc(shortUdid(a.udid))}</span>` : 'Not linked'}</span></div>
@@ -856,7 +990,10 @@ function accountSection() {
       ${!isOwner() ? '<button class="row" data-act="change-password"><span class="row-main" style="font-weight:600">Change Password</span></button>' : ''}
       ${state.server.passwordSet !== false ? '<button class="row" data-act="logout"><span class="row-main" style="color:var(--red);font-weight:600">Log Out</span></button>' : ''}
     </div>
-    <p class="hint" style="margin:8px 4px 0">${a.udid ? 'Your iPhone can sign in without a password, and Mango checks whether it\'s in your profiles.' : 'Linking downloads a quick profile: open Settings › Profile Downloaded › Install, and you\'ll come back here.'}</p>`;
+    <p class="hint" style="margin:8px 4px 0">${a.udid ? 'Your iPhone can sign in without a password, and Mango checks whether it\'s in your profiles.' : 'Linking downloads a quick profile: open Settings › Profile Downloaded › Install, and you\'ll come back here.'}</p>
+    ${!isOwner() ? `<div class="section-title">My app requests</div>
+      ${(state.requests || []).length ? `<div class="list">${state.requests.map(requestRow).join('')}</div>` : ''}
+      <button class="btn block" data-act="request-app" style="margin-top:${(state.requests || []).length ? 10 : 0}px">+ Request an App</button>` : ''}`;
 }
 
 function renderSettings() {
@@ -867,7 +1004,7 @@ function renderSettings() {
   const b = s.storageBreakdown || {};
   const z = state.settings.zipLevel ?? 6;
   const total = s.storage || 1;
-  const bar = (n, cls) => `<div class="${cls}" style="width:${Math.max(0.5, (100 * (n || 0)) / total)}%"></div>`;
+  const bar = (n, cls) => `<div class="${cls}" style="width:${Math.max(0.5, (100 * (n || 0)) / (s.disk ? s.disk.total : total))}%"></div>`;
   return `
     ${!s.https ? '<p class="warning bad">Your server isn\'t on HTTPS, so iOS will refuse to install apps. On Railway, generate a public domain for the service.</p>' : ''}
     ${!s.passwordSet ? '<p class="warning">No APP_PASSWORD is set, so anyone with your link has owner access. Add an APP_PASSWORD variable on Railway.</p>' : ''}
@@ -877,8 +1014,10 @@ function renderSettings() {
       <div class="setting"><span>Signing engine</span><span class="value">${s.zsign ? 'zsign ' + esc(s.zsign) : '<span style="color:var(--red)">Not installed</span>'}</span></div>
       <div class="setting"><span>Version</span><span class="value">${esc(s.version)}</span></div>
     </div>
-    <div class="section-title">Storage · ${fmtSize(s.storage)}</div>
+    <div class="section-title">Storage</div>
     <div class="card">
+      ${s.disk ? `<div class="disk-head"><b>${fmtSize(s.disk.total - s.disk.free)}</b> of ${fmtSize(s.disk.total)} used<span class="${s.disk.free < 1024 ** 3 ? 'low' : ''}">${fmtSize(s.disk.free)} free</span></div>` : ''}
+      ${s.disk && s.disk.free < 1024 ** 3 ? '<p class="warning bad" style="margin:0 0 10px">Storage is almost full. Big apps need about twice their size free to sign. Clean up below or delete apps you don\'t need.</p>' : ''}
       <div class="stack-bar">${bar(b.library, 's-lib')}${bar(b.signed, 's-signed')}${bar(b.certs, 's-certs')}${bar(b.temp, 's-temp')}</div>
       <div class="legend">
         <span><i class="s-lib"></i>Library ${fmtSize(b.library)}</span>
@@ -886,16 +1025,21 @@ function renderSettings() {
         <span><i class="s-certs"></i>Certs ${fmtSize(b.certs)}</span>
         <span><i class="s-temp"></i>Temp ${fmtSize(b.temp)}</span>
       </div>
+      ${cloudCount() ? `<p class="hint" style="margin:8px 0 0">☁ ${cloudCount()} app${cloudCount() === 1 ? '' : 's'} (${fmtSize(cloudBytes())}) live in the cloud and use no space here.</p>` : ''}
       <div class="card-actions">
         <button class="btn" data-act="purge-signed">Clean signed files</button>
         <button class="btn" data-act="clear-temp">Clear temp</button>
       </div>
     </div>
+    <div class="section-title">Cloud Library <span class="count">saves space</span></div>
+    ${cloudSettingsHtml()}
     <div class="section-title">Signing</div>
     <div class="list">
       <div class="setting"><span>IPA compression</span>
         <select data-act="zip-level">${[0, 1, 3, 6, 9].map((n) => `<option value="${n}" ${n === Number(z) ? 'selected' : ''}>${n === 0 ? 'None (fastest)' : n === 9 ? 'Max (smallest)' : 'Level ' + n}</option>`).join('')}</select>
       </div>
+      <label class="setting"><span>Remove signed file after it installs<br><span class="hint">Frees the space right away. Re-sign any time.</span></span>
+        <span class="switch"><input type="checkbox" data-act="delete-after-install" ${state.settings.deleteAfterInstall !== false ? 'checked' : ''}><span></span></span></label>
       <div class="setting"><span>Delete signed files after</span>
         <select data-act="retention">${[[1, '1 day'], [3, '3 days'], [7, '7 days'], [30, '30 days'], [0, 'Never']].map(([n, l]) => `<option value="${n}" ${n === Number(state.settings.signedRetentionDays) ? 'selected' : ''}>${l}</option>`).join('')}</select>
       </div>
@@ -913,6 +1057,8 @@ function renderSettings() {
     <div class="list">
       <div class="setting"><span>Apps</span><span class="value">${state.apps.length} (${state.apps.filter((a) => a.published).length} shown)</span></div>
       <button class="row" data-act="manage-cats"><span class="row-main" style="font-weight:600">Categories</span><span class="value muted">${state.categories.length} ›</span></button>
+      <button class="row" data-act="manage-cols"><span class="row-main" style="font-weight:600">Collections</span><span class="value muted">${state.collections.length} ›</span></button>
+      <button class="row" data-act="announce"><span class="row-main" style="font-weight:600">📣 Announcement</span><span class="value muted">${state.announcement ? 'On' : 'Off'} ›</span></button>
       <div class="setting"><span>Your signed apps</span><span class="value">${state.signed.length}</span></div>
       <div class="setting"><span>Users</span><span class="value">${state.users.length}</span></div>
     </div>
@@ -936,6 +1082,7 @@ function bindView(view) {
       };
       return;
     }
+    if (act === 'delete-after-install') { el.onchange = () => saveSetting({ deleteAfterInstall: el.checked }, el.checked ? 'Signed files are removed after installing' : 'Signed files are kept after installing'); return; }
     if (act === 'retention') { el.onchange = () => saveSetting({ signedRetentionDays: Number(el.value) }); return; }
     if (act === 'udid-login') { el.onchange = () => saveSetting({ udidLogin: el.checked }, el.checked ? 'iPhone sign-in on' : 'iPhone sign-in off'); return; }
     if (el.tagName === 'A') return;
@@ -948,6 +1095,17 @@ function bindView(view) {
         'go-certs': () => switchTab('certs'),
         app: () => appSheet(idv),
         sign: () => signSheet(idv),
+        get: () => quickGet(idv),
+        collection: () => collectionSheet(idv),
+        'request-app': requestAppSheet,
+        'manage-cols': manageCollectionsSheet,
+        'add-source': addSourceSheet,
+        source: () => sourceSheet(idv),
+        github: githubSheet,
+        announce: announcementSheet,
+        appearance: appearanceSheet,
+        tour: () => tourSheet(true),
+        'dismiss-announce': dismissAnnouncement,
         signed: () => signedSheet(idv),
         resign: () => resignFromSigned(idv),
         install: () => startInstall(state.signed.find((x) => x.id === idv)),
@@ -997,38 +1155,274 @@ async function maintenance(action) {
   try { const { message } = await api('POST', '/api/maintenance', { action }); toast(message); await refresh(); } catch (e) { toast(e.message, true); }
 }
 
+// ---------- cloud library (sources + GitHub storage) ----------
+const cloudApps = () => state.apps.filter((a) => a.cloud);
+const cloudCount = () => cloudApps().length;
+const cloudBytes = () => cloudApps().reduce((n, a) => n + (a.size || 0), 0);
+const localApps = () => state.apps.filter((a) => !a.cloud);
+const SUGGESTED_SOURCES = [
+  { name: 'ryP0 Repository', url: 'https://github.com/Sami-Wali/ryP0-repository/blob/main/repo.json' },
+  { name: 'MikeBuilds', url: 'https://github.com/mikevillarroel/mikebuilds-source/blob/main/source.json' },
+];
+const rawGithub = (u) => String(u).replace(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/(?:blob|raw)\//, 'https://raw.githubusercontent.com/$1/$2/');
+
+function cloudSettingsHtml() {
+  const g = state.github || {};
+  const srcs = state.sources || [];
+  return `<div class="list">
+      ${srcs.map((src) => `
+        <button class="row" data-act="source" data-id="${src.id}">
+          ${iconHtml(src.iconURL || null, src.name)}
+          <span class="row-main"><span class="row-title">${esc(src.name)}</span>
+            <span class="row-sub">${src.lastError ? `<span style="color:var(--red)">⚠ ${esc(src.lastError)}</span>` : `${src.apps} app${src.apps === 1 ? '' : 's'} · synced ${ago(src.lastSync)}${src.showInLibrary === false ? ' · hidden' : ''}`}</span></span>
+          <span class="value muted">›</span>
+        </button>`).join('')}
+      <button class="row" data-act="add-source"><span class="row-main" style="font-weight:600;color:var(--accent)">＋ Add a source</span><span class="value muted">AltStore / ESign repos</span></button>
+      <button class="row" data-act="github">
+        <span class="row-main"><span class="row-title">GitHub storage</span>
+          <span class="row-sub">${g.connected ? `${esc(g.owner)}/${esc(g.repo)} · ${g.apps} app${g.apps === 1 ? '' : 's'}${g.lastError ? ' · ⚠ ' + esc(g.lastError) : ''}` : 'Keep your own IPAs in a private repo instead of here'}</span></span>
+        <span class="value ${g.connected ? '' : 'muted'}">${g.connected ? '<span class="badge good">On</span>' : 'Off ›'}</span>
+      </button>
+    </div>
+    <p class="hint" style="margin:8px 4px 0">Cloud apps only keep their info and icon here. The file is downloaded while signing and deleted right after, so your Railway volume stays empty.</p>`;
+}
+
+function addSourceSheet() {
+  const have = new Set((state.sources || []).map((x) => x.url));
+  const sugg = SUGGESTED_SOURCES.filter((x) => !have.has(rawGithub(x.url)));
+  openSheet(`
+    <h2>Add a Source</h2>
+    <p class="muted small" style="margin-top:-6px">A source is a list of apps someone keeps up to date (the same kind AltStore, SideStore, ESign and Feather use). Its apps show up in your library as links — nothing is downloaded to your server until someone signs one.</p>
+    <div class="field"><label>Source link</label><input type="url" id="srcUrl" placeholder="https://…/source.json" autocapitalize="off" autocorrect="off"><div class="hint">GitHub links work as-is — the page link is turned into the raw file for you.</div></div>
+    <div class="group">${toggle('srcShow', 'Show its apps to everyone', 'Turn off to keep them just for you until you check them out', true)}</div>
+    <button class="btn primary block" id="srcAdd" style="margin-top:12px">Add Source</button>
+    ${sugg.length ? `<div class="section-title">Suggested</div><div class="list">${sugg.map((x, i) => `
+      <div class="row">${iconHtml(null, x.name)}<div class="row-main"><div class="row-title">${esc(x.name)}</div><div class="row-sub mono small-break">${esc(x.url.replace('https://github.com/', ''))}</div></div><button class="pill" data-sugg="${i}">Add</button></div>`).join('')}</div>` : ''}
+    <div id="addProgress"></div>`, (el) => {
+    const add = async (url, btn) => {
+      if (!url) return toast('Paste a source link first', true);
+      el.querySelectorAll('button, input').forEach((b) => { b.disabled = true; });
+      const old = btn.textContent;
+      btn.textContent = 'Reading source…';
+      try {
+        const { source, result } = await api('POST', '/api/sources', { url, showInLibrary: $('#srcShow', el).checked });
+        await refresh();
+        toast(`Added ${source.name}: ${result.added} app${result.added === 1 ? '' : 's'}`);
+        sourceSheet(source.id);
+      } catch (e) {
+        toast(e.message, true);
+        el.querySelectorAll('button, input').forEach((b) => { b.disabled = false; });
+        btn.textContent = old;
+      }
+    };
+    $('#srcAdd', el).onclick = (e) => add($('#srcUrl', el).value.trim(), e.currentTarget);
+    el.querySelectorAll('[data-sugg]').forEach((b) => { b.onclick = () => add(sugg[Number(b.dataset.sugg)].url, b); });
+  });
+}
+
+function sourceSheet(sid) {
+  const src = (state.sources || []).find((x) => x.id === sid);
+  if (!src) return toast('Source not found', true);
+  const apps = state.apps.filter((a) => a.cloud === 'source' && a.sourceName === src.name);
+  const missing = apps.filter((a) => a.missing).length;
+  openSheet(`
+    <div class="sheet-head">${iconHtml(src.iconURL || null, src.name, true)}<div class="row-main"><h2>${esc(src.name)}</h2><div class="row-sub">${esc(src.subtitle || 'App source')}</div></div></div>
+    ${src.lastError ? `<p class="warning bad">Last refresh failed: ${esc(src.lastError)}</p>` : ''}
+    <dl class="kv card" style="margin:0">
+      <dt>Apps</dt><dd>${src.apps}${missing ? ` <span class="muted small">(+${missing} removed upstream)</span>` : ''}</dd>
+      <dt>Last refresh</dt><dd>${src.lastSync ? ago(src.lastSync) : 'never'}</dd>
+      <dt>Link</dt><dd class="mono small-break">${esc(src.url)}</dd>
+    </dl>
+    <p class="hint" style="margin:8px 4px 0">Refreshes by itself every 6 hours. New versions show as UPDATED in the library. Anything you edit on an app (name, category, description…) is kept when it refreshes.</p>
+    <div class="group" style="margin-top:12px">${toggle('srcShow', 'Show its apps to everyone', 'Off = only you can see them', src.showInLibrary !== false)}</div>
+    <div class="field" style="margin-top:12px"><label>Name in your library</label><input type="text" id="srcName" value="${esc(src.name)}" maxlength="60"></div>
+    <div class="actions">
+      <button class="btn primary block" id="srcSync">Refresh now</button>
+      ${apps.length ? `<button class="btn block" id="srcBrowse">See its ${apps.length} app${apps.length === 1 ? '' : 's'} in the library</button>` : ''}
+      <button class="btn block" id="srcSave">Save name</button>
+      <button class="btn block danger" id="srcDel">Remove source</button>
+    </div>`, (el) => {
+    $('#srcShow', el).onchange = async (e) => {
+      try { await api('PATCH', `/api/sources/${sid}`, { showInLibrary: e.target.checked }); await refresh(); toast(e.target.checked ? 'Shown to everyone' : 'Only you can see these apps now'); } catch (err) { toast(err.message, true); }
+    };
+    $('#srcSave', el).onclick = async () => {
+      try { await api('PATCH', `/api/sources/${sid}`, { name: $('#srcName', el).value }); await refresh(); toast('Renamed'); sourceSheet(sid); } catch (e) { toast(e.message, true); }
+    };
+    $('#srcSync', el).onclick = async (e) => {
+      const b = e.currentTarget;
+      b.disabled = true; b.textContent = 'Refreshing…';
+      try {
+        const { result: r } = await api('POST', `/api/sources/${sid}/sync`);
+        await refresh();
+        const bits = [r.added && `${r.added} new`, r.updated && `${r.updated} updated`, r.removed && `${r.removed} removed`].filter(Boolean);
+        toast(bits.length ? bits.join(' · ') : 'Already up to date');
+      } catch (err) { await refresh().catch(() => {}); toast(err.message, true); }
+      sourceSheet(sid);
+    };
+    if ($('#srcBrowse', el)) $('#srcBrowse', el).onclick = () => { closeSheet(); state.lib.cat = `src:${src.name}`; state.lib.q = ''; switchTab('library'); };
+    $('#srcDel', el).onclick = async () => {
+      if (!confirm(`Remove ${src.name}? Its ${apps.length} app${apps.length === 1 ? '' : 's'} leave the library. People who installed them keep them.`)) return;
+      try { await api('DELETE', `/api/sources/${sid}`); closeSheet(); toast('Source removed'); await refresh(); } catch (e) { toast(e.message, true); }
+    };
+  });
+}
+
+function parseRepo(v) {
+  const t = String(v || '').trim().replace(/^https?:\/\/(www\.)?github\.com\//i, '').replace(/\.git$/, '').replace(/\/+$/, '');
+  const [owner, repo] = t.split('/');
+  return { owner: owner || '', repo: repo || '' };
+}
+
+function githubSheet(editing = false) {
+  const g = state.github || {};
+  const local = localApps();
+  const localSize = local.reduce((n, a) => n + (a.size || 0), 0);
+  if (!g.connected || editing) {
+    openSheet(`
+      <h2>GitHub storage</h2>
+      <p class="muted small" style="margin-top:-6px">Keep your own IPAs in a GitHub repo (private works) instead of on Railway. Files up to 2 GB each, and it's free.</p>
+      ${editing ? '' : `<ol class="gh-steps">
+        <li>On github.com make a <b>new repository</b> (e.g. <span class="mono">mango-ipas</span>). Set it to <b>Private</b> and tick <b>Add a README</b>.</li>
+        <li>Go to <b>Settings › Developer settings › Personal access tokens › Fine-grained tokens</b> and tap <b>Generate new token</b>.</li>
+        <li>Under <b>Repository access</b> pick <b>Only select repositories</b> and choose that repo. Under <b>Permissions › Repository permissions</b> set <b>Contents</b> to <b>Read and write</b>. Pick the longest expiration you're happy with.</li>
+        <li>Copy the token and paste it below.</li>
+      </ol>`}
+      <div class="field"><label>Repository</label><input type="text" id="ghRepo" value="${g.owner ? esc(g.owner + '/' + g.repo) : ''}" placeholder="your-name/mango-ipas" autocapitalize="off" autocorrect="off"><div class="hint">owner/name, or paste the repo's link</div></div>
+      <div class="field"><label>Token</label><input type="password" id="ghToken" placeholder="${g.connected ? 'Leave blank to keep the current token' : 'github_pat_…'}" autocapitalize="off" autocorrect="off" autocomplete="off"><div class="hint">Stored encrypted on your server and never shown again.</div></div>
+      <button class="btn primary block" id="ghConnect">${g.connected ? 'Save' : 'Connect'}</button>
+      ${editing ? '<button class="btn block" id="ghBack" style="margin-top:8px">Back</button>' : ''}`, (el) => {
+      if ($('#ghBack', el)) $('#ghBack', el).onclick = () => githubSheet();
+      $('#ghConnect', el).onclick = async (e) => {
+        const { owner, repo } = parseRepo($('#ghRepo', el).value);
+        const btn = e.currentTarget;
+        btn.disabled = true; btn.textContent = 'Checking…';
+        try {
+          const { github, result } = await api('PUT', '/api/github', { owner, repo, token: $('#ghToken', el).value.trim() });
+          state.github = github;
+          await refresh();
+          toast(result && result.added ? `Connected · found ${result.added} app${result.added === 1 ? '' : 's'}` : 'GitHub connected');
+          githubSheet();
+        } catch (err) { toast(err.message, true); btn.disabled = false; btn.textContent = g.connected ? 'Save' : 'Connect'; }
+      };
+    });
+    return;
+  }
+  openSheet(`
+    <h2>GitHub storage</h2>
+    ${g.lastError ? `<p class="warning bad">${esc(g.lastError)}</p>` : ''}
+    <dl class="kv card" style="margin:0">
+      <dt>Repo</dt><dd>${esc(g.owner)}/${esc(g.repo)} ${g.private ? '<span class="badge">Private</span>' : '<span class="badge warn">Public</span>'}</dd>
+      <dt>Apps there</dt><dd>${g.apps}</dd>
+      <dt>Last sync</dt><dd>${g.lastSync ? ago(g.lastSync) : 'never'}</dd>
+    </dl>
+    <div class="group" style="margin-top:12px">${toggle('ghStore', 'Save new uploads to GitHub', 'Apps you upload go straight to your repo, then get removed from this server', g.storeUploads)}</div>
+    <p class="hint" style="margin:8px 4px 0">You can also add apps on github.com: open your repo › <b>Releases</b> › <b>Mango Library</b> › ✏️ Edit, drop .ipa files in, save, then tap <b>Sync</b> here.</p>
+    <div class="actions">
+      <button class="btn primary block" id="ghSync">Sync with GitHub</button>
+      ${local.length ? `<button class="btn block" id="ghMove">Move ${local.length} app${local.length === 1 ? '' : 's'} off this server (frees ${fmtSize(localSize)})</button>` : ''}
+      <a class="btn block" href="https://github.com/${encodeURIComponent(g.owner)}/${encodeURIComponent(g.repo)}/releases/tag/${encodeURIComponent(g.tag || 'mango-library')}" target="_blank" rel="noopener">Open the release on GitHub ↗</a>
+      <button class="btn block" id="ghEdit">Change repo or token</button>
+      <button class="btn block danger" id="ghOff">Disconnect</button>
+    </div>`, (el) => {
+    $('#ghStore', el).onchange = async (e) => {
+      try { state.github = (await api('PATCH', '/api/github', { storeUploads: e.target.checked })).github; toast(e.target.checked ? 'New uploads go to GitHub' : 'New uploads stay on this server'); } catch (err) { toast(err.message, true); }
+    };
+    $('#ghSync', el).onclick = async (e) => {
+      const b = e.currentTarget;
+      b.disabled = true; b.textContent = 'Syncing…';
+      try {
+        const { result: r } = await api('POST', '/api/github/sync');
+        await refresh();
+        const bits = [r.added && `${r.added} added`, r.removed && `${r.removed} removed`].filter(Boolean);
+        toast(bits.length ? bits.join(' · ') : 'Already in sync');
+        if (r.failed) toast(`${r.failed} file${r.failed === 1 ? '' : 's'} on GitHub couldn't be read (not a valid .ipa?)`, true);
+      } catch (err) { await refresh().catch(() => {}); toast(err.message, true); }
+      githubSheet();
+    };
+    if ($('#ghMove', el)) $('#ghMove', el).onclick = () => moveToGithubSheet(null, `${local.length} app${local.length === 1 ? '' : 's'}`);
+    $('#ghEdit', el).onclick = () => githubSheet(true);
+    $('#ghOff', el).onclick = async () => {
+      if (!confirm(`Disconnect GitHub? Your ${g.apps} GitHub app${g.apps === 1 ? '' : 's'} stay listed but can't be signed until you connect again. Nothing is deleted from GitHub.`)) return;
+      try { state.github = (await api('DELETE', '/api/github')).github; await refresh(); toast('Disconnected'); closeSheet(); } catch (e) { toast(e.message, true); }
+    };
+  });
+}
+
+function moveToGithubSheet(ids, label) {
+  openSheet(`
+    <h2>Move to GitHub</h2>
+    <p class="muted small" style="margin-top:-6px">Uploads ${esc(label)} to your repo, then deletes ${ids && ids.length === 1 ? 'it' : 'them'} from this server. Nothing changes for anyone using the library.</p>
+    <button class="btn primary block" id="mvGo">Move ${esc(label)}</button>
+    <div id="addProgress"></div>`, (el) => {
+    $('#mvGo', el).onclick = async () => {
+      const box = $('#addProgress', el);
+      el.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+      closeSheet.locked = true;
+      $('#sheet').classList.add('locked');
+      box.innerHTML = uploadProgressHtml();
+      keepAwake(true);
+      try {
+        const { jobId } = await api('POST', '/api/github/move', ids ? { ids } : {});
+        const r = await waitJob(jobId, (j) => {
+          if (j.progress != null) $('.bar > div', box).style.width = `${Math.round(j.progress * 100)}%`;
+          const step = [...j.log].reverse().find((l) => /^\(\d+\/\d+\)/.test(l));
+          $('#addMsg', box).textContent = `${step || 'Starting…'}${j.progress != null ? ` · ${Math.round(j.progress * 100)}%` : ''}`;
+        });
+        toast(`Moved ${r.moved} app${r.moved === 1 ? '' : 's'} · freed ${fmtSize(r.freed)}`);
+        if (r.errors && r.errors.length) toast(r.errors[0], true);
+      } catch (e) { toast(e.message, true); }
+      keepAwake(false);
+      closeSheet.locked = false;
+      $('#sheet').classList.remove('locked');
+      await refresh().catch(() => {});
+      ids && ids.length === 1 ? appSheet(ids[0]) : githubSheet();
+    };
+  });
+}
+
 // ---------- adding & updating apps ----------
 function uploadProgressHtml() {
   return `<div class="bar"><div></div></div><p class="muted small" id="addMsg">Starting…</p><p class="hint" id="addSub"></p>`;
 }
 
+// Uploads with GitHub storage on come back as a job (the file is sent on to GitHub).
+async function appFromResponse(r, setProgress) {
+  if (!r.jobId) return r;
+  return waitJob(r.jobId, (j) => setProgress(j.progress, j.progress != null ? `Saving to GitHub ${Math.round(j.progress * 100)}%` : (j.log.slice(-1)[0] || 'Saving…')));
+}
+const ghStoring = () => state.github && state.github.connected && state.github.storeUploads;
+
 function addAppSheet() {
   openSheet(`
     <h2>Add App</h2>
     <div class="actions">
-      <button class="file-btn" id="pickIpa">${ICONS.file}<div class="row-main"><div class="row-title">Choose .ipa file</div><div class="row-sub">From Files, iCloud Drive or Downloads. Big files resume if your connection drops.</div></div></button>
+      <button class="file-btn" id="pickIpa">${ICONS.file}<div class="row-main"><div class="row-title">Choose .ipa file</div><div class="row-sub">${ghStoring() ? 'Saved to your GitHub repo, not this server.' : 'From Files, iCloud Drive or Downloads. Big files resume if your connection drops.'}</div></div></button>
     </div>
-    <div class="section-title">Or import from a link (fastest for big games)</div>
+    <div class="section-title">Or add from a link</div>
     <div class="field"><input type="url" id="ipaUrl" placeholder="https://example.com/app.ipa" autocapitalize="off" autocorrect="off"><div class="hint">Direct download links only. Dropbox links work (dl=0 is fixed for you).</div></div>
-    <button class="btn block" id="importUrl">Import</button>
+    <div class="group">${toggle('linkOnly', 'Link only (uses no storage)', "Only the app's info and icon are saved. The file is downloaded fresh each time someone signs it.", true)}</div>
+    <button class="btn block" id="importUrl" style="margin-top:10px">Add from link</button>
+    <button class="link-btn block" id="goSources" type="button">☁ Add a whole source (AltStore / ESign repo) instead</button>
     <div id="addProgress"></div>`, (el) => {
+    $('#goSources', el).onclick = addSourceSheet;
     $('#pickIpa', el).onclick = async () => {
       const file = await pickFile('');
       if (!file) return;
       if (!/\.ipa$/i.test(file.name)) return toast('Pick an .ipa file', true);
       await runWithProgress(el, async (setProgress, setSub) => {
         const up = await uploadFile(file, (p) => setProgress(p, `Uploading ${Math.round(p * 100)}%`), setSub);
-        setProgress(1, 'Reading app info…');
+        setProgress(ghStoring() ? 0 : 1, 'Reading app info…');
         setSub('');
-        return api('POST', '/api/apps', { uploadId: up.uploadId, fileName: file.name });
+        return appFromResponse(await api('POST', '/api/apps', { uploadId: up.uploadId, fileName: file.name }), setProgress);
       }, (app) => { toast(`Added ${app.name}`); editAppSheet(app, true); });
     };
     $('#importUrl', el).onclick = async () => {
       const url = $('#ipaUrl', el).value.trim();
       if (!url) return toast('Paste a link first', true);
+      const linkOnly = $('#linkOnly', el).checked;
       await runWithProgress(el, async (setProgress) => {
-        const { jobId } = await api('POST', '/api/apps/import', { url });
-        return waitJob(jobId, (j) => setProgress(j.progress, j.progress != null ? `Downloading ${Math.round(j.progress * 100)}%` : (j.log.slice(-1)[0] || 'Downloading…')));
+        const { jobId } = await api('POST', linkOnly ? '/api/apps/link' : '/api/apps/import', { url });
+        return waitJob(jobId, (j) => setProgress(j.progress, j.progress != null ? `${linkOnly ? 'Reading' : 'Downloading'} ${Math.round(j.progress * 100)}%` : (j.log.slice(-1)[0] || 'Working…')));
       }, (app) => { toast(`Added ${app.name}`); editAppSheet(app, true); });
     };
   });
@@ -1062,13 +1456,15 @@ async function runWithProgress(el, work, onDone) {
 }
 
 function updateIpaSheet(a) {
+  const isLink = a.cloud === 'link';
   openSheet(`
     <div class="sheet-head">${appIcon(a, true)}<div class="row-main"><h2>Update ${esc(a.name)}</h2><div class="row-sub">Now ${esc(shownVersion(a) || '—')}</div></div></div>
     <p class="muted small">Swap in a new .ipa. The name, category, description, notes, icon and default sign settings all stay the same.</p>
-    <button class="file-btn" id="uPick">${ICONS.file}<div class="row-main"><div class="row-title">Choose new .ipa</div><div class="row-sub">Resumes if your connection drops</div></div></button>
+    <button class="file-btn" id="uPick">${ICONS.file}<div class="row-main"><div class="row-title">Choose new .ipa</div><div class="row-sub">${ghStoring() ? 'Saved to your GitHub repo' : 'Resumes if your connection drops'}</div></div></button>
     <div class="section-title">Or from a link</div>
     <div class="field"><input type="url" id="uUrl" placeholder="https://example.com/app.ipa" autocapitalize="off" autocorrect="off"></div>
-    <button class="btn block" id="uImport">Update from link</button>
+    <div class="group">${toggle('uLinkOnly', 'Link only (uses no storage)', 'Keeps just the link instead of downloading the file to the server', isLink || !a.cloud)}</div>
+    <button class="btn block" id="uImport" style="margin-top:10px">Update from link</button>
     <div id="addProgress"></div>`, (el) => {
     const done = (app) => { toast(`Updated to ${app.version || 'new version'}`); appSheet(app.id); };
     $('#uPick', el).onclick = async () => {
@@ -1077,16 +1473,18 @@ function updateIpaSheet(a) {
       if (!/\.ipa$/i.test(file.name)) return toast('Pick an .ipa file', true);
       await runWithProgress(el, async (setProgress, setSub) => {
         const up = await uploadFile(file, (p) => setProgress(p, `Uploading ${Math.round(p * 100)}%`), setSub);
-        setProgress(1, 'Reading app info…');
-        return api('POST', `/api/apps/${a.id}/replace`, { uploadId: up.uploadId });
+        setProgress(ghStoring() ? 0 : 1, 'Reading app info…');
+        setSub('');
+        return appFromResponse(await api('POST', `/api/apps/${a.id}/replace`, { uploadId: up.uploadId }), setProgress);
       }, done);
     };
     $('#uImport', el).onclick = async () => {
       const url = $('#uUrl', el).value.trim();
       if (!url) return toast('Paste a link first', true);
+      const linkOnly = $('#uLinkOnly', el).checked;
       await runWithProgress(el, async (setProgress) => {
-        const { jobId } = await api('POST', `/api/apps/${a.id}/replace`, { url });
-        return waitJob(jobId, (j) => setProgress(j.progress, j.progress != null ? `Downloading ${Math.round(j.progress * 100)}%` : (j.log.slice(-1)[0] || 'Downloading…')));
+        const { jobId } = await api('POST', `/api/apps/${a.id}/replace`, { url, linkOnly });
+        return waitJob(jobId, (j) => setProgress(j.progress, j.progress != null ? `${linkOnly ? 'Reading' : 'Downloading'} ${Math.round(j.progress * 100)}%` : (j.log.slice(-1)[0] || 'Working…')));
       }, done);
     };
   });
@@ -1097,27 +1495,67 @@ function appSheet(appId) {
   if (!a) return;
   const owner = isOwner();
   const defaults = defaultsSummary(a.signDefaults);
+  const total = a.likes + a.dislikes;
+  const pct = total ? Math.round((100 * a.likes) / total) : null;
+  const shots = a.screenshots || [];
+  const shotList = shotSrcs(a);
+  const versions = a.versions || [];
+  const inCols = state.collections.filter((c) => c.appIds.includes(a.id));
   openSheet(`
     <div class="sheet-head">${appIcon(a, true)}<div class="row-main"><h2>${esc(a.name)}</h2><div class="row-sub">${esc(a.developer || a.bundleId)}</div></div></div>
     <div class="badges" style="margin-top:0">
+      ${appBadges(a)}
       <span class="badge mango">${esc(catLabel(a.categoryId))}</span>
       ${a.featured ? '<span class="badge warn">★ Featured</span>' : ''}
-      ${owner && !a.published ? '<span class="badge">Hidden</span>' : ''}
       <span class="badge">v${esc(shownVersion(a) || '?')}</span>
       <span class="badge">${fmtSize(a.size)}</span>
     </div>
-    <button class="btn primary big block" id="aSign">Sign &amp; Install</button>
-    ${defaults.length ? `<p class="hint center" style="margin-top:8px">Comes set up with: ${esc(defaults.join(' · '))}</p>` : ''}
+    <div class="stat-row">
+      <div><b>${a.installCount || 0}</b><span>installs</span></div>
+      <div><b>${pct === null ? '—' : pct + '%'}</b><span>${total ? `liked · ${total} vote${total === 1 ? '' : 's'}` : 'no votes yet'}</span></div>
+      <div><b>${esc(a.minOS || '—')}</b><span>min iOS</span></div>
+    </div>
+    ${a.missing ? `<p class="warning bad">${owner ? `This app was removed from ${esc(a.sourceName || 'its source')}, so it's hidden from everyone. You can still try signing it if the link works, or delete it.` : 'This app is no longer available.'}</p>` : ''}
+    <button class="btn primary big block" id="aGet">${hasUpdate(a) ? `Update to ${esc(shownVersion(a))}` : a.installed ? 'Get Again' : 'Get'}</button>
+    ${a.installed ? `<p class="hint center" style="margin-top:8px">You installed ${esc(a.installed.version || '')} ${ago(a.installed.at)}</p>` : ''}
+    ${defaults.length ? `<p class="hint center" style="margin-top:${a.installed ? 2 : 8}px">Comes set up with: ${esc(defaults.join(' · '))}</p>` : ''}
+    <button class="link-btn block" id="aOptions" type="button">Sign with options…</button>
+
+    ${shotList.length ? `<div class="shots">${shotList.map((src, i) => `<button class="shot" data-shot="${i}"><img class="fade-img" loading="lazy" referrerpolicy="no-referrer" onload="this.classList.add('loaded')" onerror="this.closest('.shot').remove()" src="${esc(src)}" alt="Screenshot ${i + 1}"></button>`).join('')}</div>` : ''}
+
+    <div class="vote-row">
+      <span class="muted small">Do you like it?</span>
+      <button class="vote ${a.myVote > 0 ? 'on' : ''}" data-vote="1">👍 <b>${a.likes}</b></button>
+      <button class="vote down ${a.myVote < 0 ? 'on' : ''}" data-vote="-1">👎 <b>${a.dislikes}</b></button>
+    </div>
+
+    ${(a.tags || []).length ? `<div class="tag-row">${a.tags.map((t) => `<button class="tag" data-tag="${esc(t)}"># ${esc(t)}</button>`).join('')}</div>` : ''}
     ${a.description ? `<div class="section-title">About</div><p class="desc">${esc(a.description)}</p>` : ''}
     ${a.notes ? `<div class="section-title">What's changed / notes</div><p class="desc">${esc(a.notes)}</p>` : ''}
+    ${!a.notes && versions[0] && versions[0].notes ? `<div class="section-title">What's new in ${esc(versions[0].version || 'this version')}</div><p class="desc">${esc(versions[0].notes)}</p>` : ''}
+    ${versions.length > 1 ? `<div class="section-title">Other versions <span class="count">${versions.length - 1}</span></div>
+      <div class="list">${versions.slice(1).map((v, n) => `
+        <div class="row ver-row">
+          <div class="row-main">
+            <div class="row-title">${esc(v.version || 'Version ' + (n + 2))}${v.channel && v.channel !== 'stable' ? ` <span class="badge">${esc(v.channel)}</span>` : ''}</div>
+            <div class="row-sub">${[v.date ? esc(String(v.date).slice(0, 10)) : '', v.size ? fmtSize(v.size) : ''].filter(Boolean).join(' · ')}</div>
+            ${v.notes ? `<div class="row-sub ver-notes">${esc(v.notes)}</div>` : ''}
+          </div>
+          <button class="pill" data-ver="${n + 1}">Get</button>
+        </div>`).join('')}</div>
+      <p class="hint" style="margin:6px 4px 0">Older versions are handy if the newest one has a bug or needs a newer iOS.</p>` : ''}
+    ${inCols.length ? `<div class="section-title">In collections</div><div class="tag-row">${inCols.map((c) => `<button class="tag" data-col="${c.id}">${esc(c.emoji)} ${esc(c.name)}</button>`).join('')}</div>` : ''}
     <div class="section-title">Info</div>
     <dl class="kv card" style="margin:0">
-      <dt>Version</dt><dd>${esc(shownVersion(a) || '—')}${!a.versionOverride && a.build && a.build !== a.version ? ` (${esc(a.build)})` : ''}${a.versionOverride && isOwner() ? `<br><span class="muted small">file says ${esc(a.version || '?')}</span>` : ''}${a.previousVersion && a.previousVersion !== a.version ? `<br><span class="muted small">was ${esc(a.previousVersion)}</span>` : ''}</dd>
+      <dt>Version</dt><dd>${esc(shownVersion(a) || '—')}${!a.versionOverride && a.build && a.build !== a.version ? ` (${esc(a.build)})` : ''}${a.versionOverride && owner ? `<br><span class="muted small">file says ${esc(a.version || '?')}</span>` : ''}${a.previousVersion && a.previousVersion !== shownVersion(a) ? `<br><span class="muted small">was ${esc(a.previousVersion)}</span>` : ''}</dd>
       <dt>Bundle ID</dt><dd class="mono">${esc(a.bundleId)}</dd>
       <dt>Minimum iOS</dt><dd>${esc(a.minOS || '—')}</dd>
       <dt>Size</dt><dd>${fmtSize(a.size)}</dd>
       <dt>Extensions</dt><dd>${a.extensions || 0}${a.hasWatch ? ' + Watch app' : ''}</dd>
       <dt>${a.updatedAt && a.updatedAt !== a.addedAt ? 'Updated' : 'Added'}</dt><dd>${ago(a.updatedAt || a.addedAt)}</dd>
+      ${a.cloud === 'source' ? `<dt>Source</dt><dd>☁ ${esc(a.sourceName || '—')}</dd>` : ''}
+      ${owner ? `<dt>Stored on</dt><dd>${esc(storedLabel(a))}</dd>` : ''}
+      ${owner && a.remoteUrl ? `<dt>Link</dt><dd class="mono small-break">${esc(a.remoteUrl)}</dd>` : ''}
     </dl>
     ${owner ? `
     <div class="group" style="margin-top:14px">
@@ -1125,12 +1563,36 @@ function appSheet(appId) {
       ${toggle('aFeat', 'Featured', 'Pinned to the top of the library', a.featured)}
     </div>
     <div class="actions">
-      <button class="btn block" id="aEdit">Edit details &amp; sign settings</button>
-      <button class="btn block" id="aUpdate">Update IPA (new version)</button>
+      <button class="btn block" id="aEdit">Edit details, tags &amp; sign settings</button>
+      <button class="btn block" id="aShots">Screenshots (${shots.length})</button>
+      <button class="btn block" id="aCols">Add to collection</button>
+      ${a.cloud === 'source' ? `<p class="hint center">Updates come in by themselves when ${esc(a.sourceName || 'the source')} adds a new version.</p>` : '<button class="btn block" id="aUpdate">Update IPA (new version)</button>'}
+      ${!a.cloud && state.github.connected ? `<button class="btn block" id="aMoveGh">☁ Move to GitHub (frees ${fmtSize(a.size)})</button>` : ''}
       <a class="btn block" href="/api/apps/${a.id}/download">Download original .ipa</a>
       <button class="btn block danger" id="aDelete">Delete</button>
     </div>` : ''}`, (el) => {
-    $('#aSign', el).onclick = () => signSheet(a.id);
+    $('#aGet', el).onclick = () => quickGet(a.id);
+    $('#aOptions', el).onclick = () => signSheet(a.id);
+    el.querySelectorAll('[data-shot]').forEach((b) => { b.onclick = () => shotViewer(a, Number(b.dataset.shot)); });
+    el.querySelectorAll('[data-ver]').forEach((b) => {
+      b.onclick = () => {
+        if (!state.certs.length) { closeSheet(); toast('Add your certificate first', true); return switchTab('certs'); }
+        runSign(a, { ...signOptsFromDefaults(a), versionIndex: Number(b.dataset.ver) }, { icon: null, dylibs: [] });
+      };
+    });
+    el.querySelectorAll('[data-vote]').forEach((b) => {
+      b.onclick = async () => {
+        const v = Number(b.dataset.vote);
+        try {
+          const { app } = await api('POST', `/api/apps/${a.id}/vote`, { value: a.myVote === v ? 0 : v });
+          Object.assign(a, app);
+          appSheet(a.id);
+          render();
+        } catch (e) { toast(e.message, true); }
+      };
+    });
+    el.querySelectorAll('[data-tag]').forEach((b) => { b.onclick = () => { closeSheet(); state.lib.cat = `tag:${b.dataset.tag}`; state.lib.q = ''; switchTab('library'); }; });
+    el.querySelectorAll('[data-col]').forEach((b) => { b.onclick = () => collectionSheet(b.dataset.col); });
     if (!owner) return;
     const flip = (id, field, on, off) => {
       $(id, el).onchange = async (e) => {
@@ -1140,11 +1602,356 @@ function appSheet(appId) {
     flip('#aPub', 'published', 'Shown in App Library', 'Hidden from App Library');
     flip('#aFeat', 'featured', 'Featured ★', 'No longer featured');
     $('#aEdit', el).onclick = () => editAppSheet(a);
-    $('#aUpdate', el).onclick = () => updateIpaSheet(a);
+    $('#aShots', el).onclick = () => screenshotsSheet(a);
+    $('#aCols', el).onclick = () => addToCollectionSheet(a);
+    if ($('#aUpdate', el)) $('#aUpdate', el).onclick = () => updateIpaSheet(a);
+    if ($('#aMoveGh', el)) $('#aMoveGh', el).onclick = () => moveToGithubSheet([a.id], a.name);
     $('#aDelete', el).onclick = async () => {
       if (!confirm(`Delete ${a.name} from the library? People who already installed it keep it.`)) return;
       try { await api('DELETE', `/api/apps/${a.id}`); closeSheet(); toast('Deleted'); await refresh(); } catch (e) { toast(e.message, true); }
     };
+  });
+}
+
+// Full-screen screenshot viewer with swipe between images.
+// Your uploaded screenshots first, then any that came with the source.
+function shotSrcs(a) {
+  const local = (a.screenshots || []).map((sh) => `/api/apps/${a.id}/screenshots/${sh.id}`);
+  return local.length ? local : (a.remoteScreens || []);
+}
+
+function shotViewer(a, start = 0) {
+  const shots = shotSrcs(a);
+  const ov = document.createElement('div');
+  ov.className = 'viewer';
+  ov.innerHTML = `<button class="viewer-x" aria-label="Close">✕</button>
+    <div class="viewer-track">${shots.map((src) => `<div class="viewer-slide"><img src="${esc(src)}" referrerpolicy="no-referrer" alt=""></div>`).join('')}</div>
+    <div class="viewer-dots">${shots.map((_, i) => `<i data-i="${i}"></i>`).join('')}</div>`;
+  document.body.appendChild(ov);
+  const track = ov.querySelector('.viewer-track');
+  const dots = [...ov.querySelectorAll('.viewer-dots i')];
+  const mark = () => { const i = Math.round(track.scrollLeft / track.clientWidth); dots.forEach((d, n) => d.classList.toggle('on', n === i)); };
+  requestAnimationFrame(() => { track.scrollLeft = start * track.clientWidth; mark(); });
+  track.addEventListener('scroll', mark, { passive: true });
+  const close = () => { ov.classList.add('out'); setTimeout(() => ov.remove(), 220); };
+  ov.querySelector('.viewer-x').onclick = close;
+  ov.addEventListener('click', (e) => { if (e.target === ov || e.target.classList.contains('viewer-slide')) close(); });
+}
+
+function screenshotsSheet(a) {
+  const shots = a.screenshots || [];
+  openSheet(`
+    <h2>Screenshots</h2>
+    <p class="hint" style="margin-top:-6px">Up to 8. They show on the app's page — tap one there to view it full screen.</p>
+    <div class="shot-grid">${shots.map((sh, i) => `
+      <div class="shot-edit"><img src="/api/apps/${a.id}/screenshots/${sh.id}" alt="">
+        <div class="shot-tools">
+          <button class="mini" data-left="${i}" ${i === 0 ? 'disabled' : ''}>←</button>
+          <button class="mini danger" data-del="${sh.id}">✕</button>
+          <button class="mini" data-right="${i}" ${i === shots.length - 1 ? 'disabled' : ''}>→</button>
+        </div></div>`).join('')}</div>
+    ${shots.length < 8 ? `<button class="file-btn" id="shAdd">${ICONS.plus}<div class="row-main"><div class="row-title">Add screenshots</div><div class="row-sub">PNG, JPEG or WebP · pick several at once</div></div></button>` : ''}
+    <div id="addProgress"></div>
+    <button class="btn block" id="shBack" style="margin-top:12px">Back to ${esc(a.name)}</button>`, (el) => {
+    const reload = async (app) => { Object.assign(a, app); await refresh(); screenshotsSheet(state.apps.find((x) => x.id === a.id) || a); };
+    const move = async (from, to) => {
+      const ids = shots.map((s) => s.id);
+      ids.splice(to, 0, ids.splice(from, 1)[0]);
+      try { reload((await api('POST', `/api/apps/${a.id}/screenshots/order`, { ids })).app); } catch (e) { toast(e.message, true); }
+    };
+    el.querySelectorAll('[data-left]').forEach((b) => { b.onclick = () => move(+b.dataset.left, +b.dataset.left - 1); });
+    el.querySelectorAll('[data-right]').forEach((b) => { b.onclick = () => move(+b.dataset.right, +b.dataset.right + 1); });
+    el.querySelectorAll('[data-del]').forEach((b) => {
+      b.onclick = async () => { try { reload((await api('DELETE', `/api/apps/${a.id}/screenshots/${b.dataset.del}`)).app); } catch (e) { toast(e.message, true); } };
+    });
+    $('#shBack', el).onclick = () => appSheet(a.id);
+    if ($('#shAdd', el)) {
+      $('#shAdd', el).onclick = async () => {
+        const files = (await pickFile('image/*', true)) || [];
+        if (!files.length) return;
+        const box = $('#addProgress', el);
+        box.innerHTML = '<p class="muted small center">Uploading…</p>';
+        let app = a;
+        try {
+          for (const [i, f] of files.slice(0, 8 - shots.length).entries()) {
+            box.innerHTML = `<p class="muted small center">Uploading ${i + 1} of ${Math.min(files.length, 8 - shots.length)}…</p>`;
+            const up = await uploadFile(f);
+            app = (await api('POST', `/api/apps/${a.id}/screenshots`, { uploadId: up.uploadId })).app;
+          }
+          toast('Screenshots added');
+        } catch (e) { toast(e.message, true); }
+        reload(app);
+      };
+    }
+  });
+}
+
+// ---------- one-tap Get ----------
+function signOptsFromDefaults(a) {
+  const d = a.signDefaults || {};
+  return {
+    appId: a.id,
+    certId: (state.certs.find((c) => c.isDefault) || state.certs[0] || {}).id,
+    minOS: d.minOS || '',
+    entitlements: d.entitlements || [],
+    plist: d.plist || [],
+    removeExtensions: !!d.removeExtensions,
+    removeWatch: d.removeWatch !== undefined ? !!d.removeWatch : !!a.hasWatch,
+    removeUISD: !!d.removeUISD,
+    enableDocs: !!d.enableDocs,
+  };
+}
+
+// A signed copy is reusable if it's for this app, still on the server, signed with your default cert, and newer than the app.
+function reusableSigned(a) {
+  const cert = state.certs.find((c) => c.isDefault) || state.certs[0];
+  if (!cert) return null;
+  return state.signed.find((s) => s.appId === a.id && s.fileAvailable && s.certId === cert.id
+    && new Date(s.signedAt) >= new Date(a.updatedAt || a.addedAt) && !(s.options && (s.options.dylibs || []).length) && !(s.options && s.options.icon)
+    && !(s.options && s.options.versionIndex)) || null;
+}
+
+function quickGet(appId) {
+  const a = state.apps.find((x) => x.id === appId);
+  if (!a) return toast('That app is no longer in the library', true);
+  if (!state.certs.length) {
+    closeSheet();
+    toast('Add your certificate first', true);
+    return switchTab('certs');
+  }
+  const ready = reusableSigned(a);
+  if (ready) return startInstall(ready); // already signed — install right away
+  runSign(a, signOptsFromDefaults(a), { icon: null, dylibs: [] }, { quick: true });
+}
+
+// ---------- collections ----------
+function collectionSheet(cid) {
+  const c = state.collections.find((x) => x.id === cid);
+  if (!c) return;
+  const apps = c.appIds.map((x) => state.apps.find((a) => a.id === x)).filter(Boolean);
+  openSheet(`
+    <div class="sheet-head"><div class="app-icon big col-big">${esc(c.emoji)}</div><div class="row-main"><h2>${esc(c.name)}</h2><div class="row-sub">${apps.length} app${apps.length === 1 ? '' : 's'}</div></div></div>
+    ${c.description ? `<p class="desc">${esc(c.description)}</p>` : ''}
+    ${apps.length > 1 ? `<button class="btn primary big block" id="cAll">Get all ${apps.length}</button>` : ''}
+    <div class="list" style="margin-top:12px">${apps.map((a) => `
+      <div class="row" data-open="${a.id}">${appIcon(a)}
+        <div class="row-main"><div class="row-title">${esc(a.name)}</div><div class="row-sub">${esc(shownVersion(a))} · ${fmtSize(a.size)}</div>${appBadges(a, { compact: true }) ? `<div class="row-badges">${appBadges(a, { compact: true })}</div>` : ''}</div>
+        <button class="pill" data-get="${a.id}">${getLabel(a)}</button>
+      </div>`).join('')}</div>
+    ${isOwner() ? '<button class="btn block" id="cEdit" style="margin-top:12px">Edit collection</button>' : ''}`, (el) => {
+    el.querySelectorAll('[data-open]').forEach((r) => { r.onclick = () => appSheet(r.dataset.open); });
+    el.querySelectorAll('[data-get]').forEach((b) => { b.onclick = (e) => { e.stopPropagation(); quickGet(b.dataset.get); }; });
+    if ($('#cAll', el)) $('#cAll', el).onclick = () => getAll(apps, c.name);
+    if ($('#cEdit', el)) $('#cEdit', el).onclick = () => editCollectionSheet(c);
+  });
+}
+
+// Signs several apps one after another, then lists them with Install buttons (iOS needs a tap for each install).
+async function getAll(apps, title) {
+  if (!state.certs.length) { closeSheet(); toast('Add your certificate first', true); return switchTab('certs'); }
+  const rows = apps.map((a) => ({ a, status: reusableSigned(a) ? 'ready' : 'waiting', signed: reusableSigned(a) }));
+  closeSheet.locked = true;
+  const draw = () => {
+    openSheet(`
+      <h2>${esc(title)}</h2>
+      <p class="hint" style="margin-top:-6px">Each app installs with its own tap — your iPhone asks for every one.</p>
+      <div class="list">${rows.map((r, i) => `
+        <div class="row">${appIcon(r.a)}
+          <div class="row-main"><div class="row-title">${esc(r.a.name)}</div>
+            <div class="row-sub">${{ waiting: 'Waiting…', signing: 'Signing…', ready: 'Ready to install', failed: 'Failed — tap to retry' }[r.status]}</div></div>
+          ${r.status === 'ready' ? `<button class="pill" data-inst="${i}">Install</button>` : r.status === 'signing' ? '<div class="mini-spin"></div>' : r.status === 'failed' ? `<button class="pill dim" data-retry="${i}">Retry</button>` : ''}
+        </div>`).join('')}</div>
+      <button class="btn block" id="gaDone" style="margin-top:12px" ${closeSheet.locked ? 'disabled' : ''}>Done</button>`, (el) => {
+      el.querySelectorAll('[data-inst]').forEach((b) => { b.onclick = () => { const r = rows[+b.dataset.inst]; location.href = r.signed.installUrl; api('POST', `/api/signed/${r.signed.id}/install`).catch(() => {}); b.textContent = 'Opening…'; }; });
+      el.querySelectorAll('[data-retry]').forEach((b) => { b.onclick = () => { rows[+b.dataset.retry].status = 'waiting'; run(); }; });
+      $('#gaDone', el).onclick = () => { closeSheet(); };
+    });
+  };
+  const run = async () => {
+    closeSheet.locked = true;
+    draw();
+    for (const r of rows) {
+      if (r.status !== 'waiting') continue;
+      r.status = 'signing';
+      draw();
+      try {
+        const { jobId } = await api('POST', '/api/sign', signOptsFromDefaults(r.a));
+        const res = await waitJob(jobId);
+        r.signed = res.signed;
+        r.status = 'ready';
+      } catch { r.status = 'failed'; }
+      draw();
+    }
+    closeSheet.locked = false;
+    $('#sheet').classList.remove('locked');
+    await refresh().catch(() => {});
+    draw();
+  };
+  run();
+}
+
+function manageCollectionsSheet() {
+  const cols = [...state.collections];
+  openSheet(`
+    <h2>Collections</h2>
+    <p class="hint" style="margin-top:-6px">Bundles of apps people can get together, like "Emulator setup". Shown as a shelf in the library.</p>
+    <div class="list">${cols.map((c) => `
+      <button class="row" data-ed="${c.id}"><span class="cat-emoji">${esc(c.emoji)}</span>
+        <div class="row-main"><div class="row-title">${esc(c.name)}</div><div class="row-sub">${c.appIds.length} apps</div></div><span class="value muted">›</span></button>`).join('') || '<div class="setting muted">No collections yet</div>'}</div>
+    <button class="btn primary block" id="colNew" style="margin-top:12px">+ New collection</button>`, (el) => {
+    el.querySelectorAll('[data-ed]').forEach((b) => { b.onclick = () => editCollectionSheet(state.collections.find((c) => c.id === b.dataset.ed)); });
+    $('#colNew', el).onclick = () => editCollectionSheet(null);
+  });
+}
+
+function editCollectionSheet(c) {
+  const isNew = !c;
+  const sel = new Set(c ? c.appIds : []);
+  openSheet(`
+    <h2>${isNew ? 'New collection' : 'Edit collection'}</h2>
+    <div class="field"><label>Name</label><input type="text" id="coName" value="${esc(c ? c.name : '')}" placeholder="e.g. Emulator setup"></div>
+    <div class="field"><label>Emoji</label><input type="text" id="coEmoji" value="${esc(c ? c.emoji : '📦')}" maxlength="8"></div>
+    <div class="field"><label>Description</label><textarea id="coDesc" placeholder="What's in it and why">${esc(c ? c.description : '')}</textarea></div>
+    <div class="section-title">Apps <span class="count" id="coCount">${sel.size}</span></div>
+    <div class="list">${state.apps.map((a) => `
+      <div class="row ${sel.has(a.id) ? 'selected' : ''}" data-pick="${a.id}"><span class="check ${sel.has(a.id) ? 'on' : ''}">${sel.has(a.id) ? ICONS.check : ''}</span>${appIcon(a)}
+        <div class="row-main"><div class="row-title">${esc(a.name)}</div><div class="row-sub">${esc(catLabel(a.categoryId))}</div></div></div>`).join('')}</div>
+    <button class="btn primary big block" id="coSave" style="margin-top:14px">Save</button>
+    ${isNew ? '' : '<button class="btn block danger" id="coDel" style="margin-top:8px">Delete collection</button>'}`, (el) => {
+    el.querySelectorAll('[data-pick]').forEach((r) => {
+      r.onclick = () => {
+        const x = r.dataset.pick;
+        sel.has(x) ? sel.delete(x) : sel.add(x);
+        const on = sel.has(x);
+        r.classList.toggle('selected', on);
+        const ch = r.querySelector('.check');
+        ch.classList.toggle('on', on);
+        ch.innerHTML = on ? ICONS.check : '';
+        $('#coCount', el).textContent = sel.size;
+      };
+    });
+    $('#coSave', el).onclick = async () => {
+      const body = { name: $('#coName', el).value, emoji: $('#coEmoji', el).value, description: $('#coDesc', el).value, appIds: [...sel] };
+      try {
+        if (isNew) await api('POST', '/api/collections', body); else await api('PATCH', `/api/collections/${c.id}`, body);
+        await refresh();
+        toast('Collection saved');
+        manageCollectionsSheet();
+      } catch (e) { toast(e.message, true); }
+    };
+    if ($('#coDel', el)) {
+      $('#coDel', el).onclick = async () => {
+        if (!confirm(`Delete ${c.name}? The apps stay in the library.`)) return;
+        try { await api('DELETE', `/api/collections/${c.id}`); await refresh(); toast('Deleted'); manageCollectionsSheet(); } catch (e) { toast(e.message, true); }
+      };
+    }
+  });
+}
+
+function addToCollectionSheet(a) {
+  openSheet(`
+    <h2>Add ${esc(a.name)} to…</h2>
+    <div class="list">${state.collections.map((c) => `
+      <button class="row" data-c="${c.id}"><span class="cat-emoji">${esc(c.emoji)}</span><div class="row-main"><div class="row-title">${esc(c.name)}</div></div>
+        <span class="value">${c.appIds.includes(a.id) ? '✓' : ''}</span></button>`).join('') || '<div class="setting muted">No collections yet</div>'}</div>
+    <button class="btn block" id="acNew" style="margin-top:12px">+ New collection</button>
+    <button class="btn block" id="acBack" style="margin-top:8px">Back</button>`, (el) => {
+    el.querySelectorAll('[data-c]').forEach((b) => {
+      b.onclick = async () => {
+        const c = state.collections.find((x) => x.id === b.dataset.c);
+        const ids = c.appIds.includes(a.id) ? c.appIds.filter((x) => x !== a.id) : [...c.appIds, a.id];
+        try { await api('PATCH', `/api/collections/${c.id}`, { appIds: ids }); await refresh(); addToCollectionSheet(a); } catch (e) { toast(e.message, true); }
+      };
+    });
+    $('#acNew', el).onclick = () => editCollectionSheet({ id: null, name: '', emoji: '📦', description: '', appIds: [a.id] });
+    $('#acBack', el).onclick = () => appSheet(a.id);
+  });
+}
+
+// ---------- app requests ----------
+function requestAppSheet() {
+  openSheet(`
+    <h2>Request an App</h2>
+    <p class="hint" style="margin-top:-6px">Ask for an app to be added to the library. You'll see the answer in ${isOwner() ? 'Users' : 'Account'} › Requests.</p>
+    <div class="field"><label>App name</label><input type="text" id="rqName" placeholder="e.g. Delta Emulator"></div>
+    <div class="field"><label>Link (optional)</label><input type="url" id="rqLink" placeholder="Where to find it" autocapitalize="off" autocorrect="off"></div>
+    <div class="field"><label>Anything else? (optional)</label><textarea id="rqNote" placeholder="Version, tweaks you want, why…"></textarea></div>
+    <button class="btn primary big block" id="rqSend">Send Request</button>`, (el) => {
+    $('#rqSend', el).onclick = async () => {
+      try {
+        await api('POST', '/api/requests', { name: $('#rqName', el).value, link: $('#rqLink', el).value, note: $('#rqNote', el).value });
+        closeSheet();
+        toast('Request sent 🙌');
+        await refresh();
+      } catch (e) { toast(e.message, true); }
+    };
+  });
+}
+
+const REQ_STATUS = { pending: ['⏳ Waiting', ''], added: ['✅ Added', 'good'], declined: ['✕ Declined', 'bad'] };
+function requestRow(r) {
+  const [label, cls] = REQ_STATUS[r.status] || REQ_STATUS.pending;
+  return `<div class="row" data-req="${r.id}">
+    <div class="row-main"><div class="row-title">${esc(r.name)}</div>
+      <div class="row-sub">${isOwner() ? `${esc(r.username || '?')} · ` : ''}${ago(r.createdAt)}${r.reply ? ` · “${esc(r.reply)}”` : ''}</div></div>
+    <span class="badge ${cls}">${label}</span></div>`;
+}
+
+function requestSheet(rid) {
+  const r = state.requests.find((x) => x.id === rid);
+  if (!r) return;
+  const app = r.appId && state.apps.find((a) => a.id === r.appId);
+  openSheet(`
+    <h2>${esc(r.name)}</h2>
+    <dl class="kv">
+      ${isOwner() ? `<dt>From</dt><dd>${esc(r.username || '?')}</dd>` : ''}
+      <dt>Asked</dt><dd>${ago(r.createdAt)}</dd>
+      <dt>Status</dt><dd>${REQ_STATUS[r.status][0]}</dd>
+      ${r.link ? `<dt>Link</dt><dd><a href="${esc(r.link)}" target="_blank" rel="noopener">${esc(r.link)}</a></dd>` : ''}
+    </dl>
+    ${r.note ? `<p class="desc">${esc(r.note)}</p>` : ''}
+    ${r.reply ? `<p class="setup-note">💬 ${esc(r.reply)}</p>` : ''}
+    ${app ? `<button class="btn primary block" id="rqOpen">Open ${esc(app.name)}</button>` : ''}
+    ${isOwner() ? `
+      <div class="field" style="margin-top:12px"><label>Reply (optional)</label><input type="text" id="rqReply" value="${esc(r.reply || '')}" placeholder="e.g. Added! Turn on JIT first"></div>
+      <div class="field"><label>Link it to a library app (optional)</label><select id="rqApp"><option value="">—</option>${state.apps.map((a) => `<option value="${a.id}" ${a.id === r.appId ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select></div>
+      <div class="card-actions">
+        <button class="btn" id="rqAdded">✅ Mark added</button>
+        <button class="btn" id="rqDecline">✕ Decline</button>
+      </div>` : ''}
+    ${isOwner() || r.status === 'pending' ? '<button class="btn block danger" id="rqDel" style="margin-top:8px">Delete request</button>' : ''}`, (el) => {
+    if ($('#rqOpen', el)) $('#rqOpen', el).onclick = () => appSheet(app.id);
+    const set = async (status) => {
+      try {
+        await api('PATCH', `/api/requests/${r.id}`, { status, reply: $('#rqReply', el).value, appId: $('#rqApp', el).value });
+        await refresh();
+        toast(status === 'added' ? 'Marked as added' : 'Declined');
+        closeSheet();
+      } catch (e) { toast(e.message, true); }
+    };
+    if ($('#rqAdded', el)) $('#rqAdded', el).onclick = () => set('added');
+    if ($('#rqDecline', el)) $('#rqDecline', el).onclick = () => set('declined');
+    if ($('#rqDel', el)) {
+      $('#rqDel', el).onclick = async () => {
+        try { await api('DELETE', `/api/requests/${r.id}`); await refresh(); toast('Deleted'); closeSheet(); } catch (e) { toast(e.message, true); }
+      };
+    }
+  });
+}
+
+// ---------- QR codes ----------
+function qrSheet(title, url, back) {
+  openSheet(`
+    <h2>${esc(title)}</h2>
+    <p class="hint" style="margin-top:-6px">Scan with another iPhone's Camera to open the install page.</p>
+    <div class="qr-box"><img src="/api/qr?text=${encodeURIComponent(url)}" alt="QR code"></div>
+    <p class="mono center" style="word-break:break-all;color:var(--muted)">${esc(url)}</p>
+    <div class="actions">
+      <button class="btn block" id="qrCopy">Copy link</button>
+      ${back ? '<button class="btn block" id="qrBack">Back</button>' : ''}
+    </div>`, (el) => {
+    $('#qrCopy', el).onclick = () => copy(url, 'Link copied');
+    if (back) $('#qrBack', el).onclick = back;
   });
 }
 
@@ -1164,6 +1971,9 @@ function editAppSheet(a, isNew = false) {
 
     <div class="field"><label>Name in the library</label><input type="text" id="eName" value="${esc(a.name)}"></div>
     <div class="field"><label>Category</label>${categorySelectHtml(a.categoryId)}</div>
+    <div class="field"><label>Tags</label><input type="text" id="eTags" value="${esc((a.tags || []).join(', '))}" placeholder="e.g. Needs JIT, Controller support" autocapitalize="words">
+      <div class="tag-row" id="eTagSuggest">${[...new Set(['Needs JIT', 'Controller support', 'iPad friendly', 'Tweaked', 'No ads', ...state.apps.flatMap((x) => x.tags || [])])].map((t) => `<button type="button" class="tag small" data-addtag="${esc(t)}">+ ${esc(t)}</button>`).join('')}</div>
+      <div class="hint">Separate with commas. Tags show on the app's page and as filters in the library.</div></div>
     <div class="field"><label>Version</label><input type="text" id="eVer" value="${esc(a.versionOverride || '')}" placeholder="${esc(a.version || '1.0')}" autocapitalize="off" autocorrect="off">
       <div class="hint">Leave blank to use the version from the .ipa (${esc(a.version || 'none')}). Cleared automatically when you Update IPA.</div></div>
     <div class="group">${toggle('eVerSign', 'Use this version when signing', 'Installed apps show it in Settings › General › iPhone Storage. Only numbers, letters, dots and dashes are used.', a.useVersionWhenSigning !== false)}</div>
@@ -1189,6 +1999,14 @@ function editAppSheet(a, isNew = false) {
     <button class="btn primary big block" id="eSave">Save</button>
     <div style="height:6px"></div>`, (el) => {
     const collect = bindSignOptions(el, a.signDefaults || {}, 'd');
+    el.querySelectorAll('[data-addtag]').forEach((b) => {
+      b.onclick = () => {
+        const input = $('#eTags', el);
+        const tags = input.value.split(',').map((t) => t.trim()).filter(Boolean);
+        if (!tags.includes(b.dataset.addtag)) tags.push(b.dataset.addtag);
+        input.value = tags.join(', ');
+      };
+    });
     const onCatChange = async (e) => {
       if (e.target.value !== '__new') return;
       const cat = await promptNewCategory();
@@ -1213,6 +2031,7 @@ function editAppSheet(a, isNew = false) {
           name: $('#eName', el).value,
           categoryId: $('#eCat', el).value === '__new' ? a.categoryId : ($('#eCat', el).value || null),
           developer: $('#eDev', el).value,
+          tags: $('#eTags', el).value.split(',').map((t) => t.trim()).filter(Boolean),
           versionOverride: $('#eVer', el).value.trim(),
           useVersionWhenSigning: $('#eVerSign', el).checked,
           description: $('#eDesc', el).value,
@@ -1314,7 +2133,10 @@ function signSheet(appId, overrides) {
       <select id="sCert">${state.certs.map((c) => `<option value="${c.id}" ${c.id === def.id ? 'selected' : ''}>${esc(c.label)} · ${esc(c.profile.type)}</option>`).join('')}</select>
       <div class="hint" id="sCertHint"></div>
     </div>
+    ${(a.versions || []).length > 1 ? `<div class="field"><label>App version</label>
+      <select id="sVer">${a.versions.map((v, i) => `<option value="${i}" ${i === (Number(defaults.versionIndex) || 0) ? 'selected' : ''}>${esc(v.version || 'Version ' + (i + 1))}${i === 0 ? ' (newest)' : ''}${v.date ? ' · ' + esc(String(v.date).slice(0, 10)) : ''}</option>`).join('')}</select></div>` : ''}
     ${summary.length ? `<p class="setup-note">✨ Set up for you: ${esc(summary.join(' · '))}</p>` : ''}
+    ${state.signed.some((x) => x.appId === a.id) ? '<p class="hint center" style="margin:-4px 0 10px">This replaces your current signed copy of this app.</p>' : ''}
     <button class="btn primary big block" id="sGo">Sign App</button>
     <button class="link-btn block" id="sMore" type="button">More options ▾</button>
 
@@ -1419,6 +2241,7 @@ function signSheet(appId, overrides) {
         removeWatch: !!o.removeWatch,
         removeUISD: !!o.removeUISD,
         enableDocs: !!o.enableDocs,
+        versionIndex: $('#sVer', el) ? Number($('#sVer', el).value) : 0,
       };
       runSign(a, opts, extra);
     };
@@ -1512,12 +2335,14 @@ function showSigned(s, opts = {}) {
       <div class="actions" style="margin-top:14px">
         <button class="btn primary big block" data-install="${s.id}">Install</button>
         <button class="btn block" id="okShare">Copy install link</button>
+        <button class="btn block" id="okQr">Show QR code</button>
         <button class="btn block" id="okDone">Done</button>
       </div>
       ${jit ? '<p class="warning" style="text-align:left">JIT is allowed for this app. Open StikDebug (or your JIT tool) and turn on JIT for it each time you launch it.</p>' : ''}
       <p class="hint" style="margin-top:12px">After tapping Install, go to your home screen to watch it download. For enterprise certs you may need to trust it in Settings › General › VPN &amp; Device Management.</p>
     </div>`, (el) => {
     $('#okShare', el).onclick = () => copy(s.shareUrl, 'Install link copied');
+    $('#okQr', el).onclick = () => qrSheet(`Install ${s.name}`, s.shareUrl, () => showSigned(s, opts));
     $('#okDone', el).onclick = () => { closeSheet(); switchTab('signed'); };
   });
 }
@@ -1544,12 +2369,14 @@ function signedSheet(sid) {
     <div class="actions">
       ${s.fileAvailable ? `<button class="btn primary big block" data-install="${s.id}">Install</button>
       <button class="btn block" id="gShare">Copy install link</button>
+      <button class="btn block" id="gQr">Show QR code</button>
       <a class="btn block" href="${esc(s.downloadUrl)}">Download signed .ipa</a>` : ''}
       <button class="btn ${s.fileAvailable ? '' : 'primary big'} block" id="gResign">Sign again</button>
       ${s.fileAvailable ? '<button class="btn block" id="gRelink">Reset install link</button>' : ''}
       <button class="btn block danger" id="gDelete">Delete</button>
     </div>`, (el) => {
     if ($('#gShare', el)) $('#gShare', el).onclick = () => copy(s.shareUrl, 'Install link copied');
+    if ($('#gQr', el)) $('#gQr', el).onclick = () => qrSheet(`Install ${s.name}`, s.shareUrl, () => signedSheet(s.id));
     $('#gResign', el).onclick = () => resignFromSigned(s.id);
     if ($('#gRelink', el)) {
       $('#gRelink', el).onclick = async () => {
@@ -1563,6 +2390,11 @@ function signedSheet(sid) {
     };
   });
 }
+
+document.addEventListener('click', (e) => {
+  const r = e.target.closest('[data-req]');
+  if (r && !e.target.closest('.sheet button, .sheet a') ) requestSheet(r.dataset.req);
+});
 
 // ---------- install progress ----------
 document.addEventListener('click', (e) => {
@@ -1661,7 +2493,7 @@ function installSheet(s) {
       sub.textContent = `${fmtSize(st.sent)} of ${fmtSize(st.size)}${rate > 1024 ? ` · ${fmtSize(rate)}/s · ${fmtTime((st.size - st.sent) / rate)} left` : ''}`;
       hint('');
     } else if (st.phase === 'done') {
-      if (!doneSeen) doneSeen = now;
+      if (!doneSeen) { doneSeen = now; confetti(); refresh().catch(() => {}); }
       pctEl.textContent = '100%';
       title.textContent = 'Downloaded ✓';
       sub.textContent = 'Your iPhone is finishing the install — check your Home Screen.';
@@ -1674,6 +2506,181 @@ function installSheet(s) {
     setTimeout(tick, document.visibilityState === 'visible' ? 600 : 2000);
   };
   setTimeout(tick, 400);
+}
+
+// ---------- themes ----------
+const THEMES = [
+  { id: 'mango', label: 'Mango', colors: ['#140c1a', '#241830'] },
+  { id: 'midnight', label: 'Midnight', colors: ['#0b1020', '#161e36'] },
+  { id: 'amoled', label: 'AMOLED', colors: ['#000000', '#111111'] },
+  { id: 'light', label: 'Light', colors: ['#f6f2ee', '#ffffff'] },
+];
+const ACCENTS = [
+  { id: 'mango', label: 'Mango', color: '#ff9f1c' },
+  { id: 'pink', label: 'Pink', color: '#ff5fa2' },
+  { id: 'blue', label: 'Blue', color: '#4c9dff' },
+  { id: 'green', label: 'Green', color: '#3fcf8e' },
+  { id: 'purple', label: 'Purple', color: '#a87bff' },
+  { id: 'red', label: 'Red', color: '#ff5c5c' },
+];
+function getPref(key, fallback) { try { return localStorage.getItem(key) || fallback; } catch { return fallback; } }
+function setPref(key, value) { try { localStorage.setItem(key, value); } catch { /* */ } }
+function applyTheme() {
+  const theme = getPref('mango.theme', 'mango');
+  const accent = getPref('mango.accent', 'mango');
+  document.documentElement.dataset.theme = theme;
+  document.documentElement.dataset.accent = accent;
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.content = (THEMES.find((t) => t.id === theme) || THEMES[0]).colors[0];
+}
+function themeLabel() {
+  const t = THEMES.find((x) => x.id === getPref('mango.theme', 'mango')) || THEMES[0];
+  const a = ACCENTS.find((x) => x.id === getPref('mango.accent', 'mango')) || ACCENTS[0];
+  return t.id === 'mango' && a.id === 'mango' ? 'Mango' : `${t.label} · ${a.label}`;
+}
+applyTheme();
+
+function appearanceSheet() {
+  const theme = getPref('mango.theme', 'mango');
+  const accent = getPref('mango.accent', 'mango');
+  openSheet(`
+    <h2>Appearance</h2>
+    <p class="hint" style="margin-top:-6px">Saved on this device.</p>
+    <div class="section-title">Theme</div>
+    <div class="theme-grid">${THEMES.map((t) => `
+      <button class="theme-card ${t.id === theme ? 'on' : ''}" data-theme-pick="${t.id}">
+        <span class="theme-preview" style="background:${t.colors[0]}"><i style="background:${t.colors[1]}"></i><i style="background:${t.colors[1]}"></i></span>
+        <span>${t.label}</span></button>`).join('')}</div>
+    <div class="section-title">Accent color</div>
+    <div class="accent-row">${ACCENTS.map((a) => `<button class="accent ${a.id === accent ? 'on' : ''}" data-accent-pick="${a.id}" style="--c:${a.color}" aria-label="${a.label}"></button>`).join('')}</div>
+    <div class="section-title">Library layout</div>
+    <div class="seg wide">
+      <button data-layout="list" class="${libView() === 'list' ? 'on' : ''}">☰ List</button>
+      <button data-layout="grid" class="${libView() === 'grid' ? 'on' : ''}">▦ Grid</button>
+    </div>
+    <button class="btn primary big block" id="apDone" style="margin-top:18px">Done</button>`, (el) => {
+    el.querySelectorAll('[data-theme-pick]').forEach((b) => { b.onclick = () => { setPref('mango.theme', b.dataset.themePick); applyTheme(); appearanceSheet(); render(); }; });
+    el.querySelectorAll('[data-accent-pick]').forEach((b) => { b.onclick = () => { setPref('mango.accent', b.dataset.accentPick); applyTheme(); appearanceSheet(); render(); }; });
+    el.querySelectorAll('[data-layout]').forEach((b) => { b.onclick = () => { setPref('mango.libView', b.dataset.layout); appearanceSheet(); render(); }; });
+    $('#apDone', el).onclick = closeSheet;
+  });
+}
+
+// ---------- announcements ----------
+function announcementHtml() {
+  const an = state.announcement;
+  if (!an) return '';
+  if (getPref('mango.dismissedAnnouncement', '') === an.id) return '';
+  const icon = { info: '📣', success: '✅', warning: '⚠️', party: '🎉' }[an.style] || '📣';
+  return `<div class="announce ${esc(an.style)}"><span class="announce-icon">${icon}</span><p>${esc(an.text)}</p>
+    <button class="announce-x" data-act="dismiss-announce" aria-label="Dismiss">✕</button></div>`;
+}
+function dismissAnnouncement() {
+  if (state.announcement) setPref('mango.dismissedAnnouncement', state.announcement.id);
+  const el = $('.announce');
+  if (el) { el.classList.add('out'); setTimeout(render, 220); } else render();
+}
+function announcementSheet() {
+  const an = state.announcement || {};
+  openSheet(`
+    <h2>📣 Announcement</h2>
+    <p class="hint" style="margin-top:-6px">Shows at the top of the app for everyone until they dismiss it. Posting a new one shows it again to everybody.</p>
+    <div class="field"><label>Message</label><textarea id="anText" placeholder="e.g. New emulators just dropped! Update GTA to 1.5.2.">${esc(an.text || '')}</textarea></div>
+    <div class="field"><label>Style</label>
+      <select id="anStyle">${[['info', '📣 Info'], ['success', '✅ Good news'], ['warning', '⚠️ Heads up'], ['party', '🎉 Party']].map(([k, l]) => `<option value="${k}" ${an.style === k ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
+    <button class="btn primary big block" id="anPost">Post</button>
+    ${an.text ? '<button class="btn block danger" id="anRemove" style="margin-top:8px">Remove announcement</button>' : ''}`, (el) => {
+    $('#anPost', el).onclick = async () => {
+      try {
+        await api('PUT', '/api/announcement', { text: $('#anText', el).value, style: $('#anStyle', el).value });
+        await refresh();
+        closeSheet();
+        toast('Announcement posted');
+      } catch (e) { toast(e.message, true); }
+    };
+    if ($('#anRemove', el)) {
+      $('#anRemove', el).onclick = async () => {
+        try { await api('PUT', '/api/announcement', { text: '' }); await refresh(); closeSheet(); toast('Announcement removed'); } catch (e) { toast(e.message, true); }
+      };
+    }
+  });
+}
+
+// ---------- welcome tour ----------
+function tourSheet(force = false) {
+  const slides = isOwner()
+    ? [
+      ['🥭', 'Welcome to Mango Signer', 'Your own app signer. Upload apps, sign them with your certificate, and install them right from Safari.'],
+      ['📦', 'Build your library', 'Tap + in Library to add an .ipa or paste a link. Give apps categories, tags, screenshots and default settings.'],
+      ['🛡️', 'Add your certificate', 'In Certificates, add your .p12 and .mobileprovision. Mango checks it and shows what it allows.'],
+      ['📲', 'Tap Get', 'Mango signs the app and opens the install pop-up. Watch the ring fill up as it installs.'],
+      ['👥', 'Invite friends', 'Make invite codes in Users. Friends bring their own certificate and get everything in your library.'],
+    ]
+    : [
+      ['🥭', 'Welcome to Mango Signer', 'Sign and install apps from the App Library right from Safari.'],
+      ['🛡️', 'Add your certificate', 'Go to Certificates and add your .p12 and .mobileprovision. It stays private to your account.'],
+      ['📲', 'Tap Get', 'Pick any app and tap Get. It\'s already set up — just tap Install on the pop-up and watch the ring fill up.'],
+      ['⬆️', 'Stay up to date', 'Apps you installed show ✓ Installed, and ⬆ Update when there\'s a newer version. Can\'t find something? Request it!'],
+    ];
+  let i = 0;
+  const draw = () => {
+    const [emoji, title, text] = slides[i];
+    openSheet(`
+      <div class="tour">
+        <div class="tour-emoji">${emoji}</div>
+        <h2>${esc(title)}</h2>
+        <p class="muted">${esc(text)}</p>
+        <div class="tour-dots">${slides.map((_, n) => `<i class="${n === i ? 'on' : ''}"></i>`).join('')}</div>
+        <button class="btn primary big block" id="tNext">${i === slides.length - 1 ? "Let's go" : 'Next'}</button>
+        ${i < slides.length - 1 ? '<button class="link-btn block" id="tSkip">Skip</button>' : ''}
+      </div>`, (el) => {
+      $('#tNext', el).onclick = () => { if (i < slides.length - 1) { i++; draw(); } else { closeSheet(); } };
+      if ($('#tSkip', el)) $('#tSkip', el).onclick = closeSheet;
+    });
+  };
+  setPref('mango.toured', '1');
+  if (!force) try { localStorage.setItem(SEEN_KEY, CODE_VERSION || ''); } catch { /* */ }
+  draw();
+}
+function maybeShowTour() {
+  if (getPref('mango.toured', '')) return false;
+  tourSheet();
+  return true;
+}
+
+// ---------- confetti ----------
+function confetti() {
+  if (reducedMotion()) return;
+  const c = document.createElement('canvas');
+  c.className = 'confetti';
+  const dpr = window.devicePixelRatio || 1;
+  c.width = innerWidth * dpr;
+  c.height = innerHeight * dpr;
+  document.body.appendChild(c);
+  const ctx = c.getContext('2d');
+  ctx.scale(dpr, dpr);
+  const colors = ['#ff9f1c', '#ffcf4a', '#5cc45c', '#ff5fa2', '#4c9dff', '#a87bff'];
+  const parts = Array.from({ length: 140 }, () => ({
+    x: innerWidth / 2 + (Math.random() - 0.5) * 80, y: innerHeight * 0.35,
+    vx: (Math.random() - 0.5) * 13, vy: -Math.random() * 13 - 4,
+    r: Math.random() * Math.PI, vr: (Math.random() - 0.5) * 0.4,
+    w: 6 + Math.random() * 6, h: 3 + Math.random() * 4, c: colors[(Math.random() * colors.length) | 0],
+  }));
+  const start = performance.now();
+  const frame = (t) => {
+    const age = t - start;
+    ctx.clearRect(0, 0, innerWidth, innerHeight);
+    for (const p of parts) {
+      p.vy += 0.35; p.vx *= 0.99; p.x += p.vx; p.y += p.vy; p.r += p.vr;
+      ctx.save();
+      ctx.globalAlpha = Math.max(0, 1 - age / 2600);
+      ctx.translate(p.x, p.y); ctx.rotate(p.r);
+      ctx.fillStyle = p.c; ctx.fillRect(-p.w / 2, -p.h / 2, p.w, p.h);
+      ctx.restore();
+    }
+    if (age < 2600) requestAnimationFrame(frame); else c.remove();
+  };
+  requestAnimationFrame(frame);
 }
 
 // ---------- certificates ----------
@@ -1954,7 +2961,7 @@ async function boot() {
   $('#app').classList.remove('hidden');
   $('#app').classList.add('app-in');
   await refresh();
-  maybeShowWhatsNew();
+  if (!maybeShowTour()) maybeShowWhatsNew();
 }
 
 document.addEventListener('visibilitychange', () => {
