@@ -678,6 +678,21 @@ function filteredApps() {
   return apps.sort(by[sort] || by.smart);
 }
 
+// Release notes are often written in Markdown (## headings, **bold**, - lists). Show them as tidy plain text.
+function cleanNotes(t) {
+  return String(t || '')
+    .replace(/\r/g, '')
+    .replace(/<[^>]+>/g, '')
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .split('\n')
+    .map((l) => l.replace(/^\s*#{1,6}\s*/, '').replace(/^\s*[-*+]\s+/, '• ').replace(/^\s*>\s?/, ''))
+    .join('\n')
+    .replace(/(\*\*|__)(.+?)\1/g, '$2')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
 // The "You installed…" line on an app's page, with quick fixes when Mango's guess is wrong.
 function installedNoteHtml(a) {
   const i = a.installed;
@@ -1444,6 +1459,27 @@ function addSourceSheet(prefill = '') {
   });
 }
 
+// Apps you deleted from this source, which it won't add back. Tap Restore to let it.
+function excludedHtml(src) {
+  const ex = src.excluded || [];
+  if (!ex.length) return '';
+  return `<div class="section-title">Deleted from this ${src.kind === 'telegram' ? 'channel' : 'source'} <span class="count">${ex.length}</span></div>
+    <p class="hint" style="margin:-4px 4px 8px">These won't come back when it refreshes.</p>
+    <div class="list">${ex.map((e, i) => `<div class="row"><div class="row-main"><div class="row-title">${esc(e.name || e.bundleId || 'App')}</div>${e.bundleId ? `<div class="row-sub mono">${esc(e.bundleId)}</div>` : ''}</div><button class="pill" data-restore="${i}">Restore</button></div>`).join('')}</div>`;
+}
+function bindExcluded(el, src, reopen) {
+  el.querySelectorAll('[data-restore]').forEach((b) => {
+    b.onclick = async () => {
+      b.disabled = true;
+      try {
+        const r = await api('POST', `/api/sources/${src.id}/restore`, { index: Number(b.dataset.restore) });
+        await refresh();
+        toast(r.note ? `${r.restored} restored. ${r.note}` : `${r.restored} is back`);
+        reopen();
+      } catch (e) { b.disabled = false; toast(e.message, true); }
+    };
+  });
+}
 function sourceSheet(sid) {
   const src = (state.sources || []).find((x) => x.id === sid);
   if (!src) return toast('Source not found', true);
@@ -1467,7 +1503,9 @@ function sourceSheet(sid) {
       ${missing ? `<button class="btn block danger" id="srcDelMissing">🗑 Delete ${missing} removed app${missing === 1 ? '' : 's'}</button>` : ''}
       <button class="btn block" id="srcSave">Save name</button>
       <button class="btn block danger" id="srcDel">Remove source</button>
-    </div>`, (el) => {
+    </div>
+    ${excludedHtml(src)}`, (el) => {
+    bindExcluded(el, src, () => sourceSheet(sid));
     if ($('#srcDelMissing', el)) $('#srcDelMissing', el).onclick = () => deleteRemovedApps(sid, missing);
     $('#srcShow', el).onchange = async (e) => {
       try { await api('PATCH', `/api/sources/${sid}`, { showInLibrary: e.target.checked }); await refresh(); toast(e.target.checked ? 'Shown to everyone' : 'Only you can see these apps now'); } catch (err) { toast(err.message, true); }
@@ -1706,7 +1744,9 @@ function tgChannelSheet(sid) {
       <button class="btn block" id="tcDeep">🔍 Scan older posts</button>
       <button class="btn block" id="tcBackBtn">Back</button>
       <button class="btn block danger" id="tcDel">Remove channel</button>
-    </div>`, (el) => {
+    </div>
+    ${excludedHtml(src)}`, (el) => {
+    bindExcluded(el, src, () => tgChannelSheet(sid));
     $('#tcBackBtn', el).onclick = () => telegramSheet();
     $('#tcSync', el).onclick = async () => {
       try { const { jobId } = await api('POST', `/api/sources/${src.id}/sync`); tgRunSheet(`Checking ${src.name}…`, jobId, () => tgChannelSheet(src.id)); } catch (e) { toast(e.message, true); }
@@ -2467,16 +2507,16 @@ function appSheet(appId) {
 
     ${(a.tags || []).length ? `<div class="tag-row">${a.tags.map((t) => `<button class="tag" data-tag="${esc(t)}"># ${esc(t)}</button>`).join('')}</div>` : ''}
     ${a.description ? `<div class="section-title">About</div><p class="desc">${esc(a.description)}</p>` : ''}
-    ${a.notes ? `<div class="section-title">What's changed / notes</div><p class="desc">${esc(a.notes)}</p>` : ''}
+    ${a.notes ? `<div class="section-title">What's changed / notes</div><p class="desc">${esc(cleanNotes(a.notes))}</p>` : ''}
     ${owner && versions[0] && versions[0].manualId ? `<p class="hint" style="margin:10px 4px 0">⬆ ${esc(versions[0].version)} was added by you${versions.length > 1 ? `. ${esc(a.sourceName || 'The source')}'s versions are under Other versions.` : '.'} <button class="link-btn inline" data-delver="${versions[0].manualId}" type="button">Remove it</button></p>` : ''}
-    ${!a.notes && versions[0] && versions[0].notes ? `<div class="section-title">What's new in ${esc(versions[0].version || 'this version')}</div><p class="desc">${esc(versions[0].notes)}</p>` : ''}
+    ${!a.notes && versions[0] && versions[0].notes ? `<div class="section-title">What's new in ${esc(versions[0].version || 'this version')}</div><p class="desc">${esc(cleanNotes(versions[0].notes))}</p>` : ''}
     ${versions.length > 1 ? `<div class="section-title">Other versions <span class="count">${versions.length - 1}</span></div>
       <div class="list">${versions.slice(1).map((v, n) => `
         <div class="row ver-row">
           <div class="row-main">
             <div class="row-title">${esc(v.version || 'Version ' + (n + 2))}${v.channel && v.channel !== 'stable' ? ` <span class="badge">${esc(v.channel)}</span>` : ''}</div>
             <div class="row-sub">${[v.date ? esc(String(v.date).slice(0, 10)) : '', v.size ? fmtSize(v.size) : ''].filter(Boolean).join(' · ')}</div>
-            ${v.notes ? `<div class="row-sub ver-notes">${esc(v.notes)}</div>` : ''}
+            ${v.notes ? `<div class="row-sub ver-notes" role="button" tabindex="0">${esc(cleanNotes(v.notes))}</div>` : ''}
           </div>
           ${owner && v.manualId ? `<button class="pill danger-pill" data-delver="${v.manualId}" aria-label="Remove this version">✕</button>` : ''}
           <button class="pill" data-ver="${n + 1}">Get</button>
@@ -2511,6 +2551,8 @@ function appSheet(appId) {
       <button class="btn block danger" id="aDelete">Delete</button>
     </div>` : ''}`, (el) => {
     $('#aGet', el).onclick = () => quickGet(a.id);
+    // Long version notes show 3 lines; tap to read all of it.
+    el.querySelectorAll('.ver-notes').forEach((n) => { n.onclick = () => n.classList.toggle('open'); });
     bindInstalledNote(el, a, () => appSheet(a.id));
     $('#aOptions', el).onclick = () => signSheet(a.id);
     el.querySelectorAll('[data-shot]').forEach((b) => { b.onclick = () => shotViewer(a, Number(b.dataset.shot)); });
@@ -2564,7 +2606,7 @@ function appSheet(appId) {
     });
     if ($('#aMoveGh', el)) $('#aMoveGh', el).onclick = () => moveToGithubSheet([a.id], a.name);
     $('#aDelete', el).onclick = async () => {
-      if (!confirm(`Delete ${a.name} from the library? People who already installed it keep it.`)) return;
+      if (!confirm(`Delete ${a.name} from the library? People who already installed it keep it.${isSrcApp(a) ? `\n\n${a.sourceName || 'Its source'} won't add it back when it refreshes. You can restore it from the ${a.cloud === 'telegram' ? 'channel' : 'source'}'s page.` : ''}`)) return;
       try { await api('DELETE', `/api/apps/${a.id}`); closeSheet(); toast('Deleted'); await refresh(); } catch (e) { toast(e.message, true); }
     };
   });
