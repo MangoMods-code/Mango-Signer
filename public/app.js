@@ -2160,6 +2160,41 @@ function updateIpaSheet(a) {
   });
 }
 
+// A newer build of a source app that the source hasn't posted yet.
+function addVersionSheet(a) {
+  const gh = state.github && state.github.connected;
+  openSheet(`
+    <div class="sheet-head">${appIcon(a, true)}<div class="row-main"><h2>Add a newer version</h2><div class="row-sub">${esc(a.name)} · now ${esc(shownVersion(a) || '—')}</div></div></div>
+    <p class="muted small">It becomes the newest version for everyone, like ${esc(a.sourceName || 'the source')} had posted it. The source's versions stay under "Other versions". If the source posts this version later, its copy takes over and yours is removed.</p>
+    <button class="file-btn" id="vPick" ${gh ? '' : 'disabled'}>${ICONS.file}<div class="row-main"><div class="row-title">Choose .ipa</div><div class="row-sub">${gh ? 'Saved to your GitHub storage, not this server' : 'Connect GitHub storage first (Settings › Cloud Library)'}</div></div></button>
+    <div class="section-title">Or from a link</div>
+    <div class="field"><input type="url" id="vUrl" placeholder="https://example.com/app.ipa" autocapitalize="off" autocorrect="off"></div>
+    <div class="group">${toggle('vLink', 'Link only (uses no storage)', 'Keeps just the link. Turn off to copy the file to your GitHub storage.', true)}</div>
+    <div class="field" style="margin-top:12px"><label>What's new (optional)</label><textarea id="vNotes" rows="3" placeholder="What changed in this version"></textarea></div>
+    <button class="btn primary block" id="vAdd">Add from link</button>
+    <div id="addProgress"></div>`, (el) => {
+    const done = (app) => { toast(`${app.name} is now ${app.version}`); appSheet(app.id); };
+    const follow = (setProgress) => async (r) => waitJob(r.jobId, (j) => setProgress(j.progress, j.progress != null ? `Saving ${Math.round(j.progress * 100)}%` : (j.log.slice(-1)[0] || 'Working…')));
+    $('#vPick', el).onclick = async () => {
+      const file = await pickFile('');
+      if (!file) return;
+      if (!/\.ipa$/i.test(file.name)) return toast('Pick an .ipa file', true);
+      await runWithProgress(el, async (setProgress, setSub) => {
+        const up = await uploadFile(file, (p) => setProgress(p, `Uploading ${Math.round(p * 100)}%`), setSub);
+        setProgress(0, 'Reading app info…'); setSub('');
+        return follow(setProgress)(await api('POST', `/api/apps/${a.id}/versions`, { uploadId: up.uploadId, notes: $('#vNotes', el).value }));
+      }, done);
+    };
+    $('#vAdd', el).onclick = async () => {
+      const url = $('#vUrl', el).value.trim();
+      if (!url) return toast('Paste a link first', true);
+      const linkOnly = $('#vLink', el).checked;
+      if (!linkOnly && !gh) return toast('Connect GitHub storage first, or keep Link only on', true);
+      await runWithProgress(el, async (setProgress) => follow(setProgress)(await api('POST', `/api/apps/${a.id}/versions`, { url, linkOnly, notes: $('#vNotes', el).value })), done);
+    };
+  });
+}
+
 function appSheet(appId) {
   const a = state.apps.find((x) => x.id === appId);
   if (!a) return;
@@ -2203,6 +2238,7 @@ function appSheet(appId) {
     ${(a.tags || []).length ? `<div class="tag-row">${a.tags.map((t) => `<button class="tag" data-tag="${esc(t)}"># ${esc(t)}</button>`).join('')}</div>` : ''}
     ${a.description ? `<div class="section-title">About</div><p class="desc">${esc(a.description)}</p>` : ''}
     ${a.notes ? `<div class="section-title">What's changed / notes</div><p class="desc">${esc(a.notes)}</p>` : ''}
+    ${owner && versions[0] && versions[0].manualId ? `<p class="hint" style="margin:10px 4px 0">⬆ ${esc(versions[0].version)} was added by you${versions.length > 1 ? `. ${esc(a.sourceName || 'The source')}'s versions are under Other versions.` : '.'} <button class="link-btn inline" data-delver="${versions[0].manualId}" type="button">Remove it</button></p>` : ''}
     ${!a.notes && versions[0] && versions[0].notes ? `<div class="section-title">What's new in ${esc(versions[0].version || 'this version')}</div><p class="desc">${esc(versions[0].notes)}</p>` : ''}
     ${versions.length > 1 ? `<div class="section-title">Other versions <span class="count">${versions.length - 1}</span></div>
       <div class="list">${versions.slice(1).map((v, n) => `
@@ -2212,6 +2248,7 @@ function appSheet(appId) {
             <div class="row-sub">${[v.date ? esc(String(v.date).slice(0, 10)) : '', v.size ? fmtSize(v.size) : ''].filter(Boolean).join(' · ')}</div>
             ${v.notes ? `<div class="row-sub ver-notes">${esc(v.notes)}</div>` : ''}
           </div>
+          ${owner && v.manualId ? `<button class="pill danger-pill" data-delver="${v.manualId}" aria-label="Remove this version">✕</button>` : ''}
           <button class="pill" data-ver="${n + 1}">Get</button>
         </div>`).join('')}</div>
       <p class="hint" style="margin:6px 4px 0">Older versions are handy if the newest one has a bug or needs a newer iOS.</p>` : ''}
@@ -2237,6 +2274,7 @@ function appSheet(appId) {
       <button class="btn block" id="aEdit">Edit details, tags &amp; sign settings</button>
       <button class="btn block" id="aShots">Screenshots (${shots.length})</button>
       <button class="btn block" id="aCols">Add to collection</button>
+      ${a.cloud === 'source' ? `<button class="btn block" id="aAddVer">⬆ Add a newer version</button><p class="hint center" style="margin-top:2px">For when you have a newer build than ${esc(a.sourceName || 'the source')}. Its older versions stay available.</p>` : ''}
       ${isSrcApp(a) ? `<p class="hint center">Updates come in by themselves when ${esc(a.sourceName || 'the source')} ${a.cloud === 'telegram' ? 'posts' : 'adds'} a new version.</p>` : '<button class="btn block" id="aUpdate">Update IPA (new version)</button>'}
       ${!a.cloud && state.github.connected ? `<button class="btn block" id="aMoveGh">☁ Move to GitHub (frees ${fmtSize(a.size)})</button>` : ''}
       <a class="btn block" href="/api/apps/${a.id}/download">Download original .ipa</a>
@@ -2285,6 +2323,14 @@ function appSheet(appId) {
     $('#aShots', el).onclick = () => screenshotsSheet(a);
     $('#aCols', el).onclick = () => addToCollectionSheet(a);
     if ($('#aUpdate', el)) $('#aUpdate', el).onclick = () => updateIpaSheet(a);
+    if ($('#aAddVer', el)) $('#aAddVer', el).onclick = () => addVersionSheet(a);
+    el.querySelectorAll('[data-delver]').forEach((b) => {
+      b.onclick = async (e) => {
+        e.stopPropagation();
+        if (!confirm('Remove this version? Its file is deleted from your GitHub storage.')) return;
+        try { await api('DELETE', `/api/apps/${a.id}/versions/${b.dataset.delver}`); await refresh(); toast('Version removed'); appSheet(a.id); } catch (err) { toast(err.message, true); }
+      };
+    });
     if ($('#aMoveGh', el)) $('#aMoveGh', el).onclick = () => moveToGithubSheet([a.id], a.name);
     $('#aDelete', el).onclick = async () => {
       if (!confirm(`Delete ${a.name} from the library? People who already installed it keep it.`)) return;

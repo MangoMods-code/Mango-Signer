@@ -692,3 +692,4 @@ html[data-accent="red"] { --mango: #ff5c5c; --mango-2: #ff9b9b; --accent-2: #f03
 #addMsg, #addSub, #pSub, #trSub { overflow-wrap: anywhere; }
 .log { max-height: 45vh; overflow-wrap: anywhere; word-break: normal; }
 .job-cancel { color: var(--red); }
+.link-btn.inline { display: inline; padding: 0; margin: 0 0 0 4px; font-size: inherit; }
