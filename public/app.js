@@ -1411,13 +1411,13 @@ function cloudSettingsHtml() {
     <p class="hint" style="margin:8px 4px 0">Cloud apps only keep their info and icon here. The file is downloaded while signing and deleted right after, so your Railway volume stays empty.</p>`;
 }
 
-function addSourceSheet() {
+function addSourceSheet(prefill = '') {
   const have = new Set((state.sources || []).map((x) => x.url));
   const sugg = SUGGESTED_SOURCES.filter((x) => !have.has(rawGithub(x.url)));
   openSheet(`
     <h2>Add a Source</h2>
     <p class="muted small" style="margin-top:-6px">A source is a list of apps someone keeps up to date (the same kind AltStore, SideStore, ESign and Feather use). Its apps show up in your library as links — nothing is downloaded to your server until someone signs one.</p>
-    <div class="field"><label>Source link</label><input type="url" id="srcUrl" placeholder="https://…/source.json" autocapitalize="off" autocorrect="off"><div class="hint">GitHub links work as-is — the page link is turned into the raw file for you.</div></div>
+    <div class="field"><label>Source link</label><input type="url" id="srcUrl" placeholder="https://…/source.json or github.com/owner/repo" value="${esc(typeof prefill === 'string' ? prefill : '')}" autocapitalize="off" autocorrect="off"><div class="hint">Works with AltStore-style sources, and with <b>GitHub repos</b>: paste github.com/owner/repo and every release with an .ipa becomes a version, with new releases showing up as updates.</div></div>
     <div class="group">${toggle('srcShow', 'Show its apps to everyone', 'Turn off to keep them just for you until you check them out', true)}</div>
     <button class="btn primary block" id="srcAdd" style="margin-top:12px">Add Source</button>
     ${sugg.length ? `<div class="section-title">Suggested</div><div class="list">${sugg.map((x, i) => `
@@ -1451,14 +1451,14 @@ function sourceSheet(sid) {
   const apps = state.apps.filter((a) => isSrcApp(a) && a.sourceName === src.name);
   const missing = apps.filter((a) => a.missing).length;
   openSheet(`
-    <div class="sheet-head">${iconHtml(src.iconURL || null, src.name, true)}<div class="row-main"><h2>${esc(src.name)}</h2><div class="row-sub">${esc(src.subtitle || 'App source')}</div></div></div>
+    <div class="sheet-head">${iconHtml(src.iconURL || null, src.name, true)}<div class="row-main"><h2>${esc(src.name)}</h2><div class="row-sub">${src.kind === 'ghrepo' ? `GitHub · ${esc(src.repo.owner)}/${esc(src.repo.repo)}` : esc(src.subtitle || 'App source')}</div></div></div>
     ${src.lastError ? `<p class="warning bad">Last refresh failed: ${esc(src.lastError)}</p>` : ''}
     <dl class="kv card" style="margin:0">
       <dt>Apps</dt><dd>${src.apps}${missing ? ` <span class="muted small">(+${missing} removed upstream)</span>` : ''}</dd>
       <dt>Last refresh</dt><dd>${src.lastSync ? ago(src.lastSync) : 'never'}</dd>
       <dt>Link</dt><dd class="mono small-break">${esc(src.url)}</dd>
     </dl>
-    <p class="hint" style="margin:8px 4px 0">Refreshes by itself every 6 hours. New versions show as UPDATED in the library. Anything you edit on an app (name, category, description…) is kept when it refreshes.</p>
+    <p class="hint" style="margin:8px 4px 0">Refreshes by itself every ${src.kind === 'ghrepo' ? '3 hours: each new GitHub release with an .ipa becomes the new version, and older ones stay downloadable' : '6 hours'}. New versions show as UPDATED in the library. Anything you edit on an app (name, category, description…) is kept when it refreshes.</p>
     <div class="group" style="margin-top:12px">${toggle('srcShow', 'Show its apps to everyone', 'Off = only you can see them', src.showInLibrary !== false)}</div>
     <div class="field" style="margin-top:12px"><label>Name in your library</label><input type="text" id="srcName" value="${esc(src.name)}" maxlength="60"></div>
     <div class="actions">
@@ -2293,6 +2293,7 @@ function addAppSheet() {
     </div>
     <div class="section-title">Or add from a link</div>
     <div class="field"><input type="url" id="ipaUrl" placeholder="https://example.com/app.ipa" autocapitalize="off" autocorrect="off"><div class="hint">Direct download links only. Dropbox links work (dl=0 is fixed for you).</div></div>
+    <div id="ghFollow" class="hint-card hidden"><span>This is a GitHub release. Follow the repo instead and new versions show up by themselves.</span><button class="btn small-btn" id="ghFollowBtn" type="button">Follow repo</button></div>
     <div class="group">${toggle('linkOnly', 'Link only (uses no storage)', "Only the app's info and icon are saved. The file is downloaded fresh each time someone signs it.", true)}</div>
     <button class="btn block" id="importUrl" style="margin-top:10px">Add from link</button>
     <button class="link-btn block" id="goBulk" type="button">🔗 Add several links at once</button>
@@ -2300,6 +2301,10 @@ function addAppSheet() {
     <div id="addProgress"></div>`, (el) => {
     $('#goSources', el).onclick = addSourceSheet;
     $('#goBulk', el).onclick = bulkLinksSheet;
+    // A GitHub release link: offer to follow the whole repo, so it keeps updating.
+    const ghRepoOf = (v) => { const m = String(v).match(/^https?:\/\/(?:www\.)?github\.com\/([\w.-]+)\/([\w.-]+)\/releases\b/i); return m ? `https://github.com/${m[1]}/${m[2]}` : null; };
+    $('#ipaUrl', el).oninput = () => $('#ghFollow', el).classList.toggle('hidden', !ghRepoOf($('#ipaUrl', el).value.trim()));
+    $('#ghFollowBtn', el).onclick = () => addSourceSheet(ghRepoOf($('#ipaUrl', el).value.trim()));
     $('#pickIpa', el).onclick = async () => {
       const file = await pickFile('');
       if (!file) return;
