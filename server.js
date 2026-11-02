@@ -219,10 +219,13 @@ function noteFail(req, name) {
 function notifyUpdate(app, oldVersion) {
   const shown = app.versionOverride || app.version;
   if (!oldVersion || !shown || oldVersion === shown || app.published === false) return;
-  const who = new Set(store.installLog.filter((l) => l.appId === app.id).map((l) => l.ownerId));
+  const who = Object.entries(store.data.myApps || {})
+    .filter(([, list]) => list[app.id] && !installStopped(list[app.id]) && versionCmp(app.version, list[app.id].version) > 0)
+    .map(([uid]) => uid);
   for (const uid of who) {
     if (store.alerts.some((a) => a.ownerId === uid && a.kind === 'update' && a.appId === app.id && a.version === shown)) continue;
-    addAlert(uid, 'update', `⬆ ${app.name} ${shown} is out`, `You have ${oldVersion}. Tap to update.`, { appId: app.id, version: shown });
+    const have = store.data.myApps[uid][app.id];
+    addAlert(uid, 'update', `⬆ ${app.name} ${shown} is out`, `You have ${have.shown || have.version || oldVersion}. Tap to update.`, { appId: app.id, version: shown });
   }
 }
 
@@ -464,14 +467,65 @@ function certView(c, acc) {
     deviceIncluded: deviceInProfile(c.profile, acc.udid),
   };
 }
+// ----- "My apps": what each person has installed through Mango -----
+// iOS doesn't let websites see what's on a phone, so this is built from installs Mango watched finish
+// in the app (not from shared links, which could be anyone's phone). People can fix it themselves
+// ("not on my phone" / "already have the latest"), and an app whose certificate has expired or been
+// revoked is shown as no longer opening instead of nagging for updates.
+if (!store.data.myApps || typeof store.data.myApps !== 'object') {
+  store.data.myApps = {};
+  for (const l of store.installLog) {
+    const sg = store.signed.find((x) => x.id === l.signedId);
+    (store.data.myApps[l.ownerId] ||= {})[l.appId] = {
+      version: l.version || '', shown: l.shownVersion || l.version || '', at: l.at, signedId: l.signedId || null,
+      bundleId: sg ? sg.bundleId : null, certId: sg ? sg.certId : null, expires: sg ? certExpiry(store.certs.find((c) => c.id === sg.certId)) : null,
+    };
+  }
+  store.save();
+}
+// Drop "update available" alerts that no longer apply (already updated, deleted, or the app is gone).
+{
+  const before = store.alerts.length;
+  store.data.alerts = store.alerts.filter((x) => {
+    if (x.kind !== 'update' || !x.appId) return true;
+    const app = store.apps.find((a) => a.id === x.appId);
+    const e = (store.data.myApps[x.ownerId] || {})[x.appId];
+    return !!(app && e && versionCmp(app.version, e.version) > 0);
+  });
+  if (store.alerts.length !== before) store.save();
+}
+function certExpiry(c) {
+  if (!c) return null;
+  return [c.p12 && c.p12.validTo, c.profile && c.profile.expires].filter(Boolean).sort()[0] || null;
+}
+const myAppsOf = (uid) => (store.data.myApps[uid] ||= {});
+// Why an installed app no longer opens, or null if it should still work.
+function installStopped(e) {
+  const c = e.certId && store.certs.find((x) => x.id === e.certId);
+  const exp = (c && certExpiry(c)) || e.expires;
+  if (exp && new Date(exp) < Date.now()) return 'expired';
+  if (c && c.check && c.check.status === 'revoked' && (!c.check.checkedAt || new Date(c.check.checkedAt) > new Date(e.at))) return 'revoked';
+  return null;
+}
+function installedView(a, acc) {
+  const e = (store.data.myApps[acc.id] || {})[a.id];
+  if (!e) return null;
+  const stopped = installStopped(e);
+  const cmp = a.version && e.version ? versionCmp(a.version, e.version) : 0;
+  return {
+    version: cmp === 0 && e.version === a.version ? shownAppVersion(a) || e.shown : e.shown || e.version,
+    at: e.at, stopped,
+    update: !stopped && cmp > 0,
+  };
+}
+
 function appView(a, acc) {
   const votes = Object.values(a.votes || {});
-  const mine = [...store.installLog].reverse().find((l) => l.ownerId === acc.id && l.appId === a.id);
   const extra = {
     likes: votes.filter((v) => v > 0).length,
     dislikes: votes.filter((v) => v < 0).length,
     myVote: (a.votes || {})[acc.id] || 0,
-    installed: mine ? { version: mine.shownVersion || mine.version, at: mine.at } : null,
+    installed: installedView(a, acc),
   };
   const { votes: _v, remote, ...base } = a;
   if (remote) {
@@ -494,6 +548,7 @@ function signedView(s, req) {
   return {
     ...s,
     fileAvailable: !s.fileDeleted,
+    onPhone: !!(s.appId && ((store.data.myApps[s.ownerId] || {})[s.appId] || {}).signedId === s.id),
     installUrl: `itms-services://?action=download-manifest&url=${encodeURIComponent(manifest)}`,
     shareUrl: `${base}/i/${s.token}`,
     downloadUrl: `${base}/i/${s.token}/app.ipa`,
@@ -949,15 +1004,18 @@ async function downloadToTmp(u, job) {
   const dest = path.join(dirs.tmp, id());
   job.log.push(`Downloading ${u.hostname}…`);
   job.cancellable = true;
-  const r = await fetch(u, { redirect: 'follow', signal: job.signal });
-  if (!r.ok || !r.body) throw new Error(`Download failed (HTTP ${r.status})`);
+  const idle = idleSignal(job.signal);
+  let r;
+  try { r = await fetch(u, { redirect: 'follow', signal: idle.signal }); } catch (e) { idle.done(); throw idle.stalled() ? idle.signal.reason : e; }
+  if (!r.ok || !r.body) { idle.done(); throw new Error(`Download failed (HTTP ${r.status})`); }
   const type = r.headers.get('content-type') || '';
-  if (/text\/html/i.test(type)) throw new Error("That link opens a web page, not a file. Use a direct download link (for Dropbox, change dl=0 to dl=1).");
+  if (/text\/html/i.test(type)) { idle.done(); r.body.cancel().catch(() => {}); throw new Error("That link opens a web page, not a file. Use a direct download link (for Dropbox, change dl=0 to dl=1)."); }
   const total = Number(r.headers.get('content-length')) || 0;
   let got = 0;
   const body = Readable.fromWeb(r.body);
   body.on('data', (c) => {
     got += c.length;
+    idle.kick();
     job.progress = total ? got / total : null;
     if (got > MAX_UPLOAD) body.destroy(new Error('File is too large'));
   });
@@ -965,8 +1023,11 @@ async function downloadToTmp(u, job) {
     await pipeline(body, fs.createWriteStream(dest));
   } catch (e) {
     await rmQuiet(dest);
-    throw e;
+    throw idle.stalled() ? idle.signal.reason : e;
+  } finally {
+    idle.done();
   }
+  if (total && got < total) { await rmQuiet(dest); throw new Error(`The download stopped early (${gb(got)} of ${gb(total)}). Try again.`); }
   return dest;
 }
 
@@ -1158,6 +1219,7 @@ async function deleteApp(appId, { keepRemote = false } = {}) {
     if (gh) await gh.deleteAsset(app.remote.assetId || app.remote.ghAssetId).catch((e) => console.error('GitHub delete:', e.message));
   }
   store.apps.splice(i, 1);
+  for (const list of Object.values(store.data.myApps || {})) delete list[appId];
   for (const suffix of ['.ipa', '.png', '-custom.png']) await rmQuiet(path.join(dirs.apps, appId + suffix));
   await rmQuiet(path.join(dirs.apps, appId + '-shots'));
   for (const c of store.collections) c.appIds = c.appIds.filter((x) => x !== appId);
@@ -1271,6 +1333,18 @@ async function resolveDownload(dl) {
   return { ...dl, url: f.url, headers: f.headers };
 }
 
+// A signal that aborts if a transfer goes quiet for too long (or when `parent` aborts, e.g. Stop).
+// Call kick() whenever data arrives and done() when finished.
+function idleSignal(parent, ms = 90_000, msg = 'The download stalled (nothing came in for 90 seconds). Try again.') {
+  const ctrl = new AbortController();
+  let t;
+  const kick = () => { clearTimeout(t); t = setTimeout(() => ctrl.abort(new Error(msg)), ms); };
+  const onParent = () => ctrl.abort(parent.reason);
+  if (parent) { if (parent.aborted) ctrl.abort(parent.reason); else parent.addEventListener('abort', onParent, { once: true }); }
+  kick();
+  return { signal: ctrl.signal, kick, done: () => { clearTimeout(t); if (parent) parent.removeEventListener('abort', onParent); }, stalled: () => ctrl.signal.aborted && !(parent && parent.aborted) };
+}
+
 // Fetches a link that may need a login header. The header is only sent to the first address:
 // if it redirects (GitHub sends you to a short-lived download link), the next hop gets no token.
 async function fetchAuthed(url, headers, signal) {
@@ -1286,9 +1360,12 @@ async function fetchAuthed(url, headers, signal) {
 async function fetchToFile(url, headers, dest, job, label) {
   if (job && label) job.log.push(label);
   if (job) job.cancellable = true;
-  const r = await fetchAuthed(url, headers, job && job.signal);
-  if (!r.ok || !r.body) throw new Error(`Download failed (HTTP ${r.status}). The link may have moved or expired.`);
+  const idle = idleSignal(job && job.signal);
+  let r;
+  try { r = await fetchAuthed(url, headers, idle.signal); } catch (e) { idle.done(); throw idle.stalled() ? idle.signal.reason : e; }
+  if (!r.ok || !r.body) { idle.done(); throw new Error(`Download failed (HTTP ${r.status}). The link may have moved or expired.`); }
   if (/text\/html/i.test(r.headers.get('content-type') || '')) {
+    idle.done();
     r.body.cancel().catch(() => {});
     throw new Error('That link opens a web page, not an app file. Use a direct download link.');
   }
@@ -1298,6 +1375,7 @@ async function fetchToFile(url, headers, dest, job, label) {
   const body = Readable.fromWeb(r.body);
   body.on('data', (c) => {
     got += c.length;
+    idle.kick();
     if (job) {
       job.progress = total ? got / total : null;
       if (total && Date.now() - lastLog > 3000) { lastLog = Date.now(); job.log.push(`Downloaded ${Math.floor((100 * got) / total)}%`); }
@@ -1308,7 +1386,9 @@ async function fetchToFile(url, headers, dest, job, label) {
     await pipeline(body, fs.createWriteStream(dest));
   } catch (e) {
     await rmQuiet(dest);
-    throw e;
+    throw idle.stalled() ? idle.signal.reason : e;
+  } finally {
+    idle.done();
   }
   if (total && got < total) {
     await rmQuiet(dest);
@@ -1696,6 +1776,32 @@ route('DELETE', /^\/api\/alerts$/, (req, res, m, acc) => {
 });
 
 // ----- favorites -----
+// People fixing their own "installed" list: it's gone from their phone, or they already have the latest.
+route('POST', /^\/api\/my-apps\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
+  const { action } = await readJson(req);
+  const list = myAppsOf(acc.id);
+  const app = store.apps.find((a) => a.id === m[1]);
+  if (action === 'remove') delete list[m[1]];
+  else if (action === 'latest' || action === 'have') {
+    if (!app) return fail(res, 404, 'App not found');
+    // Updated some other way, so Mango doesn't know which certificate it uses anymore.
+    list[m[1]] = { version: app.version || '', shown: shownAppVersion(app), at: new Date().toISOString(), signedId: null, certId: null, expires: null, manual: true };
+    store.data.alerts = store.alerts.filter((x) => !(x.ownerId === acc.id && x.kind === 'update' && x.appId === m[1]));
+  } else return fail(res, 400, 'Unknown action');
+  store.save();
+  json(res, { ok: true, installed: app ? installedView(app, acc) : null });
+});
+route('POST', /^\/api\/my-apps\/clean$/, async (req, res, m, acc) => {
+  // Forget apps that can't open anymore (expired/revoked certificate) or were deleted from the library.
+  const list = myAppsOf(acc.id);
+  let n = 0;
+  for (const [aid, e] of Object.entries(list)) {
+    if (installStopped(e) || !store.apps.some((a) => a.id === aid)) { delete list[aid]; n++; }
+  }
+  store.save();
+  json(res, { ok: true, removed: n });
+});
+
 route('POST', /^\/api\/apps\/([a-f0-9]{16})\/favorite$/, async (req, res, m, acc) => {
   if (!visibleApps(acc).some((a) => a.id === m[1])) return fail(res, 404, 'App not found');
   const { on } = await readJson(req);
@@ -2455,7 +2561,10 @@ async function tgImportPost(src, post, job, preMeta) {
     const gh = ghClient();
     if (!gh || !g.releaseId) throw new Error('this channel saves to GitHub, but GitHub storage is not connected');
     job.log.push(`Copying ${meta.name} ${meta.version} to GitHub…`);
-    const r = await fetchAuthed(f.url, f.headers, job.signal);
+    const startCtrl = new AbortController();
+    const startTimer = setTimeout(() => startCtrl.abort(new Error("Telegram didn't start sending the file. Try again.")), 120000);
+    let r;
+    try { r = await fetchAuthed(f.url, f.headers, AbortSignal.any([job.signal, startCtrl.signal])); } finally { clearTimeout(startTimer); }
     if (!r.ok || !r.body) throw new Error(`couldn't read the file from Telegram (HTTP ${r.status})`);
     const size = Number(r.headers.get('content-length')) || meta.size;
     const safe = `tg-${normName(meta.name).slice(0, 40) || 'app'}-${meta.version || 'v'}-${id().slice(0, 6)}.ipa`;
@@ -2708,7 +2817,8 @@ setInterval(async () => {
   if (!tgReady()) return;
   for (const src of store.sources.filter((x) => x.kind === 'telegram' && x.options && x.options.autoSync !== false)) {
     const job = tgSync(src);
-    while (job.status === 'running') await new Promise((r) => setTimeout(r, 2000));
+    const started = Date.now();
+    while (job.status === 'running' && Date.now() - started < 45 * 60_000) await new Promise((r) => setTimeout(r, 2000));
   }
 }, 10 * 60_000);
 
@@ -3337,7 +3447,7 @@ const signingNow = new Map(); // "owner:app" -> job id
 
 route('GET', /^\/api\/jobs\/([a-f0-9]{16})$/, (req, res, m, acc) => {
   const job = jobs.get(m[1]);
-  if (!job || job.owner !== acc.id) return fail(res, 404, 'Job not found');
+  if (!job || job.owner !== acc.id) return fail(res, 404, 'This task stopped because the server restarted (probably an update). Start it again.');
   const cancelled = !!job.cancelled;
   json(res, { status: cancelled ? 'cancelled' : job.status, log: job.log.slice(-300), error: cancelled ? 'Cancelled' : job.error, result: job.result, progress: cancelled ? null : job.progress ?? null, counter: job.counter || null, cancellable: !!job.cancellable && !job.cancelled });
 });
@@ -3477,6 +3587,7 @@ route('DELETE', /^\/api\/users\/([a-f0-9]{16})$/, async (req, res, m) => {
     await rmQuiet(path.join(dirs.signed, s.id + '.png'));
   }
   store.users.splice(store.users.indexOf(u), 1);
+  delete store.data.myApps[u.id];
   for (const a of store.apps) if (a.votes) delete a.votes[u.id];
   store.data.requests = store.requests.filter((r) => r.ownerId !== u.id);
   store.save();
@@ -3548,18 +3659,33 @@ route('GET', /^\/i\/([\w-]{20,40})\/app\.ipa$/, (req, res, m) => {
       st.sent += n;
       if (st.sent >= st.size && st.phase !== 'done') {
         Object.assign(st, { phase: 'done', doneAt: Date.now(), sent: st.size });
-        try { recordInstall(s); } catch (e) { console.error('install tracking:', e); }
+        try { recordInstall(s, st); } catch (e) { console.error('install tracking:', e); }
       }
     },
   });
 }, 'open');
 
-function recordInstall(s) {
+function recordInstall(s, st = {}) {
   const app = store.apps.find((a) => a.id === s.appId);
+  // The version name people see: the app's custom name if they installed the current version, else the real one.
+  const shown = app && app.version === s.version ? shownAppVersion(app) : s.version;
+  const viaApp = st.via === 'app';
   store.installLog.push({
     id: id(), signedId: s.id, ownerId: s.ownerId, appId: s.appId, name: s.name, version: s.version,
-    shownVersion: app ? shownAppVersion(app) : s.version, certLabel: s.certLabel, at: new Date().toISOString(),
+    shownVersion: shown, certLabel: s.certLabel, at: new Date().toISOString(), via: viaApp ? 'app' : 'link',
   });
+  // Only installs started from the app count as "on your phone". A shared link could be anyone's phone.
+  if (viaApp && s.appId) {
+    const list = myAppsOf(s.ownerId);
+    // A phone holds one app per bundle ID, so installing this replaced any other app with the same one.
+    if (s.bundleId) for (const [aid, e] of Object.entries(list)) if (aid !== s.appId && e.bundleId && e.bundleId === s.bundleId) delete list[aid];
+    list[s.appId] = {
+      version: s.version || '', shown, at: new Date().toISOString(), signedId: s.id, bundleId: s.bundleId || null,
+      certId: s.certId || null, expires: certExpiry(store.certs.find((c) => c.id === s.certId)),
+    };
+    // They just installed it: clear "update available" alerts for this app if they're now up to date.
+    if (!app || versionCmp(s.version, app.version) >= 0) store.data.alerts = store.alerts.filter((x) => !(x.ownerId === s.ownerId && x.kind === 'update' && x.appId === s.appId));
+  }
   if (store.installLog.length > 5000) store.installLog.splice(0, store.installLog.length - 5000);
   if (app) app.installCount = (app.installCount || 0) + 1;
   s.installedAt = new Date().toISOString();
@@ -3574,7 +3700,9 @@ route('POST', /^\/api\/signed\/([a-f0-9]{16})\/install$/, (req, res, m, acc) => 
   const cur = installs.get(s.id);
   // If the iPhone already asked for the app a moment ago, keep that progress instead of resetting it.
   const fresh = cur && Date.now() - Math.max(cur.manifestAt || 0, cur.downloadAt || 0) < 5000;
-  json(res, { install: installView(fresh ? cur : resetInstall(s)) });
+  const st = fresh ? cur : resetInstall(s);
+  st.via = 'app';
+  json(res, { install: installView(st) });
 });
 route('GET', /^\/api\/signed\/([a-f0-9]{16})\/install$/, (req, res, m, acc) => {
   const s = store.signed.find((x) => x.id === m[1] && x.ownerId === acc.id);
@@ -3587,7 +3715,9 @@ route('POST', /^\/i\/([\w-]{20,40})\/status$/, (req, res, m) => {
   if (!s || s.fileDeleted) return fail(res, 404, 'Link expired');
   const cur = installs.get(s.id);
   const fresh = cur && Date.now() - Math.max(cur.manifestAt || 0, cur.downloadAt || 0) < 5000;
-  json(res, { install: installView(fresh ? cur : resetInstall(s)) });
+  const st = fresh ? cur : resetInstall(s);
+  if (st.via !== 'app') st.via = 'link';
+  json(res, { install: installView(st) });
 }, 'open');
 route('GET', /^\/i\/([\w-]{20,40})\/status$/, (req, res, m) => {
   const s = findByToken(m[1]);
@@ -3676,6 +3806,13 @@ const server = http.createServer(async (req, res) => {
   }
 });
 server.requestTimeout = 0; // allow big uploads
+// One background task failing (a dropped connection, a bad file) must never take the whole server down.
+process.on('unhandledRejection', (e) => console.error('Background task error:', e && e.message ? e.message : e));
+process.on('uncaughtException', (e) => {
+  console.error('Unexpected error:', e);
+  if (e && (e.code === 'EADDRINUSE' || e.code === 'EACCES')) process.exit(1);
+  if (isNoSpace(e)) storageAlert();
+});
 server.headersTimeout = 60_000;
 
 // Clean temp uploads older than a day.
