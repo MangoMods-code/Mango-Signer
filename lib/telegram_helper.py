@@ -31,6 +31,9 @@ API_HASH = os.environ.get("TG_API_HASH", "")
 SESSION = os.environ.get("TG_SESSION", "")
 
 PART = 512 * 1024  # Telegram serves files in 512 KB pieces (must not cross a 1 MB boundary)
+# How many pieces to ask Telegram for at the same time. One at a time waits a full round trip per
+# 512 KB; asking for several at once keeps the connection busy and downloads several times faster.
+PARALLEL = max(1, min(16, int(os.environ.get("TG_PARALLEL", "8") or 8)))
 
 client = TelegramClient(StringSession(SESSION or None), API_ID, API_HASH,
                         device_model="Mango Signer", app_version="1.7", system_version="Server",
@@ -282,14 +285,41 @@ async def stream_file(writer, q, headers):
     piece = piece_size(length)
     aligned = start - (start % piece)
     skip = start - aligned
-    left = length
+    offsets = list(range(aligned, end + 1, piece))
     sent_any = False
+
+    async def fetch(doc, offset):
+        """One piece of the file. Retries a couple of times on hiccups; waits out flood limits."""
+        for attempt in range(4):
+            try:
+                async for chunk in client.iter_download(doc, offset=offset, request_size=piece, chunk_size=piece, limit=1, file_size=size):
+                    return chunk
+                return b""
+            except errors.FloodWaitError as e:
+                await asyncio.sleep(min(60, e.seconds + 1))
+            except Exception as e:
+                if "FileReference" in type(e).__name__ or attempt == 3:
+                    raise
+                await asyncio.sleep(0.5 * (attempt + 1))
+        raise RuntimeError("Telegram kept failing to send part of the file")
+
     for attempt in range(2):
+        tasks = {}
         try:
-            async for chunk in client.iter_download(msg.document, offset=aligned, request_size=piece, file_size=size):
-                if skip:
-                    chunk = chunk[skip:]
-                    skip = 0
+            left = length
+            skip_now = skip
+            nxt = 0
+            for i in range(len(offsets)):
+                # Keep up to PARALLEL pieces on the way while we send the earlier ones in order.
+                while nxt < len(offsets) and nxt < i + PARALLEL:
+                    tasks[nxt] = asyncio.ensure_future(fetch(msg.document, offsets[nxt]))
+                    nxt += 1
+                chunk = await tasks.pop(i)
+                if i < len(offsets) - 1 and len(chunk) < piece:
+                    raise RuntimeError("Telegram sent a short piece")
+                if skip_now:
+                    chunk = chunk[skip_now:]
+                    skip_now = 0
                 if len(chunk) > left:
                     chunk = chunk[:left]
                 writer.write(chunk)
@@ -305,6 +335,9 @@ async def stream_file(writer, q, headers):
                 msg = await get_post(ref, msg_id, fresh=True)
                 continue
             raise
+        finally:
+            for t in tasks.values():
+                t.cancel()
 
 
 # ---------- tiny HTTP server ----------
