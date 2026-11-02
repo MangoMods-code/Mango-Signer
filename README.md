@@ -3,6 +3,8 @@
 A self-hosted iOS app signer, installer and App Library you use from Safari on your iPhone.
 Upload an `.ipa`, add a `.p12` + `.mobileprovision`, tap **Sign**, then **Install**.
 
+**[⬇️ Download the latest release](https://github.com/MangoMods-code/Mango-Signer/releases)** · each release lists everything that changed.
+
 ## Features
 - **App Library** – the owner uploads apps (or imports from a link); invited users browse, search, sign and install them
 - **Organization** – categories with emoji, featured apps, search, sorting, bulk select, full app editing, Update IPA, and default sign settings per app
@@ -17,7 +19,7 @@ Upload an `.ipa`, add a `.p12` + `.mobileprovision`, tap **Sign**, then **Instal
 - **Owner tools** – manage users (reset password, turn off, unlink iPhone, delete), invite codes, hide apps from the library, signing queue
 
 ## Deploy on Railway
-1. Put this project in a GitHub repo and create a Railway service from it (it builds from the `Dockerfile`).
+1. Download the latest zip from [Releases](https://github.com/MangoMods-code/Mango-Signer/releases), put it in a GitHub repo and create a Railway service from it (it builds from the `Dockerfile`).
 2. Add a **volume** mounted at `/data`.
 3. Set `APP_PASSWORD` (the owner password). Optional: `SESSION_SECRET` (any long random string).
 4. Generate a public domain (installs need HTTPS) and open it in Safari.
