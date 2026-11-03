@@ -3,6 +3,21 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.8.9',
+    date: '2026-11-02',
+    title: 'Stop Means Stop',
+    summary: 'Stopping a check now lets the next one start right away.',
+    sections: [
+      {
+        title: '⏳ Activity',
+        items: [
+          'Stopping a check now lets the ones waiting behind it start right away. Before, they kept waiting while the stopped one finished what it was in the middle of.',
+          'Checking the same channel again right after stopping it waits a moment for the stopped one to wrap up, so the same app is never added twice.',
+        ],
+      },
+    ],
+  },
+  {
     version: '1.8.8',
     date: '2026-11-02',
     title: 'Activity',

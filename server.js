@@ -3009,7 +3009,8 @@ let checkRunning = null;
 function queueInfo(job) {
   const i = checkQueue.findIndex((c) => c.job === job);
   if (i < 0) return null;
-  return { position: i + 1, waitingFor: (checkRunning && checkRunning.title) || (i > 0 ? checkQueue[i - 1].job.title : null) };
+  const wrapping = windingDown.has(job.srcId) ? 'the stopped check of it to wrap up' : null;
+  return { position: i + 1, waitingFor: (checkRunning && checkRunning.title) || wrapping || (i > 0 ? checkQueue[i - 1].job.title : null) };
 }
 function runCheck(job, work) {
   job.isCheck = true;
@@ -3021,10 +3022,14 @@ function runCheck(job, work) {
   pumpChecks();
   return job;
 }
+// Sources whose check was stopped but is still finishing its current step (a Telegram request, say).
+// A new check of the same source waits for that, so the two never import the same posts at once.
+const windingDown = new Set();
 async function pumpChecks() {
   if (checkRunning) return;
-  const next = checkQueue.shift();
-  if (!next) return;
+  const i = checkQueue.findIndex((c) => c.job.cancelled || !windingDown.has(c.job.srcId));
+  if (i < 0) return;
+  const [next] = checkQueue.splice(i, 1);
   const { job, work } = next;
   if (job.cancelled) { job.status = 'cancelled'; job.endedAt = Date.now(); return pumpChecks(); }
   checkRunning = job;
@@ -3037,9 +3042,21 @@ async function pumpChecks() {
   } finally {
     if (job.status === 'running') job.status = job.cancelled ? 'cancelled' : 'done';
     job.endedAt = job.endedAt || Date.now();
-    // Only free the line if this is still the check holding it (the watchdog may have moved on already).
-    if (checkRunning === job) { checkRunning = null; setImmediate(pumpChecks); }
+    if (job.srcId) windingDown.delete(job.srcId);
+    // Free the line if this is still the check holding it (Stop or the watchdog may have already).
+    if (checkRunning === job) checkRunning = null;
+    setImmediate(pumpChecks);
   }
+}
+// Stopping the running check frees the line right away: the next one starts now instead of waiting
+// for the stopped one to finish whatever request it was in the middle of.
+function releaseCheck(job) {
+  if (checkRunning !== job) return;
+  if (job.srcId) windingDown.add(job.srcId);
+  job.status = 'cancelled';
+  job.endedAt = Date.now();
+  checkRunning = null;
+  setImmediate(pumpChecks);
 }
 const checkBusy = () => !!checkRunning || checkQueue.length > 0;
 // Is this source already being checked (or waiting)? Then reuse that instead of starting another.
@@ -3057,11 +3074,9 @@ setInterval(() => {
   j.log.push('✕ Stopped: nothing happened for 15 minutes, so it was stopped to let the next check run. Try it again.');
   j.cancelled = true;
   try { j.abort.abort(new Error('Stopped: no progress for 15 minutes')); } catch { /* */ }
+  releaseCheck(j);
   j.status = 'error';
   j.error = 'Stopped after 15 minutes with no progress. Try it again.';
-  j.endedAt = Date.now();
-  checkRunning = null;
-  setImmediate(pumpChecks);
 }, 30_000).unref();
 
 // Every hour, everything gets checked (see scheduleChecks). Remember when, to show "next check in…".
@@ -3932,6 +3947,7 @@ route('POST', /^\/api\/jobs\/cancel-all$/, (req, res, m, acc) => {
     j.log.push('✕ Cancelled');
     const qi = checkQueue.findIndex((c) => c.job === j);
     if (qi >= 0) { checkQueue.splice(qi, 1); j.status = 'cancelled'; j.endedAt = Date.now(); }
+    releaseCheck(j);
     try { j.abort.abort(new Error('Cancelled')); } catch { /* */ }
     if (j.child) j.child.kill('SIGKILL');
     n++;
@@ -3964,6 +3980,7 @@ route('POST', /^\/api\/jobs\/([a-f0-9]{16})\/cancel$/, (req, res, m, acc) => {
   job.log.push(job.status === 'queued' ? '✕ Cancelled before it started' : '✕ Cancelled — stopping…');
   const qi = checkQueue.findIndex((c) => c.job === job);
   if (qi >= 0) { checkQueue.splice(qi, 1); job.status = 'cancelled'; job.endedAt = Date.now(); }
+  releaseCheck(job);
   if (job.countedFor) {
     // A cancelled sign doesn't use up one of today's signs.
     const c = store.data.signCounts[job.countedFor];
