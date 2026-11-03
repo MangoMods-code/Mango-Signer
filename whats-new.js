@@ -3,6 +3,21 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.9.3',
+    date: '2026-11-02',
+    title: 'Links From Anywhere',
+    summary: 'Paste a direct .ipa link from any website into either box and it just works.',
+    sections: [
+      {
+        title: '🔗 Adding apps by link',
+        items: [
+          'A direct link to an .ipa file from any website now works in the Add Source box too, not just in Add App. Mango adds that one app.',
+          'Links work without the https:// at the start.',
+        ],
+      },
+    ],
+  },
+  {
     version: '1.9.2',
     date: '2026-11-02',
     title: 'Smarter Check Order',

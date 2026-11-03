@@ -1855,6 +1855,7 @@ route('POST', /^\/api\/sources$/, async (req, res, m, acc) => {
   if (typeof b.url === 'string' && !/^[a-z]+:\/\//i.test(b.url.trim()) && /^[\w.-]+\.[a-z]{2,}\//i.test(b.url.trim())) b.url = 'https://' + b.url.trim();
   let url;
   const repo = parseGithubRepo(b.url);
+  try { if (!repo && /\.ipa$/i.test(new URL(b.url).pathname)) return fail(res, 400, "That's a link to one app, not a source. Add it with + › Add App › Or add from a link."); } catch { /* checked below */ }
   try { url = repo ? repo.url : sources.normalizeSourceUrl(b.url); } catch (e) { return fail(res, 400, e.message); }
   if (store.sources.some((x) => x.url.toLowerCase() === url.toLowerCase())) return fail(res, 400, 'That source is already added');
   const src = { id: id(), url, name: repo ? repo.repo : 'Source', showInLibrary: b.showInLibrary !== false, addedAt: new Date().toISOString() };
