@@ -577,8 +577,8 @@ function bindSignOptions(el, defaults = {}, prefix = '') {
 // Checkboxes for tweaks from the Tweaks library.
 function tweakPickerHtml(prefix, selected = []) {
   if (!state.tweaks.length) return '';
-  return `<div class="group tweak-pick">${state.tweaks.map((t) => toggle(`${prefix}Tw_${t.id}`, `🧩 ${t.name}${t.version ? ' ' + t.version : ''}`,
-    t.description ? t.description.split('\n')[0].slice(0, 90) : (t.warnings.length ? '⚠️ ' + t.warnings[0] : `${t.files.length} file${t.files.length === 1 ? '' : 's'}`), selected.includes(t.id))).join('')}</div>`;
+  return `<div class="group tweak-pick">${state.tweaks.map((t) => toggle(`${prefix}Tw_${t.id}`, `🧩 ${esc(t.name)}${t.version ? ' ' + esc(t.version) : ''}`,
+    esc(t.description ? t.description.split('\n')[0].slice(0, 90) : (t.warnings.length ? '⚠️ ' + t.warnings[0] : `${t.files.length} file${t.files.length === 1 ? '' : 's'}`)), selected.includes(t.id))).join('')}</div>`;
 }
 const pickedTweaks = (el, prefix) => state.tweaks.filter((t) => { const x = $(`#${prefix}Tw_${t.id}`, el); return x && x.checked; }).map((t) => t.id);
 
@@ -4263,6 +4263,7 @@ async function handleUrlParams() {
     taken: ['That iPhone is already linked to another account', true],
     disabled: ['That account is turned off', true],
     off: ['iPhone sign-in is turned off', true],
+    ownerpw: ['The owner account signs in with the password only (iPhone sign-in is for customers)', true],
     error: ["Couldn't read your iPhone's ID — try again", true],
   };
   if (msgs[udid]) toast(...msgs[udid]);
