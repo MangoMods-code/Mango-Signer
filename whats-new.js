@@ -3,6 +3,23 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.9.5',
+    date: '2026-11-02',
+    title: 'Security Check-Up',
+    summary: 'A security tune-up: safer sign-in and stronger protection for your account.',
+    sections: [
+      {
+        title: '🔒 Security',
+        items: [
+          'If someone keeps entering wrong passwords for your account, they get locked out, not you. You can still sign in from your own phone.',
+          'Login limits can no longer be dodged by faking where a request comes from.',
+          'Other websites can\'t show Mango inside their page, which stops tricks that get you to tap buttons you can\'t see.',
+          'App and tweak names are always shown as plain text, so a badly named tweak can\'t mess with the app.',
+        ],
+      },
+    ],
+  },
+  {
     version: '1.9.4',
     date: '2026-11-02',
     title: 'Apps From Websites',

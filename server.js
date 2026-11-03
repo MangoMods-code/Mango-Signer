@@ -147,7 +147,7 @@ function cookies(req) {
   const out = {};
   for (const part of (req.headers.cookie || '').split(';')) {
     const i = part.indexOf('=');
-    if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+    if (i > 0) { try { out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim()); } catch { /* bad cookie */ } }
   }
   return out;
 }
@@ -170,14 +170,19 @@ function sessionCookie(req, account) {
 }
 const loginFails = new Map();
 function rateLimited(req) {
-  const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+  const ip = clientIp(req);
   const f = loginFails.get(ip) || { n: 0, t: 0 };
   if (Date.now() - f.t > 60_000) f.n = 0;
   return { limited: f.n >= 6, fail: () => loginFails.set(ip, { n: f.n + 1, t: Date.now() }), ok: () => loginFails.delete(ip) };
 }
 
 // ---------- alerts & security log ----------
-const clientIp = (req) => (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+// The real address is the LAST one in X-Forwarded-For (added by Railway's proxy). Earlier ones are sent by the
+// browser and can be made up, so they're never trusted (they'd let someone dodge the login limits).
+const clientIp = (req) => {
+  const xff = String(req.headers['x-forwarded-for'] || '').split(',').map((x) => x.trim()).filter(Boolean);
+  return xff.length ? xff[xff.length - 1] : String(req.socket.remoteAddress || '');
+};
 function shortUa(ua = '') {
   const ios = ua.match(/(iPhone|iPad|iPod).*?OS (\d+)_(\d+)/);
   const browser = /CriOS/.test(ua) ? 'Chrome' : /FxiOS/.test(ua) ? 'Firefox' : /EdgiOS|Edg\//.test(ua) ? 'Edge' : /Safari/.test(ua) ? 'Safari' : '';
@@ -202,14 +207,27 @@ function secEvent(req, type, user, ok, detail = '') {
 const userFails = new Map();
 const LOCK_AFTER = 8;
 const LOCK_MS = 15 * 60_000;
-function accountLocked(name) {
-  const f = userFails.get(name);
-  return !!(f && f.n >= LOCK_AFTER && Date.now() - f.t < LOCK_MS);
+// Locks are per account AND per network: 8 wrong passwords from one place lock that place out of that
+// account for 15 minutes, so a stranger can't lock you out of your own account by guessing on purpose.
+// A much bigger number of wrong tries from everywhere at once (someone trying from many places) locks the account itself.
+const LOCK_ALL = 40;
+function accountLocked(name, req) {
+  const mine = userFails.get(`${name}|${clientIp(req)}`);
+  const all = userFails.get(name);
+  const live = (f, max) => !!(f && f.n >= max && Date.now() - f.t < LOCK_MS);
+  return live(mine, LOCK_AFTER) || live(all, LOCK_ALL);
 }
+function clearFails(req, name) { userFails.delete(`${name}|${clientIp(req)}`); }
 function noteFail(req, name) {
-  const f = userFails.get(name);
-  const n = f && Date.now() - f.t < LOCK_MS ? f.n + 1 : 1;
-  userFails.set(name, { n, t: Date.now() });
+  const bump = (key) => {
+    const f = userFails.get(key);
+    const n = f && Date.now() - f.t < LOCK_MS ? f.n + 1 : 1;
+    userFails.set(key, { n, t: Date.now() });
+    return n;
+  };
+  bump(name);
+  const n = bump(`${name}|${clientIp(req)}`);
+  if (userFails.size > 5000) for (const [k, v] of userFails) if (Date.now() - v.t > LOCK_MS) userFails.delete(k);
   if (n === LOCK_AFTER) {
     secEvent(req, 'locked', name, false, `${LOCK_AFTER} wrong passwords in a row`);
     addAlert('owner', 'security', `🔒 ${name === 'owner' ? 'Your owner login' : name} was locked for 15 minutes`, `${LOCK_AFTER} wrong passwords in a row from ${clientIp(req) || 'an unknown address'} (${shortUa(req.headers['user-agent'])}).`);
@@ -697,11 +715,11 @@ route('POST', /^\/api\/login$/, async (req, res) => {
   const { username = '', password = '' } = await readJson(req);
   const name = String(username).trim().toLowerCase();
   const who = name || 'owner';
-  if (accountLocked(who)) return fail(res, 429, 'Too many wrong passwords — this account is locked for 15 minutes');
+  if (accountLocked(who, req)) return fail(res, 429, 'Too many wrong passwords — try again in 15 minutes');
 
   if ((!name || name === 'owner') && APP_PASSWORD && safeEqual(password, APP_PASSWORD)) {
     rl.ok();
-    userFails.delete('owner');
+    clearFails(req, 'owner');
     secEvent(req, 'login', 'owner', true);
     store.save();
     return send(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(req, OWNER()) });
@@ -709,7 +727,7 @@ route('POST', /^\/api\/login$/, async (req, res) => {
   const u = store.users.find((x) => x.username === name);
   if (u && !u.disabled && checkPassword(password, u)) {
     rl.ok();
-    userFails.delete(name);
+    clearFails(req, name);
     u.lastLogin = new Date().toISOString();
     secEvent(req, 'login', name, true);
     store.save();
@@ -865,6 +883,9 @@ route('GET', /^\/udid\/done$/, (req, res) => {
     const acc = accountById(holder);
     udidStates.delete(state);
     if (!acc) return redirect(res, '/?udid=disabled');
+    // The iPhone's answer can't be fully verified here, so someone who knows an iPhone's ID could pretend to
+    // be it. That's an acceptable shortcut for customers, but never for the owner: the owner signs in with the password.
+    if (holder === 'owner') { secEvent(req, 'login-udid', 'owner', false, 'iPhone sign-in is off for the owner'); store.save(); return redirect(res, '/?udid=ownerpw'); }
     if (holder !== 'owner') findUser(holder).lastLogin = new Date().toISOString();
     secEvent(req, 'login-udid', acc.username, true, acc.deviceName ? `with ${acc.deviceName}` : 'with iPhone');
     store.save();
@@ -994,7 +1015,7 @@ route('GET', /^\/api\/state$/, async (req, res, m, acc) => {
     server: { baseUrl: base, https: base.startsWith('https://'), version: displayVersion(), codeVersion: VERSION },
   };
   if (isOwner(acc)) {
-    const { github: _gh, ...ownerSettings } = store.settings; // the GitHub token never leaves the server, even encrypted
+    const { github: _gh, telegram: _tg, ...ownerSettings } = store.settings; // GitHub token and Telegram login never leave the server, even encrypted
     out.settings = ownerSettings;
     out.users = store.users.map(userView);
     out.invites = store.invites;
@@ -4398,6 +4419,11 @@ const server = http.createServer(async (req, res) => {
   req.query = url.searchParams;
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'no-referrer');
+  // Other sites can't show Mango inside a frame (stops "clickjacking" tricks on your buttons),
+  // and browsers always use HTTPS for it once they've seen it on HTTPS.
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Content-Security-Policy', "frame-ancestors 'none'");
+  if (String(req.headers['x-forwarded-proto'] || '').startsWith('https')) res.setHeader('Strict-Transport-Security', 'max-age=31536000');
 
   try {
     for (const r of routes) {
