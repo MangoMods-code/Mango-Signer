@@ -10,6 +10,12 @@ const state = {
   lib: { q: '', cat: 'all', sort: 'smart', select: false, selected: new Set(), limit: 40 },
 };
 const isOwner = () => state.account && state.account.role === 'owner';
+// Admins help run the library and users; testers see "Testers only" apps and beta versions first.
+const isAdmin = () => !!state.account && state.account.role === 'user' && state.account.rank === 'admin';
+const isStaff = () => isOwner() || isAdmin();
+const isTester = () => !!state.account && state.account.role === 'user' && state.account.rank === 'tester';
+const seesTesterApps = () => isStaff() || isTester();
+const RANK_LABEL = { admin: '⭐ Admin', tester: '🧪 Tester' };
 
 // ---------- version & updates ----------
 const pageData = document.documentElement.dataset;
@@ -598,8 +604,8 @@ function defaultsSummary(d = {}) {
 
 // ---------- render ----------
 function tabsFor() {
-  return isOwner()
-    ? [['library', 'Library'], ['signed', 'Signed'], ['certs', 'Certificates'], ['users', 'Users'], ['settings', 'Settings']]
+  return isStaff()
+    ? [['library', 'Library'], ['signed', 'Signed'], ['certs', 'Certificates'], ['users', 'Users'], ['settings', isOwner() ? 'Settings' : 'Account']]
     : [['library', 'Apps'], ['signed', 'Signed'], ['certs', 'Certificates'], ['settings', 'Account']];
 }
 
@@ -620,10 +626,10 @@ function renderTabs() {
 function render() {
   if (!tabsFor().some(([k]) => k === state.tab)) state.tab = 'library';
   const title = Object.fromEntries(tabsFor())[state.tab];
-  $('#pageTitle').textContent = state.tab === 'library' && !isOwner() ? 'App Library' : title;
+  $('#pageTitle').textContent = state.tab === 'library' && !isStaff() ? 'App Library' : title;
   renderTabs();
   const top = $('#topAction');
-  const actions = { library: isOwner() ? addAppSheet : null, certs: addCertSheet, users: newInviteSheet };
+  const actions = { library: isStaff() ? addAppSheet : null, certs: addCertSheet, users: newInviteSheet };
   top.innerHTML = actions[state.tab] ? ICONS.plus : '';
   top.onclick = actions[state.tab] || null;
   top.classList.toggle('hidden', !actions[state.tab]);
@@ -661,6 +667,7 @@ function filteredApps() {
   else if (cat === 'new') apps = apps.filter((a) => isNewApp(a) || isUpdatedApp(a));
   else if (cat === 'none') apps = apps.filter((a) => !a.categoryId || !catById(a.categoryId));
   else if (cat === 'hidden') apps = apps.filter((a) => !a.published);
+  else if (cat === 'testers') apps = apps.filter((a) => a.testersOnly);
   else if (cat === 'missing') apps = apps.filter((a) => a.missing);
   else if (cat === 'cloud:github') apps = apps.filter((a) => a.cloud === 'github');
   else if (cat === 'cloud:link') apps = apps.filter((a) => a.cloud === 'link');
@@ -769,7 +776,8 @@ function appBadges(a, { compact = false } = {}) {
   else if (a.installed) b.push('<span class="badge good">✓ Installed</span>');
   if (isNewApp(a)) b.push('<span class="badge new">NEW</span>');
   else if (isUpdatedApp(a)) b.push('<span class="badge new">UPDATED</span>');
-  if (!compact && isOwner() && !a.published) b.push('<span class="badge">Hidden</span>');
+  if (a.testersOnly && seesTesterApps()) b.push('<span class="badge tester">🧪 Testers</span>');
+  if (!compact && isStaff() && !a.published && !a.testersOnly) b.push('<span class="badge">Hidden</span>');
   if (!compact && a.missing) b.push('<span class="badge bad">Removed from source</span>');
   if (!compact) b.push(cloudBadge(a));
   return b.join('');
@@ -779,7 +787,7 @@ function appBadges(a, { compact = false } = {}) {
 function cloudBadge(a) {
   if (a.cloud === 'source') return `<span class="badge cloud">☁ ${esc(a.sourceName || 'Source')}</span>`;
   if (a.cloud === 'telegram') return `<span class="badge cloud">✈️ ${esc(a.sourceName || 'Telegram')}</span>`;
-  if (!isOwner()) return '';
+  if (!isStaff()) return '';
   if (a.cloud === 'github') return '<span class="badge cloud">☁ GitHub</span>';
   if (a.cloud === 'link') return '<span class="badge cloud">🔗 Link</span>';
   return '';
@@ -839,7 +847,7 @@ function libraryListHtml() {
   const apps = filteredApps();
   const { q, cat } = state.lib;
   if (!state.apps.length) {
-    return isOwner()
+    return isStaff()
       ? `<div class="empty">${ICONS.box}<h3>No apps yet</h3><p>Add an .ipa from Files or paste a download link. Apps you add show up in the App Library for everyone you invite.</p>
         <button class="btn primary" data-act="add-app">Add App</button></div>`
       : `<div class="empty">${ICONS.box}<h3>No apps yet</h3><p>The owner hasn't added any apps yet. Want something? Request it!</p>
@@ -847,13 +855,17 @@ function libraryListHtml() {
   }
   if (!apps.length) {
     return `<div class="empty" style="padding:30px 20px">${ICONS.search}<h3>Nothing found</h3><p>${q ? `No apps match “${esc(q)}”.` : 'Nothing here yet.'}</p>
-      ${!isOwner() ? '<button class="btn" data-act="request-app">Request an App</button>' : ''}</div>`;
+      ${!isStaff() ? '<button class="btn" data-act="request-app">Request an App</button>' : ''}</div>`;
   }
 
   // Grouped view: shelves up top, then one section per category, in your order.
   if (cat === 'all' && !q && state.lib.sort === 'smart' && !state.lib.select) {
     let html = '';
     // Kept small on purpose: a slim row of icons instead of big cards.
+    const forTesters = seesTesterApps() ? apps.filter((a) => a.testersOnly) : [];
+    if (forTesters.length) {
+      html += `<div class="section-title" style="margin-top:6px">🧪 For testers <span class="count">${forTesters.length}</span></div><div class="mini-shelf">${forTesters.map((a) => miniCard(a, shownVersion(a))).join('')}</div>`;
+    }
     const updates = apps.filter(hasUpdate);
     if (updates.length) {
       html += `<div class="section-title" style="margin-top:6px">⬆ Updates for you <span class="count">${updates.length}</span></div><div class="mini-shelf">${updates.map((a) => miniCard(a, `→ ${shownVersion(a)}`)).join('')}</div>`;
@@ -883,6 +895,7 @@ function libCount(key) {
   if (key === 'featured') return A.filter((a) => a.featured).length;
   if (key === 'none') return A.filter((a) => !catById(a.categoryId)).length;
   if (key === 'hidden') return A.filter((a) => !a.published).length;
+  if (key === 'testers') return A.filter((a) => a.testersOnly).length;
   if (key.startsWith('tag:')) return A.filter((a) => (a.tags || []).includes(key.slice(4))).length;
   if (key.startsWith('src:')) return A.filter((a) => isSrcApp(a) && a.sourceName === key.slice(4)).length;
   if (key === 'cloud:github') return A.filter((a) => a.cloud === 'github').length;
@@ -895,13 +908,13 @@ function filterGroups() {
   const tags = [...new Set(state.apps.flatMap((a) => a.tags || []))].sort();
   const srcNames = [...new Set(state.apps.filter((a) => isSrcApp(a) && a.sourceName).map((a) => a.sourceName))].sort();
   const g = [
-    { title: 'Show', items: [['all', '📱 All'], ['favorites', '♥ Favorites'], ['installed', '✓ Installed'], ['updates', '⬆ Updates'], ['new', '🆕 New'], ['featured', '★ Featured']] },
+    { title: 'Show', items: [['all', '📱 All'], ['favorites', '♥ Favorites'], ['installed', '✓ Installed'], ['updates', '⬆ Updates'], ['new', '🆕 New'], ['featured', '★ Featured'], ...(seesTesterApps() ? [['testers', '🧪 Testers']] : [])] },
     { title: 'Categories', items: state.categories.map((c) => [c.id, `${c.emoji} ${c.name}`]) },
     { title: 'Sources', items: srcNames.map((n) => [`src:${n}`, `${state.apps.some((a) => a.cloud === 'telegram' && a.sourceName === n) ? '✈️' : '☁'} ${n}`]) },
     { title: 'Tags', items: tags.map((t) => [`tag:${t}`, `# ${t}`]) },
   ];
-  if (isOwner()) g.push({ title: 'Owner', items: [['cloud:github', '☁ On GitHub'], ['cloud:link', '🔗 Links'], ['none', 'Uncategorized'], ['hidden', 'Hidden'], ['missing', '⚠ Removed']] });
-  return g.map((x) => ({ ...x, items: x.items.filter(([k]) => k === 'all' || libCount(k) > 0 || (x.title === 'Categories' && isOwner())) })).filter((x) => x.items.length);
+  if (isStaff()) g.push({ title: 'Owner', items: [['cloud:github', '☁ On GitHub'], ['cloud:link', '🔗 Links'], ['none', 'Uncategorized'], ['hidden', 'Hidden'], ['missing', '⚠ Removed']] });
+  return g.map((x) => ({ ...x, items: x.items.filter(([k]) => k === 'all' || libCount(k) > 0 || (x.title === 'Categories' && isStaff())) })).filter((x) => x.items.length);
 }
 const filterLabel = (key) => (filterGroups().flatMap((x) => x.items).find(([k]) => k === key) || [key, key])[1];
 const PRIMARY_FILTERS = ['all', 'favorites', 'installed', 'updates', 'featured'];
@@ -914,7 +927,7 @@ function filterSheet() {
       <div class="filter-grid">${g.items.map(([k, l]) => `<button class="fopt ${state.lib.cat === k ? 'on' : ''} ${libCount(k) ? '' : 'zero'}" data-f="${esc(k)}"><span>${esc(l)}</span><b>${libCount(k)}</b></button>`).join('')}</div>`).join('')}
     ${cols.length ? `<div class="section-title">Collections</div><div class="filter-grid">${cols.map((c) => `<button class="fopt" data-col="${c.id}"><span>${esc(c.emoji)} ${esc(c.name)}</span><b>${c.appIds.filter((x) => state.apps.some((a) => a.id === x)).length}</b></button>`).join('')}</div>` : ''}
     <div class="actions" style="margin-top:14px">
-      ${isOwner() ? '<button class="btn block" id="fEdit">⚙︎ Edit categories</button>' : '<button class="btn block" id="fReq">+ Request an App</button>'}
+      ${isStaff() ? '<button class="btn block" id="fEdit">⚙︎ Edit categories</button>' : '<button class="btn block" id="fReq">+ Request an App</button>'}
     </div>`, (el) => {
     el.querySelectorAll('[data-f]').forEach((b) => {
       b.onclick = () => { state.lib.cat = b.dataset.f; state.lib.limit = 40; saveLibPrefs(); closeSheet(); window.scrollTo(0, 0); render(); };
@@ -953,14 +966,14 @@ function renderLibrary() {
       <button class="btn small-btn" data-act="toggle-select-mode">${state.lib.select ? 'Done' : 'Select'}</button>
     </div>` : ''}
     ${['installed', 'updates'].includes(cat) && libCount('installed') ? `<div class="hint-card"><span>Deleted something or updated it elsewhere?</span><button class="btn small-btn" data-act="my-apps">Fix the list</button></div>` : ''}
-    ${cat === 'missing' && isOwner() && libCount('missing') ? `<div class="warning bad" style="margin:0 0 12px;display:flex;align-items:center;gap:10px"><span style="flex:1">These apps were removed from their source and are hidden from everyone.</span><button class="btn small-btn danger" data-act="delete-missing">Delete all ${libCount('missing')}</button></div>` : ''}
+    ${cat === 'missing' && isStaff() && libCount('missing') ? `<div class="warning bad" style="margin:0 0 12px;display:flex;align-items:center;gap:10px"><span style="flex:1">These apps were removed from their source and are hidden from everyone.</span><button class="btn small-btn danger" data-act="delete-missing">Delete all ${libCount('missing')}</button></div>` : ''}
     <div id="libList">${libraryListHtml()}</div>
     ${state.lib.select ? bulkBarHtml() : ''}`;
 }
 
 function bulkBarHtml() {
   const n = state.lib.selected.size;
-  if (!isOwner()) {
+  if (!isStaff()) {
     return `<div class="bulk-bar"><span>${n} selected</span><button data-bulk="get" class="primary" ${n ? '' : 'disabled'}>Get ${n || ''}</button></div>`;
   }
   return `<div class="bulk-bar">
@@ -1062,7 +1075,7 @@ function installHistoryHtml(limit = 20) {
 function renderSigned() {
   if (!state.signed.length && !(state.installs || []).length) {
     return `<div class="empty">${ICONS.down}<h3>Nothing signed yet</h3><p>Signed apps show up here, ready to install.</p>
-      <button class="btn primary" data-act="go-library">Go to ${isOwner() ? 'Library' : 'App Library'}</button></div>`;
+      <button class="btn primary" data-act="go-library">Go to ${isStaff() ? 'Library' : 'App Library'}</button></div>`;
   }
   const keep = Number(state.settings.signedRetentionDays);
   const notes = [];
@@ -1163,7 +1176,7 @@ function renderUsers() {
         <div class="row" data-act="user" data-id="${u.id}">
           <div class="app-icon" style="width:44px;height:44px;border-radius:50%;font-size:18px">${esc(u.username.charAt(0).toUpperCase())}</div>
           <div class="row-main">
-            <div class="row-title">${esc(u.username)}${u.disabled ? '<span class="badge bad">Off</span>' : ''}</div>
+            <div class="row-title">${esc(u.username)}${u.rank ? `<span class="badge ${u.rank === 'tester' ? 'tester' : 'mango'}">${RANK_LABEL[u.rank]}</span>` : ''}${u.disabled ? '<span class="badge bad">Off</span>' : ''}</div>
             <div class="row-sub">${u.deviceName ? esc(u.deviceName) : 'No iPhone linked'} · ${u.certCount} cert${u.certCount === 1 ? '' : 's'} · ${u.signedCount} signed</div>
             <div class="row-sub">Last seen ${ago(u.lastLogin)}</div>
           </div>
@@ -1174,7 +1187,11 @@ function renderUsers() {
   const reqs = (state.requests || []).length
     ? `<div class="section-title" style="margin-top:4px">App requests ${pending.length ? `<span class="count hot">${pending.length} new</span>` : ''}</div>
        <div class="list">${[...pending, ...others].map(requestRow).join('')}</div>` : '';
-  return `${reqs}<div class="section-title" style="margin-top:${reqs ? 22 : 4}px">Invite codes</div>${invites}<div class="section-title">People <span class="count">${state.users.length}</span></div>${users}`;
+  const openBugs = (state.bugs || []).filter((b) => b.status === 'open');
+  const bugs = (state.bugs || []).length
+    ? `<div class="section-title" style="margin-top:${reqs ? 22 : 4}px">🐞 Bug reports ${openBugs.length ? `<span class="count hot">${openBugs.length} open</span>` : ''}</div>
+       <div class="list">${[...openBugs, ...(state.bugs || []).filter((b) => b.status !== 'open').slice(0, 10)].map(bugRow).join('')}</div>` : '';
+  return `${reqs}${bugs}<div class="section-title" style="margin-top:${reqs || bugs ? 22 : 4}px">Invite codes</div>${invites}<div class="section-title">People <span class="count">${state.users.length}</span></div>${users}`;
 }
 
 function accountSection() {
@@ -1188,7 +1205,7 @@ function accountSection() {
       <button class="row" data-act="tour"><span class="row-main" style="font-weight:600">👋 Show the welcome tour</span><span class="value muted">›</span></button>
       <button class="row" data-act="tasks"><span class="row-main" style="font-weight:600">⏳ Activity</span><span class="value muted">${(() => { const n = (state.tasks || []).filter((j) => ['running', 'queued'].includes(j.status)).length; return n ? `<span style="color:var(--mango)">${n} going</span>` : ''; })()} ›</span></button>
       <button class="row" data-act="whats-new"><span class="row-main" style="font-weight:600">✨ What's New</span><span class="value muted">V${esc(CLIENT_VERSION || state.server.version || '')} ›</span></button>
-      <div class="setting"><span>Username</span><span class="value">${esc(a.username)}</span></div>
+      <div class="setting"><span>Username</span><span class="value">${esc(a.username)}${a.rank ? ` <span class="badge ${a.rank === 'tester' ? 'tester' : 'mango'}">${RANK_LABEL[a.rank] || esc(a.rank)}</span>` : ''}</span></div>
       <div class="setting"><span>iPhone</span><span class="value">${a.udid ? `${esc(a.deviceName || 'iPhone')}<br><span class="mono">${esc(shortUdid(a.udid))}</span>` : 'Not linked'}</span></div>
       ${a.udid ? '<button class="row" data-act="copy-udid"><span class="row-main" style="font-weight:600">Copy my UDID</span></button><button class="row" data-act="unlink-device"><span class="row-main" style="color:var(--red);font-weight:600">Unlink iPhone</span></button>'
         : '<a class="row" href="/udid/profile.mobileconfig?intent=link" style="text-decoration:none"><span class="row-main" style="color:var(--mango);font-weight:600">Link this iPhone</span></a>'}
@@ -1198,12 +1215,35 @@ function accountSection() {
       ${state.server.passwordSet !== false ? '<button class="row" data-act="logout"><span class="row-main" style="color:var(--red);font-weight:600">Log Out</span></button>' : ''}
     </div>
     <p class="hint" style="margin:8px 4px 0">${a.udid ? 'Your iPhone can sign in without a password, and Mango checks whether it\'s in your profiles.' : 'Linking downloads a quick profile: open Settings › Profile Downloaded › Install, and you\'ll come back here.'}</p>
-    ${!isOwner() ? `<div class="section-title">My app requests</div>
+    ${isTester() ? `<div class="section-title">🧪 Tester</div>
+      <p class="hint" style="margin:0 4px 10px">You see apps marked for testers, beta versions first, and you have no daily sign limit. Found something broken? Tell the owner.</p>
+      ${(state.bugs || []).length ? `<div class="list" style="margin-bottom:10px">${state.bugs.map(bugRow).join('')}</div>` : ''}
+      <button class="btn block" data-act="report-bug">🐞 Report a bug</button>` : ''}
+    ${!isStaff() ? `<div class="section-title">My app requests</div>
       ${(state.requests || []).length ? `<div class="list">${state.requests.map(requestRow).join('')}</div>` : ''}
       <button class="btn block" data-act="request-app" style="margin-top:${(state.requests || []).length ? 10 : 0}px">+ Request an App</button>` : ''}`;
 }
 
 function renderSettings() {
+  if (isAdmin()) {
+    return `<p class="hint" style="margin:0 4px 10px">⭐ You're an admin: you can manage the library and users. Server settings, GitHub, Telegram sign-in and backups stay with the owner.</p>
+    <div class="section-title">Cloud Library</div>
+    ${cloudSettingsHtml()}
+    <div class="section-title">Library</div>
+    <div class="list">
+      <div class="setting"><span>Apps</span><span class="value">${state.apps.length} (${state.apps.filter((a) => a.published).length} shown)</span></div>
+      <button class="row" data-act="manage-cats"><span class="row-main" style="font-weight:600">Categories</span><span class="value muted">${state.categories.length} ›</span></button>
+      <button class="row" data-act="manage-cols"><span class="row-main" style="font-weight:600">Collections</span><span class="value muted">${state.collections.length} ›</span></button>
+      <button class="row" data-act="tweaks"><span class="row-main" style="font-weight:600">🧩 Tweaks</span><span class="value muted">${state.tweaks.length} ›</span></button>
+      ${duplicateGroups().length ? `<button class="row" data-act="dupes"><span class="row-main" style="font-weight:600">🔁 Duplicates</span><span class="value" style="color:var(--mango)">${duplicateGroups().length} ›</span></button>` : ''}
+    </div>
+    <div class="section-title">Tools</div>
+    <div class="list">
+      <button class="row" data-act="stats"><span class="row-main" style="font-weight:600">📊 Stats &amp; activity</span><span class="value muted">›</span></button>
+      <button class="row" data-act="security-log"><span class="row-main" style="font-weight:600">🛡 Security log</span><span class="value muted">›</span></button>
+    </div>
+    ${accountSection()}<p class="footer-note">🥭 Mango Signer ${esc(state.server.version || '')}<br>© 2026 MangoMods · All rights reserved</p>`;
+  }
   if (!isOwner()) {
     return `${accountSection()}<p class="footer-note">🥭 Mango Signer ${esc(state.server.version || '')}<br>© 2026 MangoMods · All rights reserved</p>`;
   }
@@ -1352,6 +1392,8 @@ function bindView(view) {
         'new-invite': newInviteSheet,
         invite: () => inviteSheet(idv),
         user: () => userSheet(idv),
+        bug: () => bugSheet(idv),
+        'report-bug': () => reportBugSheet(),
         'whats-new': whatsNewSheet,
         tasks: () => tasksSheet(),
         'copy-udid': () => copy(state.account.udid, 'UDID copied'),
@@ -1414,16 +1456,16 @@ function cloudSettingsHtml() {
           <span class="value muted">›</span>
         </button>`).join('')}
       <button class="row" data-act="add-source"><span class="row-main" style="font-weight:600;color:var(--accent)">＋ Add a source</span><span class="value muted">AltStore / ESign repos</span></button>
-      <button class="row" data-act="telegram">
+      ${isOwner() || t.connected ? `<button class="row" data-act="telegram">
         <span class="row-main"><span class="row-title">✈️ Telegram channels</span>
           <span class="row-sub">${t.connected ? `${tgc.length} channel${tgc.length === 1 ? '' : 's'} · ${tgc.reduce((n, c) => n + (c.apps || 0), 0)} apps${t.error ? ' · ⚠ ' + esc(t.error) : ''}` : 'Pull new .ipa posts from channels automatically'}</span></span>
         <span class="value ${t.connected ? '' : 'muted'}">${t.connected ? '<span class="badge good">On</span>' : 'Off ›'}</span>
-      </button>
-      <button class="row" data-act="github">
+      </button>` : ''}
+      ${isOwner() ? `<button class="row" data-act="github">
         <span class="row-main"><span class="row-title">GitHub storage</span>
           <span class="row-sub">${g.connected ? `${esc(g.owner)}/${esc(g.repo)} · ${g.apps} app${g.apps === 1 ? '' : 's'}${g.lastError ? ' · ⚠ ' + esc(g.lastError) : ''}` : 'Keep your own IPAs in a private repo instead of here'}</span></span>
         <span class="value ${g.connected ? '' : 'muted'}">${g.connected ? '<span class="badge good">On</span>' : 'Off ›'}</span>
-      </button>
+      </button>` : ''}
     </div>
     <p class="hint" style="margin:8px 4px 0">Cloud apps only keep their info and icon here. The file is downloaded while signing and deleted right after, so your Railway volume stays empty.</p>`;
 }
@@ -1933,7 +1975,7 @@ function certBanner() {
   return '';
 }
 
-const ALERT_ICONS = { broadcast: '📣', update: '⬆️', request: '🙋', cert: '🔐', security: '🔒', user: '👋', storage: '💾' };
+const ALERT_ICONS = { bug: '🐞', broadcast: '📣', update: '⬆️', request: '🙋', cert: '🔐', security: '🔒', user: '👋', storage: '💾' };
 function alertsSheet() {
   const list = state.alerts;
   const unreadIds = list.filter((a) => !a.read).map((a) => a.id);
@@ -1953,7 +1995,8 @@ function alertsSheet() {
         if (a.kind === 'request' && a.requestId && (state.requests || []).some((r) => r.id === a.requestId)) return requestSheet(a.requestId);
         if (a.kind === 'cert') { closeSheet(); return switchTab('certs'); }
         if (a.kind === 'user' && a.userId && state.users.some((u) => u.id === a.userId)) return userSheet(a.userId);
-        if (a.kind === 'security' && isOwner()) return securityLogSheet();
+        if (a.kind === 'security' && isStaff()) return securityLogSheet();
+        if (a.kind === 'bug' && a.bugId && (state.bugs || []).some((x) => x.id === a.bugId)) return bugSheet(a.bugId);
         if (a.kind === 'storage') { closeSheet(); return switchTab('settings'); }
       };
     });
@@ -2665,7 +2708,7 @@ function addVersionSheet(a) {
 function appSheet(appId) {
   const a = state.apps.find((x) => x.id === appId);
   if (!a) return;
-  const owner = isOwner();
+  const owner = isStaff();
   const defaults = defaultsSummary(a.signDefaults);
   const total = a.likes + a.dislikes;
   const pct = total ? Math.round((100 * a.likes) / total) : null;
@@ -2692,6 +2735,7 @@ function appSheet(appId) {
     ${a.installed ? installedNoteHtml(a) : ''}
     ${defaults.length ? `<p class="hint center" style="margin-top:${a.installed ? 2 : 8}px">Comes set up with: ${esc(defaults.join(' · '))}</p>` : ''}
     <button class="link-btn block" id="aOptions" type="button">Sign with options…</button>
+    ${seesTesterApps() && !isOwner() ? '<button class="link-btn block" id="aBug" type="button" style="margin-top:-8px">🐞 Report a bug in this app</button>' : ''}
 
     ${shotList.length ? `<div class="shots">${shotList.map((src, i) => `<button class="shot" data-shot="${i}"><img class="fade-img" loading="lazy" referrerpolicy="no-referrer" onload="this.classList.add('loaded')" onerror="this.closest('.shot').remove()" src="${esc(src)}" alt="Screenshot ${i + 1}"></button>`).join('')}</div>` : ''}
 
@@ -2716,7 +2760,7 @@ function appSheet(appId) {
             ${v.notes ? `<div class="row-sub ver-notes" role="button" tabindex="0">${esc(cleanNotes(v.notes))}</div>` : ''}
           </div>
           ${owner && v.manualId ? `<button class="pill danger-pill" data-delver="${v.manualId}" aria-label="Remove this version">✕</button>` : ''}
-          <button class="pill" data-ver="${n + 1}">Get</button>
+          <button class="pill" data-ver="${v.vi ?? n + 1}">Get</button>
         </div>`).join('')}</div>
       <p class="hint" style="margin:6px 4px 0">Older versions are handy if the newest one has a bug or needs a newer iOS.</p>` : ''}
     ${inCols.length ? `<div class="section-title">In collections</div><div class="tag-row">${inCols.map((c) => `<button class="tag" data-col="${c.id}">${esc(c.emoji)} ${esc(c.name)}</button>`).join('')}</div>` : ''}
@@ -2736,6 +2780,7 @@ function appSheet(appId) {
     <div class="group" style="margin-top:14px">
       ${toggle('aPub', 'Show in App Library', 'Everyone you invite can sign and install it', a.published)}
       ${toggle('aFeat', 'Featured', 'Pinned to the top of the library', a.featured)}
+      ${toggle('aTest', 'Testers only', 'Only testers (and admins) can see it — a 🧪 For testers list shows at the top of their library', !!a.testersOnly)}
     </div>
     <div class="actions">
       <button class="btn block" id="aEdit">Edit details, tags &amp; sign settings</button>
@@ -2743,7 +2788,7 @@ function appSheet(appId) {
       <button class="btn block" id="aCols">Add to collection</button>
       ${a.cloud === 'source' ? `<button class="btn block" id="aAddVer">⬆ Add a newer version</button><p class="hint center" style="margin-top:2px">For when you have a newer build than ${esc(a.sourceName || 'the source')}. Its older versions stay available.</p>` : ''}
       ${isSrcApp(a) ? `<p class="hint center">Updates come in by themselves when ${esc(a.sourceName || 'the source')} ${a.cloud === 'telegram' ? 'posts' : 'adds'} a new version.</p>` : '<button class="btn block" id="aUpdate">Update IPA (new version)</button>'}
-      ${!a.cloud && state.github.connected ? `<button class="btn block" id="aMoveGh">☁ Move to GitHub (frees ${fmtSize(a.size)})</button>` : ''}
+      ${!a.cloud && isOwner() && state.github.connected ? `<button class="btn block" id="aMoveGh">☁ Move to GitHub (frees ${fmtSize(a.size)})</button>` : ''}
       <a class="btn block" href="/api/apps/${a.id}/download">Download original .ipa</a>
       <button class="btn block danger" id="aDelete">Delete</button>
     </div>` : ''}`, (el) => {
@@ -2752,6 +2797,7 @@ function appSheet(appId) {
     el.querySelectorAll('.ver-notes').forEach((n) => { n.onclick = () => n.classList.toggle('open'); });
     bindInstalledNote(el, a, () => appSheet(a.id));
     $('#aOptions', el).onclick = () => signSheet(a.id);
+    if ($('#aBug', el)) $('#aBug', el).onclick = () => reportBugSheet(a.id);
     el.querySelectorAll('[data-shot]').forEach((b) => { b.onclick = () => shotViewer(a, Number(b.dataset.shot)); });
     el.querySelectorAll('[data-ver]').forEach((b) => {
       b.onclick = () => {
@@ -2789,6 +2835,7 @@ function appSheet(appId) {
     };
     flip('#aPub', 'published', 'Shown in App Library', 'Hidden from App Library');
     flip('#aFeat', 'featured', 'Featured ★', 'No longer featured');
+    flip('#aTest', 'testersOnly', 'Only testers can see it now 🧪', 'Not just for testers anymore');
     $('#aEdit', el).onclick = () => editAppSheet(a);
     $('#aShots', el).onclick = () => screenshotsSheet(a);
     $('#aCols', el).onclick = () => addToCollectionSheet(a);
@@ -2938,7 +2985,7 @@ function collectionSheet(cid) {
         <div class="row-main"><div class="row-title">${esc(a.name)}</div><div class="row-sub">${esc(shownVersion(a))} · ${fmtSize(a.size)}</div>${appBadges(a, { compact: true }) ? `<div class="row-badges">${appBadges(a, { compact: true })}</div>` : ''}</div>
         <button class="pill" data-get="${a.id}">${getLabel(a)}</button>
       </div>`).join('')}</div>
-    ${isOwner() ? '<button class="btn block" id="cEdit" style="margin-top:12px">Edit collection</button>' : ''}`, (el) => {
+    ${isStaff() ? '<button class="btn block" id="cEdit" style="margin-top:12px">Edit collection</button>' : ''}`, (el) => {
     el.querySelectorAll('[data-open]').forEach((r) => { r.onclick = () => appSheet(r.dataset.open); });
     el.querySelectorAll('[data-get]').forEach((b) => { b.onclick = (e) => { e.stopPropagation(); quickGet(b.dataset.get); }; });
     if ($('#cAll', el)) $('#cAll', el).onclick = () => getAll(apps, c.name);
@@ -3072,7 +3119,7 @@ function addToCollectionSheet(a) {
 function requestAppSheet() {
   openSheet(`
     <h2>Request an App</h2>
-    <p class="hint" style="margin-top:-6px">Ask for an app to be added to the library. You'll see the answer in ${isOwner() ? 'Users' : 'Account'} › Requests.</p>
+    <p class="hint" style="margin-top:-6px">Ask for an app to be added to the library. You'll see the answer in ${isStaff() ? 'Users' : 'Account'} › Requests.</p>
     <div class="field"><label>App name</label><input type="text" id="rqName" placeholder="e.g. Delta Emulator"></div>
     <div class="field"><label>Link (optional)</label><input type="url" id="rqLink" placeholder="Where to find it" autocapitalize="off" autocorrect="off"></div>
     <div class="field"><label>Anything else? (optional)</label><textarea id="rqNote" placeholder="Version, tweaks you want, why…"></textarea></div>
@@ -3093,7 +3140,7 @@ function requestRow(r) {
   const [label, cls] = REQ_STATUS[r.status] || REQ_STATUS.pending;
   return `<div class="row" data-req="${r.id}">
     <div class="row-main"><div class="row-title">${esc(r.name)}</div>
-      <div class="row-sub">${isOwner() ? `${esc(r.username || '?')} · ` : ''}${ago(r.createdAt)}${r.reply ? ` · “${esc(r.reply)}”` : ''}</div></div>
+      <div class="row-sub">${isStaff() ? `${esc(r.username || '?')} · ` : ''}${ago(r.createdAt)}${r.reply ? ` · “${esc(r.reply)}”` : ''}</div></div>
     <span class="badge ${cls}">${label}</span></div>`;
 }
 
@@ -3104,7 +3151,7 @@ function requestSheet(rid) {
   openSheet(`
     <h2>${esc(r.name)}</h2>
     <dl class="kv">
-      ${isOwner() ? `<dt>From</dt><dd>${esc(r.username || '?')}</dd>` : ''}
+      ${isStaff() ? `<dt>From</dt><dd>${esc(r.username || '?')}</dd>` : ''}
       <dt>Asked</dt><dd>${ago(r.createdAt)}</dd>
       <dt>Status</dt><dd>${REQ_STATUS[r.status][0]}</dd>
       ${r.link ? `<dt>Link</dt><dd><a href="${esc(r.link)}" target="_blank" rel="noopener">${esc(r.link)}</a></dd>` : ''}
@@ -3112,14 +3159,14 @@ function requestSheet(rid) {
     ${r.note ? `<p class="desc">${esc(r.note)}</p>` : ''}
     ${r.reply ? `<p class="setup-note">💬 ${esc(r.reply)}</p>` : ''}
     ${app ? `<button class="btn primary block" id="rqOpen">Open ${esc(app.name)}</button>` : ''}
-    ${isOwner() ? `
+    ${isStaff() ? `
       <div class="field" style="margin-top:12px"><label>Reply (optional)</label><input type="text" id="rqReply" value="${esc(r.reply || '')}" placeholder="e.g. Added! Turn on JIT first"></div>
       <div class="field"><label>Link it to a library app (optional)</label><select id="rqApp"><option value="">—</option>${state.apps.map((a) => `<option value="${a.id}" ${a.id === r.appId ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select></div>
       <div class="card-actions">
         <button class="btn" id="rqAdded">✅ Mark added</button>
         <button class="btn" id="rqDecline">✕ Decline</button>
       </div>` : ''}
-    ${isOwner() || r.status === 'pending' ? '<button class="btn block danger" id="rqDel" style="margin-top:8px">Delete request</button>' : ''}`, (el) => {
+    ${isStaff() || r.status === 'pending' ? '<button class="btn block danger" id="rqDel" style="margin-top:8px">Delete request</button>' : ''}`, (el) => {
     if ($('#rqOpen', el)) $('#rqOpen', el).onclick = () => appSheet(app.id);
     const set = async (status) => {
       try {
@@ -3397,7 +3444,7 @@ function signSheet(appId, overrides) {
       <div class="hint" id="sCertHint"></div>
     </div>
     ${(a.versions || []).length > 1 ? `<div class="field"><label>App version</label>
-      <select id="sVer">${a.versions.map((v, i) => `<option value="${i}" ${i === (Number(defaults.versionIndex) || 0) ? 'selected' : ''}>${esc(v.version || 'Version ' + (i + 1))}${i === 0 ? ' (newest)' : ''}${v.date ? ' · ' + esc(String(v.date).slice(0, 10)) : ''}</option>`).join('')}</select></div>` : ''}
+      <select id="sVer">${a.versions.map((v, i) => `<option value="${v.vi ?? i}" ${(v.vi ?? i) === (Number(defaults.versionIndex) || 0) ? 'selected' : ''}>${esc(v.version || 'Version ' + (i + 1))}${i === 0 ? ' (newest)' : ''}${v.channel && /^(beta|alpha|pre)/i.test(v.channel) ? ' · beta' : ''}${v.date ? ' · ' + esc(String(v.date).slice(0, 10)) : ''}</option>`).join('')}</select></div>` : ''}
     ${state.presets.length ? `<div class="field"><label>Preset</label>
       <select id="sPreset"><option value="">${overrides && overrides.presetId ? 'App defaults' : 'None (app defaults)'}</option>${state.presets.map((p) => `<option value="${p.id}" ${overrides && overrides.presetId === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></div>` : ''}
     ${summary.length ? `<p class="setup-note">✨ ${overrides && overrides.presetId ? 'From your preset' : 'Set up for you'}: ${esc(summary.join(' · '))}</p>` : ''}
@@ -4144,23 +4191,34 @@ function userSheet(uid) {
       ${u.invite ? `<dt>Invite</dt><dd class="mono">${esc(u.invite)}</dd>` : ''}
       <dt>Signs today</dt><dd>${u.signsToday || 0}</dd>
     </dl>
-    <div class="list" style="margin-top:12px">
+    ${isOwner() ? `<div class="list" style="margin-top:12px">
+      <div class="setting"><span>Role<br><span class="hint">Admins help run the library and users. Testers see apps for testers and beta versions first.</span></span>
+        <select id="uRank">${[['', 'Member'], ['tester', '🧪 Tester'], ['admin', '⭐ Admin']].map(([v, l]) => `<option value="${v}" ${(u.rank || '') === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
+    </div>` : u.rank ? `<p class="hint" style="margin:10px 4px 0">${RANK_LABEL[u.rank]}${u.rank === 'admin' ? ' · only the owner can change admins' : ''}</p>` : ''}
+    ${u.rank === 'admin' && !isOwner() ? '' : `<div class="list" style="margin-top:12px">
       <div class="setting"><span>Signs per day</span>
-        <select id="uLimit">${[['', `Everyone's limit (${Number(state.settings.signsPerDay) || 'none'})`], ['0', 'No limit'], ['3', '3'], ['5', '5'], ['10', '10'], ['20', '20'], ['50', '50']].map(([v, l]) => `<option value="${v}" ${String(u.signLimit ?? '') === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
-    </div>
+        <select id="uLimit">${[['', `Everyone's limit (${Number(state.settings.signsPerDay ?? state.settings.everyoneSignsPerDay) || 'none'})`], ['0', 'No limit'], ['3', '3'], ['5', '5'], ['10', '10'], ['20', '20'], ['50', '50']].map(([v, l]) => `<option value="${v}" ${String(u.signLimit ?? '') === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
+    </div>`}
     ${(u.recentSignins || []).length ? `<div class="section-title">Recent sign-ins</div><div class="list">${u.recentSignins.map(signinRow).join('')}</div>` : ''}
-    <div class="actions" style="margin-top:12px">
+    ${u.rank === 'admin' && !isOwner() ? `${u.udid ? '<div class="actions" style="margin-top:12px"><button class="btn block" id="uCopy">Copy UDID</button></div>' : ''}` : `<div class="actions" style="margin-top:12px">
       ${u.udid ? '<button class="btn block" id="uCopy">Copy UDID</button>' : ''}
       <button class="btn block" id="uReset">Reset password</button>
       <button class="btn block" id="uSignOut">Sign them out everywhere</button>
       ${u.udid ? '<button class="btn block" id="uUnlink">Unlink iPhone</button>' : ''}
       <button class="btn block" id="uToggle">${u.disabled ? 'Turn account on' : 'Turn account off'}</button>
       <button class="btn block danger" id="uDelete">Delete account</button>
-    </div>`, (el) => {
+    </div>`}`, (el) => {
     const patch = async (body, msg) => {
       try { await api('PATCH', `/api/users/${u.id}`, body); toast(msg); closeSheet(); await refresh(); } catch (e) { toast(e.message, true); }
     };
     if ($('#uCopy', el)) $('#uCopy', el).onclick = () => copy(u.udid, 'UDID copied');
+    if ($('#uRank', el)) {
+      $('#uRank', el).onchange = (e) => {
+        const rank = e.target.value || null;
+        patch({ rank }, rank ? `${u.username} is now ${rank === 'admin' ? 'an admin ⭐' : 'a tester 🧪'}` : `${u.username} is a member again`);
+      };
+    }
+    if (!$('#uReset', el)) return; // an admin looking at another admin: nothing to change
     $('#uReset', el).onclick = () => {
       const pw = prompt(`New password for ${u.username} (6+ characters)`);
       if (pw) patch({ password: pw }, 'Password reset — they\'ll need to sign in again');
@@ -4174,6 +4232,69 @@ function userSheet(uid) {
     $('#uDelete', el).onclick = async () => {
       if (!confirm(`Delete ${u.username}? Their certificates and signed apps are removed too.`)) return;
       try { await api('DELETE', `/api/users/${u.id}`); closeSheet(); toast('Account deleted'); await refresh(); } catch (e) { toast(e.message, true); }
+    };
+  });
+}
+
+// ---------- bug reports (testers & admins send them; you and admins answer) ----------
+const BUG_STATUS = { open: ['🐞 Open', ''], fixed: ['✅ Fixed', 'good'], wontfix: ['✕ Won\'t fix', 'bad'] };
+function bugRow(b) {
+  const [label, cls] = BUG_STATUS[b.status] || BUG_STATUS.open;
+  return `<button class="row" data-act="bug" data-id="${b.id}">
+    <span class="row-main"><span class="row-title">${esc(b.appName || 'General')}</span>
+      <span class="row-sub">${isStaff() ? `${esc(b.username || '?')} · ` : ''}${ago(b.createdAt)} · ${esc(b.text.split('\n')[0].slice(0, 80))}</span></span>
+    <span class="badge ${cls}">${label}</span></button>`;
+}
+function reportBugSheet(appId) {
+  const a = appId && state.apps.find((x) => x.id === appId);
+  openSheet(`
+    <h2>🐞 Report a bug</h2>
+    <p class="hint" style="margin-top:-6px">It goes straight to the owner${isAdmin() ? '' : ' and admins'}. Say what you did and what went wrong.</p>
+    <div class="field"><label>App</label>
+      <select id="bgApp"><option value="">Mango Signer itself / general</option>${state.apps.map((x) => `<option value="${x.id}" ${a && a.id === x.id ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}</select></div>
+    <div class="field"><label>What happened?</label><textarea id="bgText" placeholder="e.g. Crashes when I open the settings page"></textarea></div>
+    <button class="btn primary big block" id="bgSend">Send Report</button>`, (el) => {
+    $('#bgSend', el).onclick = async () => {
+      try {
+        await api('POST', '/api/bugs', { text: $('#bgText', el).value, appId: $('#bgApp', el).value || null });
+        closeSheet(); toast('Thanks! Report sent 🐞'); await refresh();
+      } catch (e) { toast(e.message, true); }
+    };
+  });
+}
+function bugSheet(id) {
+  const b = (state.bugs || []).find((x) => x.id === id);
+  if (!b) return;
+  const app = b.appId && state.apps.find((x) => x.id === b.appId);
+  openSheet(`
+    <h2>🐞 ${esc(b.appName || 'General')}</h2>
+    <dl class="kv">
+      ${isStaff() ? `<dt>From</dt><dd>${esc(b.username || '?')}</dd>` : ''}
+      <dt>Sent</dt><dd>${ago(b.createdAt)}</dd>
+      <dt>Status</dt><dd>${(BUG_STATUS[b.status] || BUG_STATUS.open)[0]}</dd>
+      ${b.device ? `<dt>Device</dt><dd>${esc(b.device)}</dd>` : ''}
+    </dl>
+    <p class="desc">${esc(b.text)}</p>
+    ${b.reply ? `<p class="setup-note">💬 ${esc(b.reply)}</p>` : ''}
+    ${app ? `<button class="btn block" id="bgOpen">Open ${esc(app.name)}</button>` : ''}
+    ${isStaff() ? `
+      <div class="field" style="margin-top:12px"><label>Reply (optional)</label><input type="text" id="bgReply" value="${esc(b.reply || '')}" placeholder="e.g. Fixed in the next version"></div>
+      <div class="card-actions">
+        <button class="btn" id="bgFixed">✅ Fixed</button>
+        <button class="btn" id="bgWont">✕ Won't fix</button>
+        <button class="btn" id="bgReopen">Reopen</button>
+      </div>` : ''}
+    <button class="btn block danger" id="bgDel" style="margin-top:8px">Delete report</button>`, (el) => {
+    if ($('#bgOpen', el)) $('#bgOpen', el).onclick = () => appSheet(app.id);
+    const set = async (status) => {
+      try { await api('PATCH', `/api/bugs/${b.id}`, { status, reply: $('#bgReply', el).value }); await refresh(); toast('Saved'); closeSheet(); } catch (e) { toast(e.message, true); }
+    };
+    if ($('#bgFixed', el)) $('#bgFixed', el).onclick = () => set('fixed');
+    if ($('#bgWont', el)) $('#bgWont', el).onclick = () => set('wontfix');
+    if ($('#bgReopen', el)) $('#bgReopen', el).onclick = () => set('open');
+    $('#bgDel', el).onclick = async () => {
+      if (!confirm('Delete this report?')) return;
+      try { await api('DELETE', `/api/bugs/${b.id}`); await refresh(); toast('Deleted'); closeSheet(); } catch (e) { toast(e.message, true); }
     };
   });
 }

@@ -733,3 +733,6 @@ html[data-accent="red"] { --mango: #ff5c5c; --mango-2: #ff9b9b; --accent-2: #f03
 .task-pill.done { border-color: rgba(92, 196, 92, .45); }
 .pill-ok { width: 18px; text-align: center; color: var(--leaf); font-weight: 800; }
 .hint-card .mini-spin { width: 16px; height: 16px; border-width: 2.5px; }
+
+/* roles */
+.badge.tester { background: rgba(106, 168, 255, .16); color: var(--blue); }
