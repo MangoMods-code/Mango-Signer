@@ -4264,6 +4264,7 @@ async function handleUrlParams() {
     disabled: ['That account is turned off', true],
     off: ['iPhone sign-in is turned off', true],
     ownerpw: ['The owner account signs in with the password only (iPhone sign-in is for customers)', true],
+    verify: ["Couldn't confirm that was really your iPhone, so sign in with your username and password this time", true],
     error: ["Couldn't read your iPhone's ID — try again", true],
   };
   if (msgs[udid]) toast(...msgs[udid]);
