@@ -10,7 +10,7 @@ const state = {
   lib: { q: '', cat: 'all', sort: 'smart', select: false, selected: new Set(), limit: 40 },
 };
 const isOwner = () => state.account && state.account.role === 'owner';
-// Admins help run the library and users; testers see "Testers only" apps and beta versions first.
+// Admins help run the library and users; testers get a badge and see "Testers only" apps.
 const isAdmin = () => !!state.account && state.account.role === 'user' && state.account.rank === 'admin';
 const isStaff = () => isOwner() || isAdmin();
 const isTester = () => !!state.account && state.account.role === 'user' && state.account.rank === 'tester';
@@ -1217,7 +1217,7 @@ function accountSection() {
     </div>
     <p class="hint" style="margin:8px 4px 0">${a.udid ? 'Your iPhone can sign in without a password, and Mango checks whether it\'s in your profiles.' : 'Linking downloads a quick profile: open Settings › Profile Downloaded › Install, and you\'ll come back here.'}</p>
     ${isTester() ? `<div class="section-title">🧪 Tester</div>
-      <p class="hint" style="margin:0 4px 10px">You see apps marked for testers, beta versions first, and you have no daily sign limit. Found something broken? Tell the owner.</p>
+      <p class="hint" style="margin:0 4px 10px">You get the 🧪 badge and see the apps the owner picks for testers. Found something broken? Report it here.</p>
       ${(state.bugs || []).length ? `<div class="list" style="margin-bottom:10px">${state.bugs.map(bugRow).join('')}</div>` : ''}
       <button class="btn block" data-act="report-bug">🐞 Report a bug</button>` : ''}
     ${!isStaff() ? `<div class="section-title">My app requests</div>
@@ -4282,7 +4282,7 @@ function newInviteSheet() {
       <select id="iRank">${[['', 'Member'], ['tester', '🧪 Tester'], ['admin', '⭐ Admin']].map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}</select>
       <div class="hint" id="iRankHint">They join as a regular member.</div></div>` : ''}
     <button class="btn primary big block" id="iMake">Create Invite</button>`, (el) => {
-    const rankHint = { '': 'They join as a regular member.', tester: 'They join as testers right away: testers-only apps, beta versions, no sign limit and a 🧪 badge.', admin: '⚠️ They join as admins right away and can manage the library and users. Only use this for people you trust, and keep uses low.' };
+    const rankHint = { '': 'They join as a regular member.', tester: 'They join as testers right away: a 🧪 badge and the apps you mark for testers. Nothing else changes for them.', admin: '⚠️ They join as admins right away and can manage the library and users. Only use this for people you trust, and keep uses low.' };
     if ($('#iRank', el)) $('#iRank', el).onchange = (e) => { $('#iRankHint', el).textContent = rankHint[e.target.value]; };
     $('#iMake', el).onclick = async () => {
       try {
@@ -4336,7 +4336,7 @@ function userSheet(uid) {
       <dt>Signs today</dt><dd>${u.signsToday || 0}</dd>
     </dl>
     ${isOwner() ? `<div class="list" style="margin-top:12px">
-      <div class="setting"><span>Role<br><span class="hint">Admins help run the library and users. Testers see apps for testers and beta versions first.</span></span>
+      <div class="setting"><span>Role<br><span class="hint">Admins help run the library and users. Testers get a 🧪 badge and see the apps you mark for testers.</span></span>
         <select id="uRank">${[['', 'Member'], ['tester', '🧪 Tester'], ['admin', '⭐ Admin']].map(([v, l]) => `<option value="${v}" ${(u.rank || '') === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
     </div>` : u.rank ? `<p class="hint" style="margin:10px 4px 0">${RANK_LABEL[u.rank]}${u.rank === 'admin' ? ' · only the owner can change admins' : ''}</p>` : ''}
     ${u.rank === 'admin' && !isOwner() ? '' : `<div class="list" style="margin-top:12px">
