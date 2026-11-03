@@ -1444,7 +1444,7 @@ function addSourceSheet(prefill = '') {
   openSheet(`
     <h2>Add a Source</h2>
     <p class="muted small" style="margin-top:-6px">A source is a list of apps someone keeps up to date (the same kind AltStore, SideStore, ESign and Feather use). Its apps show up in your library as links — nothing is downloaded to your server until someone signs one.</p>
-    <div class="field"><label>Source link</label><input type="url" id="srcUrl" placeholder="https://…/source.json or github.com/owner/repo" value="${esc(typeof prefill === 'string' ? prefill : '')}" autocapitalize="off" autocorrect="off"><div class="hint">Works with AltStore-style sources, and with <b>GitHub repos</b>: paste github.com/owner/repo and every release with an .ipa becomes a version, with new releases showing up as updates. A link straight to one <b>.ipa</b> file from any website works too, and adds just that app.</div></div>
+    <div class="field"><label>Source link</label><input type="url" id="srcUrl" placeholder="https://…/source.json or github.com/owner/repo" value="${esc(typeof prefill === 'string' ? prefill : '')}" autocapitalize="off" autocorrect="off"><div class="hint">Works with AltStore-style sources, and with <b>GitHub repos</b>: paste github.com/owner/repo and every release with an .ipa becomes a version, with new releases showing up as updates. A website's <b>downloads page</b> works too (like example.com/downloads): Mango picks up every .ipa link on it and adds new ones as updates. A link straight to one <b>.ipa</b> file adds just that app.</div></div>
     <div class="group">${toggle('srcShow', 'Show its apps to everyone', 'Turn off to keep them just for you until you check them out', true)}</div>
     <button class="btn primary block" id="srcAdd" style="margin-top:12px">Add Source</button>
     ${sugg.length ? `<div class="section-title">Suggested</div><div class="list">${sugg.map((x, i) => `
@@ -1514,7 +1514,7 @@ function sourceSheet(sid) {
       <dt>Last refresh</dt><dd>${src.lastSync ? ago(src.lastSync) : 'never'}</dd>
       <dt>Link</dt><dd class="mono small-break">${esc(src.url)}</dd>
     </dl>
-    <p class="hint" style="margin:8px 4px 0">Refreshes by itself every hour${src.kind === 'ghrepo' ? ': each new GitHub release with an .ipa becomes the new version, and older ones stay downloadable' : ''}. New versions show as UPDATED in the library. Anything you edit on an app (name, category, description…) is kept when it refreshes.</p>
+    <p class="hint" style="margin:8px 4px 0">Refreshes by itself every hour${src.kind === 'ghrepo' ? ': each new GitHub release with an .ipa becomes the new version, and older ones stay downloadable' : src.kind === 'webpage' ? ': any new .ipa link on the page becomes the new version, and links it saw before stay as older versions' : ''}. New versions show as UPDATED in the library. Anything you edit on an app (name, category, description…) is kept when it refreshes.</p>
     <div class="group" style="margin-top:12px">${toggle('srcShow', 'Show its apps to everyone', 'Off = only you can see them', src.showInLibrary !== false)}
       ${toggle('srcSkip', 'Skip apps I already have', 'Don\'t add an app that\'s already in your library from somewhere else', src.skipHave === undefined ? src.kind !== 'ghrepo' : !!src.skipHave)}</div>
     <div class="field" style="margin-top:12px"><label>Name in your library</label><input type="text" id="srcName" value="${esc(src.name)}" maxlength="60"></div>
