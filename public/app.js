@@ -3350,13 +3350,13 @@ async function quickSortSheet(back) {
   let guesses = {};
   try { guesses = (await api('POST', '/api/apps/category-guesses', { ids: queue })).guesses || {}; } catch { /* guesses are a bonus */ }
   const total = queue.length;
-  let i = 0, done = 0;
+  let i = 0, done = 0, deleted = 0;
   const history = [];
   const next = () => { while (i < queue.length && !state.apps.find((a) => a.id === queue[i])) i++; };
   const draw = () => {
     next();
     if (i >= queue.length) {
-      openSheet(`<div class="empty"><div class="empty-icon">🎉</div><h3>All done</h3><p>${done} sorted${total - done ? `, ${total - done} skipped` : ''}.</p></div>
+      openSheet(`<div class="empty"><div class="empty-icon">🎉</div><h3>All done</h3><p>${done} sorted${deleted ? `, ${deleted} deleted` : ''}${total - done - deleted ? `, ${total - done - deleted} skipped` : ''}.</p></div>
         ${history.length ? '<button class="btn block" id="qsUndo">↩ Undo the last one</button>' : ''}
         <button class="btn primary block" id="qsClose" style="margin-top:8px">${back ? 'Back' : 'Close'}</button>`, (el) => {
         if ($('#qsUndo', el)) $('#qsUndo', el).onclick = undo;
@@ -3370,7 +3370,7 @@ async function quickSortSheet(back) {
     const sub = [a.developer, a.bundleId, a.sourceName ? `${a.cloud === 'telegram' ? '✈️' : '☁'} ${a.sourceName}` : ''].filter(Boolean).join(' · ');
     const about = String(a.description || a.notes || '').replace(/\s+/g, ' ').slice(0, 160);
     openSheet(`
-      <p class="muted small center" style="margin:-4px 0 10px">${i + 1} of ${queue.length} · ${done} sorted</p>
+      <p class="muted small center" style="margin:-4px 0 10px">${i + 1} of ${queue.length} · ${done} sorted${deleted ? ` · ${deleted} deleted` : ''}</p>
       <div class="sheet-head">${appIcon(a, true)}<div class="row-main"><h2>${esc(a.name)}</h2><div class="row-sub">${esc(sub)}</div></div></div>
       ${about ? `<p class="muted small" style="margin:-4px 0 12px">${esc(about)}${about.length >= 160 ? '…' : ''}</p>` : ''}
       ${guessCat ? `<button class="btn primary big block" data-qcat="${guessCat.id}">${esc(guessCat.emoji)} ${esc(guessCat.name)}<span class="qs-why">Best guess: ${esc(g.why)}</span></button>`
@@ -3379,6 +3379,7 @@ async function quickSortSheet(back) {
         <button class="btn" data-qnew="">+ New…</button></div>
       <div class="actions" style="margin-top:12px">
         <button class="btn block" id="qsSkip">Skip for now</button>
+        <button class="btn block danger" id="qsDel">🗑 Delete from library</button>
         ${history.length ? '<button class="link-btn block" id="qsUndo" type="button">↩ Undo the last one</button>' : ''}
         <button class="link-btn block" id="qsOpen" type="button">Open the app's page</button>
         <button class="link-btn block" id="qsDone" type="button">${back ? 'Back' : 'Done'}</button>
@@ -3404,6 +3405,16 @@ async function quickSortSheet(back) {
         };
       });
       $('#qsSkip', el).onclick = () => { i++; draw(); };
+      $('#qsDel', el).onclick = async () => {
+        if (!confirm(`Delete ${a.name} from the library? People who installed it keep it.${isSrcApp(a) ? ` ${a.sourceName || 'Its source'} won't add it back.` : ''} This can't be undone.`)) return;
+        el.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+        try {
+          await api('DELETE', `/api/apps/${a.id}`);
+          state.apps = state.apps.filter((x) => x.id !== a.id);
+          deleted++; i++;
+          draw();
+        } catch (e) { toast(e.message, true); draw(); }
+      };
       if ($('#qsUndo', el)) $('#qsUndo', el).onclick = undo;
       $('#qsOpen', el).onclick = () => appSheet(a.id);
       $('#qsDone', el).onclick = async () => { await refresh(); if (back) back(); else closeSheet(); };
