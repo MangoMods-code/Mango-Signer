@@ -3926,6 +3926,34 @@ function trimSigned(acc) {
   for (const s of mine.slice(max)) removeSigned(s).catch(() => {});
 }
 
+// The original (unsigned) app file, for signing on the person's own iPhone in the Mango Signer app.
+// Same rules as signing on the server: only apps they can see, and it counts toward their daily sign limit.
+route('GET', /^\/api\/apps\/([a-f0-9]{16})\/ipa$/, async (req, res, m, acc) => {
+  const app = visibleApps(acc).find((a) => a.id === m[1]);
+  if (!app) return fail(res, 404, 'App not found');
+  const limit = signLimitFor(acc);
+  if (limit && signsToday(acc.id) >= limit) return fail(res, 429, `You've used all ${limit} signs for today. It resets at midnight (server time).`);
+  const versionIndex = Math.max(0, Math.min(14, Number(req.query.get('v')) || 0));
+  const count = () => { if (req.method !== 'HEAD') { countSign(acc.id, app.id); store.save(); } };
+  const fileName = `${app.name} ${app.version || ''}.ipa`.replace(/[^\w.\- ]/g, '_');
+  if (!app.remote) { count(); return serveFile(req, res, path.join(dirs.apps, app.id + '.ipa'), { download: fileName }); }
+  const dl = await resolveDownload(remoteDownload(app, versionIndex));
+  const idle = idleSignal(null, 90_000);
+  let r;
+  try { r = await fetchAuthed(dl.url, dl.headers, idle.signal); } catch (e) { idle.done(); return fail(res, 502, `Couldn't get the app (${e.message})`); }
+  if (!r.ok || !r.body) { idle.done(); return fail(res, 502, `Couldn't get the app (HTTP ${r.status})`); }
+  count(); // only once the app is really on its way
+  res.writeHead(200, {
+    'Content-Type': 'application/octet-stream',
+    'Content-Disposition': `attachment; filename="${fileName}"`,
+    'Cache-Control': 'no-store',
+    ...(r.headers.get('content-length') ? { 'Content-Length': r.headers.get('content-length') } : {}),
+  });
+  const body = Readable.fromWeb(r.body);
+  body.on('data', () => idle.kick());
+  return pipeline(body, res).catch(() => {}).finally(() => idle.done());
+});
+
 route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
   const b = await readJson(req);
   const app = visibleApps(acc).find((a) => a.id === b.appId);

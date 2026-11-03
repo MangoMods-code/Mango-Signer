@@ -3,6 +3,21 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.9.7',
+    date: '2026-11-03',
+    title: 'Ready for the iPhone App',
+    summary: 'Mango Signer can now work with the Mango Signer iPhone app.',
+    sections: [
+      {
+        title: '📱 iPhone app',
+        items: [
+          'The Mango Signer iPhone app can sign in to this server and show your library, certificates and signed apps.',
+          'In the app you can sign on the server like always, or have the app signed right on your iPhone. Signing on your iPhone counts toward your daily sign limit, the same as signing here.',
+        ],
+      },
+    ],
+  },
+  {
     version: '1.9.6',
     date: '2026-11-02',
     title: 'Safer iPhone Sign-In',
