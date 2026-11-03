@@ -24,7 +24,8 @@ const zipLib = require('./lib/zip');
 const telegram = require('./lib/telegram');
 const appstore = require('./lib/appstore');
 
-const WHATS_NEW = require('./lib/whats-new');
+// whats-new.js lives in the main folder (older versions kept it in lib/).
+const WHATS_NEW = (() => { try { return require('./whats-new'); } catch (e) { if (e.code !== 'MODULE_NOT_FOUND') throw e; return require('./lib/whats-new'); } })();
 const VERSION = WHATS_NEW[0].version; // the real version of this code
 // Changes whenever any app file changes, so open apps know to refresh even if the version label is the same.
 const BUILD_ID = crypto.createHash('sha256')
@@ -3003,14 +3004,20 @@ const catExists = (cid) => store.categories.some((c) => c.id === cid);
 // Starting one while another runs is fine: it waits its turn and says what it's waiting for.
 const checkQueue = [];
 let checkRunning = null;
+// Where a waiting check is in line and what it's waiting for, worked out fresh each time it's asked
+// (so it never says it's waiting for something that already finished).
+function queueInfo(job) {
+  const i = checkQueue.findIndex((c) => c.job === job);
+  if (i < 0) return null;
+  return { position: i + 1, waitingFor: (checkRunning && checkRunning.title) || (i > 0 ? checkQueue[i - 1].job.title : null) };
+}
 function runCheck(job, work) {
-  if (checkRunning || checkQueue.length) {
-    job.status = 'queued';
-    const ahead = [checkRunning, ...checkQueue.map((c) => c.job)].filter(Boolean);
-    job.waitingFor = ahead.map((j) => j.title).filter(Boolean);
-    job.log.push(`⏳ Waiting for ${job.waitingFor[0] || 'another check'} to finish${ahead.length > 1 ? ` (${ahead.length} ahead)` : ''}. It starts by itself right after.`);
-  }
+  job.isCheck = true;
   checkQueue.push({ job, work });
+  if (checkRunning || checkQueue.length > 1) {
+    job.status = 'queued';
+    job.waitingFor = [queueInfo(job).waitingFor].filter(Boolean); // for the reply that started it
+  }
   pumpChecks();
   return job;
 }
@@ -3024,20 +3031,41 @@ async function pumpChecks() {
   job.status = 'running';
   job.waitingFor = null;
   job.started = Date.now();
+  job.activityAt = Date.now();
   try { await work(); } catch (e) {
     if (job.status === 'running') { job.status = 'error'; job.error = e.message; }
   } finally {
     if (job.status === 'running') job.status = job.cancelled ? 'cancelled' : 'done';
-    job.endedAt = Date.now();
-    checkRunning = null;
-    setImmediate(pumpChecks);
+    job.endedAt = job.endedAt || Date.now();
+    // Only free the line if this is still the check holding it (the watchdog may have moved on already).
+    if (checkRunning === job) { checkRunning = null; setImmediate(pumpChecks); }
   }
 }
 const checkBusy = () => !!checkRunning || checkQueue.length > 0;
 // Is this source already being checked (or waiting)? Then reuse that instead of starting another.
 function checkFor(srcId) {
-  return [checkRunning, ...checkQueue.map((c) => c.job)].find((j) => j && j.srcId === srcId && !j.cancelled) || null;
+  return [checkRunning, ...checkQueue.map((c) => c.job)].find((j) => j && j.srcId === srcId && !j.cancelled && ['running', 'queued'].includes(j.status)) || null;
 }
+// Watchdog: a check that has shown no sign of life for 15 minutes is stopped, so it can never hold up
+// the line forever. "Sign of life" = a new log line, counter or progress change.
+setInterval(() => {
+  const j = checkRunning;
+  if (!j) return;
+  const sig = `${j.log.length}|${j.counter ? j.counter.done : ''}|${j.progress ?? ''}`;
+  if (sig !== j.activitySig) { j.activitySig = sig; j.activityAt = Date.now(); return; }
+  if (Date.now() - (j.activityAt || j.started) < 15 * 60_000) return;
+  j.log.push('✕ Stopped: nothing happened for 15 minutes, so it was stopped to let the next check run. Try it again.');
+  j.cancelled = true;
+  try { j.abort.abort(new Error('Stopped: no progress for 15 minutes')); } catch { /* */ }
+  j.status = 'error';
+  j.error = 'Stopped after 15 minutes with no progress. Try it again.';
+  j.endedAt = Date.now();
+  checkRunning = null;
+  setImmediate(pumpChecks);
+}, 30_000).unref();
+
+// Every hour, everything gets checked (see scheduleChecks). Remember when, to show "next check in…".
+let nextAutoCheck = Date.now() + 5 * 60_000;
 
 const tgSyncing = new Map();
 function tgSync(src, acc) {
@@ -3233,14 +3261,19 @@ route('POST', /^\/api\/telegram\/channels$/, async (req, res, m, acc) => {
 }, 'owner');
 
 // Every hour, line up a check of every channel, GitHub repo and source (one at a time, see runCheck).
-function scheduleChecks() {
+function scheduleChecks(acc, { manual = false } = {}) {
+  let n = 0;
   for (const src of store.sources) {
     if (checkFor(src.id)) continue;
-    if (src.kind === 'telegram') { if (tgReady() && src.options && src.options.autoSync !== false) tgSync(src); } else sourceCheck(src);
+    if (src.kind === 'telegram') {
+      if (tgReady() && (manual || (src.options && src.options.autoSync !== false))) { tgSync(src, acc); n++; }
+    } else { sourceCheck(src, acc); n++; }
   }
+  if (!manual) nextAutoCheck = Date.now() + 60 * 60_000;
+  return n;
 }
-setTimeout(scheduleChecks, 5 * 60_000).unref();
-setInterval(scheduleChecks, 60 * 60_000).unref();
+setTimeout(() => scheduleChecks(), 5 * 60_000).unref();
+setInterval(() => scheduleChecks(), 60 * 60_000).unref();
 
 // Shortly after start, re-check which channel posts still exist. Older versions only checked
 // the first 200 apps per channel, so the rest were wrongly marked "Removed from source".
@@ -3874,21 +3907,52 @@ route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
 });
 const signingNow = new Map(); // "owner:app" -> job id
 
+function jobView(j) {
+  let status = j.cancelled && j.status !== 'error' ? 'cancelled' : j.status;
+  // A check shown as running or waiting must really be: one that isn't running and isn't in line has
+  // finished (or was lost), so it never shows as running or waiting forever.
+  if (j.isCheck && status === 'queued' && !checkQueue.some((c) => c.job === j)) status = j.result ? 'done' : 'cancelled';
+  if (j.isCheck && status === 'running' && checkRunning !== j) status = j.error ? 'error' : 'done';
+  const q = status === 'queued' ? queueInfo(j) : null;
+  return {
+    id: j.id, title: j.title, status, progress: status === 'running' ? j.progress ?? null : null,
+    counter: j.counter || null, last: [...j.log].reverse().find((l) => !/^⏳ Waiting/.test(l)) || '', started: j.started, endedAt: j.endedAt || null,
+    error: status === 'cancelled' ? 'Cancelled' : j.error, cancellable: !!j.cancellable && !j.cancelled && ['running', 'queued'].includes(status),
+    position: q ? q.position : null, waitingFor: q ? q.waitingFor : null, isCheck: !!j.isCheck, srcId: j.srcId || null,
+    result: status === 'done' && j.result && typeof j.result === 'object' && !j.result.signed ? j.result : null,
+  };
+}
+// Owner: check every channel, repo and source now / stop everything that's running or waiting.
+route('POST', /^\/api\/checks\/run-all$/, (req, res, m, acc) => json(res, { queued: scheduleChecks(acc, { manual: true }) }), 'owner');
+route('POST', /^\/api\/jobs\/cancel-all$/, (req, res, m, acc) => {
+  let n = 0;
+  for (const j of jobs.values()) {
+    if (!['running', 'queued'].includes(j.status) || j.cancelled || !j.cancellable || !(j.owner === acc.id || j.isCheck)) continue;
+    j.cancelled = true;
+    j.log.push('✕ Cancelled');
+    const qi = checkQueue.findIndex((c) => c.job === j);
+    if (qi >= 0) { checkQueue.splice(qi, 1); j.status = 'cancelled'; j.endedAt = Date.now(); }
+    try { j.abort.abort(new Error('Cancelled')); } catch { /* */ }
+    if (j.child) j.child.kill('SIGKILL');
+    n++;
+  }
+  json(res, { stopped: n });
+}, 'owner');
+
 route('GET', /^\/api\/jobs\/([a-f0-9]{16})$/, (req, res, m, acc) => {
   const job = jobs.get(m[1]);
   if (!job || job.owner !== acc.id) return fail(res, 404, 'This task stopped because the server restarted (probably an update). Start it again.');
-  const cancelled = !!job.cancelled;
-  json(res, { status: cancelled ? 'cancelled' : job.status, log: job.log.slice(-300), error: cancelled ? 'Cancelled' : job.error, result: job.result, progress: cancelled ? null : job.progress ?? null, counter: job.counter || null, cancellable: !!job.cancellable && !job.cancelled });
+  json(res, { ...jobView(job), log: job.log.slice(-300), result: job.result });
 });
 
 // Background tasks you can come back to after leaving the app.
 route('GET', /^\/api\/jobs$/, (req, res, m, acc) => {
-  const list = [...jobs.values()].filter((j) => j.owner === acc.id && j.title && (['running', 'queued'].includes(j.status) || Date.now() - (j.endedAt || Date.now()) < 10 * 60 * 1000));
+  // Everything still going, plus what finished in the last half hour.
+  const list = [...jobs.values()].filter((j) => (j.owner === acc.id || (isOwner(acc) && j.isCheck)) && j.title && (['running', 'queued'].includes(j.status) || Date.now() - (j.endedAt || Date.now()) < 30 * 60 * 1000));
+  const rank = (v) => (v.status === 'running' ? 0 : v.status === 'queued' ? 1 : 2);
   json(res, {
-    jobs: list.map((j) => ({
-      id: j.id, title: j.title, status: j.cancelled ? 'cancelled' : j.status, progress: j.progress ?? null,
-      counter: j.counter || null, last: j.log[j.log.length - 1] || '', started: j.started, error: j.error, cancellable: !!j.cancellable && !j.cancelled,
-    })).sort((a, b) => b.started - a.started),
+    jobs: list.map(jobView).sort((a, b) => rank(a) - rank(b) || (a.position || 0) - (b.position || 0) || (b.endedAt || b.started) - (a.endedAt || a.started)),
+    checks: isOwner(acc) ? { nextAuto: nextAutoCheck, sources: store.sources.length, running: !!checkRunning, waiting: checkQueue.length } : null,
   });
 });
 

@@ -21,7 +21,7 @@ RUN pip3 install --no-cache-dir --break-system-packages "telethon>=1.36,<2" \
 COPY --from=zsign /zsign/bin/zsign /usr/local/bin/zsign
 WORKDIR /app
 COPY package.json ./
-COPY server.js ./
+COPY server.js whats-new.js ./
 COPY lib ./lib
 COPY public ./public
 ENV NODE_ENV=production DATA_DIR=/data

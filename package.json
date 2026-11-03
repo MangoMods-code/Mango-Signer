@@ -1,6 +1,6 @@
 {
   "name": "mango-signer",
-  "version": "1.8.7",
+  "version": "1.8.8",
   "description": "Self-hosted iOS app signer and installer for iPhone",
   "main": "server.js",
   "private": true,
