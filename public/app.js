@@ -1167,7 +1167,7 @@ function renderUsers() {
         <div class="row" data-act="invite" data-id="${esc(i.code)}">
           <div class="row-main">
             <div class="row-title mono" style="font-size:16px">${esc(i.code)}</div>
-            <div class="row-sub">${esc(i.note || 'No note')} · ${i.uses}/${i.maxUses} used${i.expiresAt && new Date(i.expiresAt) > new Date() ? ` · expires ${fmtDate(i.expiresAt)}` : ''}</div>
+            <div class="row-sub">${i.rank ? `${i.rank === 'admin' ? '⭐ Admin' : '🧪 Tester'} · ` : ''}${esc(i.note || 'No note')} · ${i.uses}/${i.maxUses} used${i.expiresAt && new Date(i.expiresAt) > new Date() ? ` · expires ${fmtDate(i.expiresAt)}` : ''}</div>
           </div>
           ${i.uses >= i.maxUses ? '<span class="badge">Used up</span>' : i.expiresAt && new Date(i.expiresAt) < new Date() ? '<span class="badge">Expired</span>' : '<span class="badge good">Active</span>'}
         </div>`).join('')}</div>`
@@ -4278,10 +4278,15 @@ function newInviteSheet() {
     <div class="field"><label>Expires</label>
       <select id="iExp">${[[0, 'Never'], [1, 'In 1 day'], [7, 'In 7 days'], [30, 'In 30 days']].map(([n, l]) => `<option value="${n}" ${n === 7 ? 'selected' : ''}>${l}</option>`).join('')}</select>
     </div>
+    ${isOwner() ? `<div class="field"><label>Role for everyone who joins with it</label>
+      <select id="iRank">${[['', 'Member'], ['tester', '🧪 Tester'], ['admin', '⭐ Admin']].map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}</select>
+      <div class="hint" id="iRankHint">They join as a regular member.</div></div>` : ''}
     <button class="btn primary big block" id="iMake">Create Invite</button>`, (el) => {
+    const rankHint = { '': 'They join as a regular member.', tester: 'They join as testers right away: testers-only apps, beta versions, no sign limit and a 🧪 badge.', admin: '⚠️ They join as admins right away and can manage the library and users. Only use this for people you trust, and keep uses low.' };
+    if ($('#iRank', el)) $('#iRank', el).onchange = (e) => { $('#iRankHint', el).textContent = rankHint[e.target.value]; };
     $('#iMake', el).onclick = async () => {
       try {
-        const { invite, signupUrl } = await api('POST', '/api/invites', { note: $('#iNote', el).value, maxUses: Number($('#iUses', el).value), expiresDays: Number($('#iExp', el).value) });
+        const { invite, signupUrl } = await api('POST', '/api/invites', { note: $('#iNote', el).value, maxUses: Number($('#iUses', el).value), expiresDays: Number($('#iExp', el).value), rank: $('#iRank', el) ? $('#iRank', el).value : '' });
         await refresh();
         showInvite(invite, signupUrl);
       } catch (e) { toast(e.message, true); }
@@ -4294,6 +4299,7 @@ function showInvite(inv, signupUrl) {
   openSheet(`
     <h2>Invite ${inv.note ? 'for ' + esc(inv.note) : 'code'}</h2>
     <div class="code-box">${esc(inv.code)}</div>
+    ${inv.rank ? `<p class="center" style="margin:-4px 0 6px"><span class="badge ${inv.rank === 'tester' ? 'tester' : 'warn'}">Joins as ${inv.rank === 'admin' ? '⭐ Admin' : '🧪 Tester'}</span></p>` : ''}
     <p class="muted small center">${inv.uses}/${inv.maxUses} used${inv.usedBy && inv.usedBy.length ? ' · ' + esc(inv.usedBy.join(', ')) : ''}</p>
     <div class="actions">
       <button class="btn primary block" id="iLink">Copy invite link</button>
