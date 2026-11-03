@@ -1975,7 +1975,7 @@ function certBanner() {
   return '';
 }
 
-const ALERT_ICONS = { bug: '🐞', broadcast: '📣', update: '⬆️', request: '🙋', cert: '🔐', security: '🔒', user: '👋', storage: '💾' };
+const ALERT_ICONS = { signed: '✅', bug: '🐞', broadcast: '📣', update: '⬆️', request: '🙋', cert: '🔐', security: '🔒', user: '👋', storage: '💾' };
 function alertsSheet() {
   const list = state.alerts;
   const unreadIds = list.filter((a) => !a.read).map((a) => a.id);
@@ -1996,6 +1996,8 @@ function alertsSheet() {
         if (a.kind === 'cert') { closeSheet(); return switchTab('certs'); }
         if (a.kind === 'user' && a.userId && state.users.some((u) => u.id === a.userId)) return userSheet(a.userId);
         if (a.kind === 'security' && isStaff()) return securityLogSheet();
+        if (a.kind === 'signed' && a.signedId && state.signed.some((x) => x.id === a.signedId)) return signedSheet(a.signedId);
+        if (a.kind === 'signed' && a.appId && state.apps.some((x) => x.id === a.appId)) return appSheet(a.appId);
         if (a.kind === 'bug' && a.bugId && (state.bugs || []).some((x) => x.id === a.bugId)) return bugSheet(a.bugId);
         if (a.kind === 'storage') { closeSheet(); return switchTab('settings'); }
       };
@@ -3608,11 +3610,23 @@ function runSign(a, opts, extra) {
       <p class="muted small" id="pSub">Keep this screen open</p>
       <div class="bar hidden" id="pBar"><div></div></div>
       <div class="log hidden" id="pLog"></div>
+      <button class="btn block hidden" id="pBg" type="button" style="margin-top:12px">Keep going in the background</button>
       ${cancelBtnHtml('Cancel signing')}
     </div>`);
   const body = $('#sheetBody');
   const setTitle = (t, s) => { $('#pTitle', body).textContent = t; if (s !== undefined) $('#pSub', body).textContent = s; };
   const setBar = (p) => { $('#pBar', body).classList.remove('hidden'); $('#pBar > div', body).style.width = `${Math.round(p * 100)}%`; };
+  // "Keep going in the background": close this screen; the server sends an alert when it's ready.
+  let background = false;
+  let jobId = null;
+  $('#pBg', body).onclick = async () => {
+    background = true;
+    closeSheet.locked = false;
+    $('#sheet').classList.remove('locked');
+    closeSheet();
+    if (jobId) api('POST', `/api/jobs/${jobId}/notify`).catch(() => {});
+    toast(`Signing ${a.name} in the background — you'll get an alert when it's ready`);
+  };
 
   (async () => {
     try {
@@ -3629,18 +3643,23 @@ function runSign(a, opts, extra) {
       }
       $('#pBar', body).classList.add('hidden');
       setTitle('Signing…', 'Big apps can take a minute');
-      const { jobId } = await api('POST', '/api/sign', opts);
+      ({ jobId } = await api('POST', '/api/sign', opts));
+      if (!background) $('#pBg', body).classList.remove('hidden');
+      else api('POST', `/api/jobs/${jobId}/notify`).catch(() => {});
       const result = await waitJob(jobId, (j) => {
+        if (background) return;
         if (j.status === 'queued') setTitle('Waiting in line…', 'Someone else is signing right now');
         else setTitle('Signing…', 'Big apps can take a minute');
         const log = $('#pLog', body);
         if (j.log.length) { log.classList.remove('hidden'); log.textContent = j.log.join('\n'); log.scrollTop = log.scrollHeight; }
       });
+      await refresh().catch(() => {});
+      if (background) { render(); return; } // the alert tells them it's ready
       closeSheet.locked = false;
       $('#sheet').classList.remove('locked');
-      await refresh().catch(() => {});
       showSigned(result.signed, opts);
     } catch (e) {
+      if (background) { refresh().catch(() => {}); return; } // the alert says it failed
       closeSheet.locked = false;
       $('#sheet').classList.remove('locked');
       if (e.cancelled) { closeSheet(); toast('Signing cancelled'); return; }
