@@ -4163,12 +4163,14 @@ route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
       job.result = { signed: signedView(rec, req), replaced: true };
       job.status = 'done';
       job.log.push('Done!');
+      if (job.notify) { addAlert(acc.id, 'signed', `✅ ${rec.name} is signed and ready`, 'Tap to install it.', { signedId: rec.id, appId: app.id }); store.save(); }
       if (signedToGithubOn()) setTimeout(() => archiveSigned().catch(() => {}), 20_000); // after the first install has a head start
     } catch (e) {
       await rmQuiet(out);
       const full = isNoSpace(e) || job.log.some((l) => /no space left|ENOSPC/i.test(l));
       job.error = full ? storageFullMessage() : e.message;
       job.status = 'error';
+      if (job.notify && !job.cancelled) { addAlert(acc.id, 'signed', `⚠️ Signing ${app.name} failed`, job.error, { appId: app.id }); store.save(); }
     } finally {
       await rmQuiet(work);
       if (signingNow.get(runKey) === job.id) signingNow.delete(runKey);
@@ -4225,6 +4227,14 @@ route('GET', /^\/api\/jobs$/, (req, res, m, acc) => {
     jobs: list.map(jobView).sort((a, b) => rank(a) - rank(b) || (a.position || 0) - (b.position || 0) || (b.endedAt || b.started) - (a.endedAt || a.started)),
     checks: isStaff(acc) ? { nextAuto: nextAutoCheck, sources: store.sources.length, running: !!checkRunning, waiting: checkQueue.length } : null,
   });
+});
+
+// "Keep going in the background": send an alert when this job finishes (or fails).
+route('POST', /^\/api\/jobs\/([a-f0-9]{16})\/notify$/, (req, res, m, acc) => {
+  const job = jobs.get(m[1]);
+  if (!job || job.owner !== acc.id) return fail(res, 404, 'Job not found');
+  job.notify = true;
+  json(res, { ok: true, status: jobView(job).status });
 });
 
 route('POST', /^\/api\/jobs\/([a-f0-9]{16})\/cancel$/, (req, res, m, acc) => {

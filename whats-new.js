@@ -3,6 +3,21 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.11.1',
+    date: '2026-11-03',
+    title: 'Sign in the Background',
+    summary: 'Big apps can keep signing while you do something else.',
+    sections: [
+      {
+        title: '✍️ Signing',
+        items: [
+          'While an app is signing, tap "Keep going in the background" to close the screen. Signing keeps going on the server.',
+          'You get an alert when it\'s ready (or if it fails). Tap the alert to install it.',
+        ],
+      },
+    ],
+  },
+  {
     version: '1.11.0',
     date: '2026-11-03',
     title: 'Admins & Testers',
