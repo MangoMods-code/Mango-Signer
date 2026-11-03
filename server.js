@@ -1400,6 +1400,37 @@ route('POST', /^\/api\/apps\/bulk$/, async (req, res) => {
   json(res, { ok: true, count: apps.length });
 }, 'owner');
 
+// Cleans up duplicates in one go: for every bundle ID in the library more than once, keeps one copy and
+// deletes the rest. Which one stays: copies from the place you pick (if it has one), otherwise the newest
+// version (then the most installed, then the one you had first). Deleted copies are remembered by their
+// source, so a refresh doesn't bring them back.
+function dedupeKeeper(group, prefer) {
+  const pref = prefer && prefer !== 'newest' ? group.filter((a) => (prefer === 'mine' ? !a.remote || ['github', 'link'].includes(a.remote.kind) : a.remote && a.remote.sourceId === prefer)) : [];
+  const pool = pref.length ? pref : group;
+  return [...pool].sort((x, y) => versionCmp(y.version, x.version) || (y.installCount || 0) - (x.installCount || 0) || String(x.addedAt).localeCompare(String(y.addedAt)))[0];
+}
+function duplicateGroupsServer() {
+  const by = new Map();
+  for (const a of store.apps) {
+    const b = normBid(a.bundleId);
+    if (!b || (a.remote && a.remote.missing)) continue;
+    if (!by.has(b)) by.set(b, []);
+    by.get(b).push(a);
+  }
+  return [...by.values()].filter((g) => g.length > 1);
+}
+route('POST', /^\/api\/apps\/dedupe$/, async (req, res) => {
+  const { prefer = 'newest' } = await readJson(req);
+  const groups = duplicateGroupsServer();
+  let deleted = 0;
+  for (const g of groups) {
+    const keep = dedupeKeeper(g, prefer);
+    for (const a of g) if (a !== keep) { await deleteApp(a.id, { exclude: true }); deleted++; }
+  }
+  store.save();
+  json(res, { ok: true, groups: groups.length, deleted });
+}, 'owner');
+
 // Deletes every app marked "Removed from source" (optionally just one source's).
 // Telegram channels are re-checked first, so only apps whose post is really gone are deleted.
 route('POST', /^\/api\/apps\/delete-removed$/, async (req, res) => {
@@ -1646,6 +1677,13 @@ function excludeFromSource(app) {
   if (src.excluded.some((e) => (r.key && e.key === r.key) || (bid && e.bundleId === bid))) return;
   src.excluded.push({ key: r.key || null, bundleId: bid || null, name: app.originalName || app.name, at: new Date().toISOString() });
 }
+// Is an app with this bundle ID already in the library from another place (another source, your uploads…)?
+const haveElsewhere = (bundleId, srcId) => {
+  const b = normBid(bundleId);
+  return !!b && store.apps.some((a) => normBid(a.bundleId) === b && !(a.remote && a.remote.sourceId === srcId) && !(a.remote && a.remote.missing));
+};
+// GitHub repos you follow are for that one app, so they always add it. Other sources skip apps you already have.
+const sourceSkipsHave = (src) => (src.skipHave === undefined ? src.kind !== 'ghrepo' : !!src.skipHave);
 const isExcluded = (src, { key, bundleId }) => (src.excluded || []).some((e) => (key && e.key === key) || (normBid(bundleId) && e.bundleId === normBid(bundleId)));
 
 // ----- GitHub repos as sources -----
@@ -1746,6 +1784,7 @@ async function syncSource(src) {
     seen.add(s.key);
     if (isExcluded(src, s)) continue; // you deleted it from this source
     const existing = byKey.get(s.key);
+    if (!existing && sourceSkipsHave(src) && haveElsewhere(s.bundleId, src.id)) continue; // already have it from somewhere else
     if (existing) dropSupersededManual(existing, s.versions);
     // Your own newer uploads (added with "Add a newer version") count as part of the source.
     const v = existing ? mergedVersions(existing, s.versions)[0] : s.versions[0];
@@ -1887,6 +1926,7 @@ route('PATCH', /^\/api\/sources\/([a-f0-9]{16})$/, async (req, res, m) => {
     for (const a of store.apps) if (a.remote && a.remote.sourceId === src.id && !(a.locked || []).includes('published')) a.published = b.showInLibrary;
   }
   if (typeof b.name === 'string' && b.name.trim()) { src.customName = b.name.trim().slice(0, 60); src.name = src.customName; }
+  if (typeof b.skipHave === 'boolean' && src.kind !== 'telegram') src.skipHave = b.skipHave;
   if (src.kind === 'telegram') {
     if (b.options) src.options = cleanTgOptions(b.options, src.options);
     if (b.categoryId !== undefined) src.categoryId = ['__auto', '__none'].includes(b.categoryId) ? b.categoryId : b.categoryId && catExists(b.categoryId) ? b.categoryId : '__auto';
@@ -2825,7 +2865,7 @@ route('DELETE', /^\/api\/telegram$/, async (req, res) => {
   json(res, { telegram: tgView() });
 }, 'owner');
 
-const TG_DEFAULTS = { storage: 'telegram', updateMine: false, matchName: false, backfill: 10, keywords: '', autoSync: true, captionNotes: true };
+const TG_DEFAULTS = { storage: 'telegram', updateMine: false, matchName: false, backfill: 10, keywords: '', autoSync: true, captionNotes: true, skipHave: true };
 function cleanTgOptions(o = {}, base = TG_DEFAULTS) {
   return {
     storage: o.storage === 'github' ? 'github' : o.storage === 'telegram' ? 'telegram' : base.storage,
@@ -2835,6 +2875,7 @@ function cleanTgOptions(o = {}, base = TG_DEFAULTS) {
     keywords: typeof o.keywords === 'string' ? o.keywords.slice(0, 300) : base.keywords,
     autoSync: typeof o.autoSync === 'boolean' ? o.autoSync : base.autoSync,
     captionNotes: typeof o.captionNotes === 'boolean' ? o.captionNotes : base.captionNotes,
+    skipHave: typeof o.skipHave === 'boolean' ? o.skipHave : base.skipHave !== false,
   };
 }
 
@@ -2870,6 +2911,11 @@ async function tgImportPost(src, post, job, preMeta) {
   // You deleted this app from the channel: don't add it back (updating your own copy with "update mine" is still fine).
   if (!app && isExcluded(src, { bundleId: bid })) {
     job.log.push(`– ${meta.name}: skipped (you deleted it from this channel)`);
+    return 'skipped';
+  }
+  // Already in the library from somewhere else: don't add a second copy.
+  if (!app && opts.skipHave !== false && haveElsewhere(bid, src.id)) {
+    job.log.push(`– ${meta.name}: skipped (already in your library from somewhere else)`);
     return 'skipped';
   }
   const notes = opts.captionNotes ? cleanCaption(post.text) : '';
