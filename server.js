@@ -660,13 +660,14 @@ function appView(a, acc) {
     extra.missing = !!remote.missing;
     // vi is the version's real number for signing, so lists that skip some still sign the right one.
     extra.versions = (remote.kind === 'source' ? mergedVersions(a) : remote.versions || []).map((v, vi) => ({ vi, version: v.version, date: v.date, size: v.size, notes: (v.notes || '').slice(0, 400), channel: v.channel, manualId: v.manualId || undefined }));
-    // Beta versions are early access: testers and staff see them, everyone else gets the rest.
-    if (!seesTesterApps(acc)) extra.versions = extra.versions.filter((v, i) => i === 0 || !/^(beta|alpha|pre)/i.test(String(v.channel || '')));
+    // Beta versions are for you and admins only; everyone else (testers included) gets the rest.
+    if (!isStaff(acc)) extra.versions = extra.versions.filter((v, i) => i === 0 || !/^(beta|alpha|pre)/i.test(String(v.channel || '')));
     extra.remoteScreens = remote.screenshots || [];
     if (isStaff(acc)) extra.remoteUrl = remote.kind === 'github' ? null : remote.url;
   }
   if (isStaff(acc)) return { ...base, ...extra };
-  const { fileName, source, ...rest } = base;
+  // Everyone else only gets what the library shows: no file names, storage details or owner bookkeeping.
+  const { fileName, source, locked, manualVersions, descFromCaption, iconURL: _iu, published: _p, ...rest } = base;
   return { ...rest, ...extra };
 }
 const shownAppVersion = (a) => a.versionOverride || a.version || '';
@@ -1081,7 +1082,12 @@ route('GET', /^\/api\/state$/, async (req, res, m, acc) => {
     categories: sortedCategories(),
     certs: myCerts(acc).map((c) => certView(c, acc)),
     signed: mySigned(acc).map((s) => signedView(s, req)),
-    collections: sortedCollections().filter((c) => isStaff(acc) || c.appIds.some((aid) => visibleApps(acc).some((a) => a.id === aid))),
+    collections: (() => {
+      if (isStaff(acc)) return sortedCollections();
+      // Only the apps this person can see, so hidden apps don't show up through a collection.
+      const seen = new Set(visibleApps(acc).map((a) => a.id));
+      return sortedCollections().map((c) => ({ ...c, appIds: c.appIds.filter((aid) => seen.has(aid)) })).filter((c) => c.appIds.length);
+    })(),
     requests: (isStaff(acc) ? store.requests : store.requests.filter((r) => r.ownerId === acc.id)).slice(-200).reverse(),
     bugs: (isStaff(acc) ? store.data.bugs : store.data.bugs.filter((b) => b.ownerId === acc.id)).slice(-200).reverse(),
     installs: store.installLog.filter((l) => l.ownerId === acc.id).slice(-60).reverse(),
@@ -1754,12 +1760,12 @@ async function inspectLink(url, headers, job) {
   }
 }
 
-// People who aren't testers can't sign or download beta versions (they're hidden from them).
+// Only you and admins can sign or download beta versions (they're hidden from everyone else).
 function checkVersionAllowed(app, acc, versionIndex) {
-  if (!versionIndex || seesTesterApps(acc) || !app.remote) return;
+  if (!versionIndex || isStaff(acc) || !app.remote) return;
   const list = app.remote.kind === 'source' ? mergedVersions(app) : (app.remote.versions || []);
   const v = list[versionIndex];
-  if (v && /^(beta|alpha|pre)/i.test(String(v.channel || ''))) throw httpError(403, 'That version is only for testers');
+  if (v && /^(beta|alpha|pre)/i.test(String(v.channel || ''))) throw httpError(403, "That version isn't available to you");
 }
 
 function newLibraryRecord(meta, extra = {}) {
@@ -2364,7 +2370,7 @@ function countSign(uid, appId) {
 }
 // 0 = no limit. A per-user limit (set on their page) wins over the everyone limit.
 function signLimitFor(acc) {
-  if (isOwner(acc) || isAdmin(acc) || isTester(acc)) return 0; // no daily limit for you, admins and testers
+  if (isOwner(acc) || isAdmin(acc)) return 0; // no daily limit for you and admins (testers have the normal limit)
   const u = findUser(acc.id);
   if (u && u.signLimit !== null && u.signLimit !== undefined) return u.signLimit;
   return Number(store.settings.signsPerDay) || 0;

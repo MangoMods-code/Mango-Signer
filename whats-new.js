@@ -3,6 +3,21 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.12.3',
+    date: '2026-11-03',
+    title: 'Privacy Tune-up',
+    summary: 'You only get the details you need.',
+    sections: [
+      {
+        title: '🔒 Privacy',
+        items: [
+          'Collections only show apps you can see.',
+          'Testers get the 🧪 badge and the apps picked for testers. Daily sign limits are the same for everyone.',
+        ],
+      },
+    ],
+  },
+  {
     version: '1.12.2',
     date: '2026-11-03',
     title: 'Join as a Tester',
@@ -11,7 +26,7 @@ module.exports = [
       {
         title: '🧪 Testers',
         items: [
-          'If you joined with a tester invite, you are a tester right away: testers-only apps, beta versions, no sign limit and a 🧪 badge.',
+          'If you joined with a tester invite, you are a tester right away: you get the 🧪 badge and the apps picked for testers.',
         ],
       },
     ],
@@ -93,7 +108,6 @@ module.exports = [
         title: '🧪 Testers',
         items: [
           'Testers see apps marked "Testers only", in a 🧪 For testers list at the top of their library.',
-          'Testers get beta versions first, and have no daily sign limit.',
           'Testers can send bug reports straight from an app\'s page or their Account tab, and see the answer.',
         ],
       },
