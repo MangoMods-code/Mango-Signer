@@ -8,20 +8,29 @@ Upload an `.ipa`, add a `.p12` + `.mobileprovision`, tap **Sign**, then **Instal
 ## Features
 - **App Library** – the owner uploads apps (or imports from a link); invited users browse, search, sign and install them
 - **Organization** – categories with emoji, featured apps, search, sorting, bulk select, full app editing, Update IPA, and default sign settings per app
-- **Cloud Library** – add AltStore/SideStore/ESign-style sources, link-only apps, or keep your own IPAs in a (private) GitHub repo's release, so app files don't sit on your Railway volume. Files are downloaded only while signing and deleted right after. Older versions from sources can be picked when signing
-- **Telegram channels** – sign in once and Mango watches channels you pick: new `.ipa` posts are added to the library (or update the existing app), kept as links on Telegram or copied to your GitHub storage
+- **Cloud Library** – app files don't have to sit on your Railway volume. Add apps from:
+  - **AltStore / SideStore / ESign sources** (JSON source links)
+  - **GitHub repos** – paste `github.com/owner/repo`; every release with an `.ipa` becomes a version and new releases show up as updates
+  - **Website downloads pages** – paste a page like `example.com/downloads/`; every `.ipa` link on it is picked up, new links become updates, and old ones are kept as older versions
+  - **Any direct `.ipa` link** (link-only apps), or your own IPAs kept in a (private) GitHub repo's release
+  - Files are downloaded only while signing; recent downloads are kept briefly (up to 1 GB, 2 days) so signing the same app again skips the download. Older versions can be picked when signing
+- **Telegram channels** – sign in once and Mango watches channels you pick: new `.ipa` posts are added to the library (or update the existing app), kept as links on Telegram or copied to your GitHub storage. Downloads fetch 8 pieces at once, and Telegram's rate limits are shown with a countdown instead of hanging
+- **Update checks & Activity** – every channel, repo, page and source is checked every hour, one at a time (repos and sources first, Telegram channels last, smallest first). The ⏳ Activity screen shows what's running, waiting in line and finished, with live logs, Check all now / Stop all, and a watchdog that stops anything stuck
+- **No duplicates** – "Skip apps I already have" per channel/source, a Duplicates screen to pick which copy of each app to keep (or clean them all up in one tap), and apps you delete from a source are remembered so refreshes don't bring them back (restore them from the source's page)
+- **Signed apps that stay** – with GitHub storage on a private repo, signed apps are saved to a separate "Mango Signed" release and stay in the Signed tab, ready to reinstall, until they're deleted (or their certificate expires)
+- **Installed apps** – Mango tracks what each person installed through it, only nags about real updates (by version number), marks apps whose certificate expired as "won't open", and lets people fix the list ("I already updated it", "Not on my phone anymore")
 - **Owner tools** – stats & activity, message everyone, one-tap backup & restore
 - **Tweaks** – a tweaks library (jailbreak `.deb` or `.dylib`), per-app default tweaks, automatic CydiaSubstrate/ElleKit bundling for tweaks that need it
 - **Presets & batch signing** – save sign settings as presets, select several apps and Get them all at once, import certificates from a `.zip`
 - **Alerts & security** – 🔔 alerts inbox (updates, requests, certificate expiry and revokes, new users, lockouts, low storage), ♥ favorites, security log, account lockout, sign out everywhere, expiring invites, daily sign limits
-- **Big files** – resumable uploads that survive dropped connections; old signed files are cleaned up automatically
+- **Big files** – resumable uploads that survive dropped connections; stalled downloads/uploads are stopped with a message instead of hanging; old signed files are cleaned up automatically; app icons are stored small (180px) to save space
 - **Accounts** – invite codes, username + password login, or sign in with your iPhone (UDID)
 - **Certificates** – each account adds its own `.p12` + `.mobileprovision`; shows type, expiry, revoke status, cert/profile mismatch, and whether your iPhone is in the profile
 - **Entitlements** – one-tap JIT support (`get-task-allow`), increased memory limit, extended virtual addressing, plus custom entitlements; warns when your profile doesn't allow one
 - **Info.plist editing** – 120Hz ProMotion, Game Mode, full screen, plus any custom key (add, change or remove)
 - **Signing options** – change name, bundle ID, version, minimum iOS, icon; inject `.dylib` tweaks; remove extensions, Watch app or device limits; Files app sharing
 - **Install** – one-tap over-the-air install, shareable install pages, download signed `.ipa`
-- **Owner tools** – manage users (reset password, turn off, unlink iPhone, delete), invite codes, hide apps from the library, signing queue
+- **User management** – reset passwords, turn accounts off, unlink iPhones, delete users, invite codes, hide apps from the library, signing queue
 
 ## Deploy on Railway
 1. Download the latest zip from [Releases](https://github.com/MangoMods-code/Mango-Signer/releases), put it in a GitHub repo and create a Railway service from it (it builds from the `Dockerfile`).
@@ -48,11 +57,15 @@ The owner signs in with the password only (leave username blank). Everyone else 
 
 Mango creates a release tagged `mango-library` and keeps each app as a release asset (up to 2 GB each). You can also drop `.ipa` files onto that release on github.com and tap **Sync**. The token is stored encrypted and never sent to the browser.
 
+With **Keep signed apps on GitHub** on (private repos only), signed apps go into a separate release tagged `mango-signed` (then `mango-signed-2`, `-3`… before GitHub's 1,000-file limit). Mango manages it: deleting a signed app in the Signed tab deletes it there too.
+
 ## Telegram channels (optional)
 Uses [Telethon](https://github.com/LonamiWebs/Telethon) (MIT), installed in the Docker build.
 1. On my.telegram.org › **API development tools**, create an app and copy its **api_id** and **api_hash**.
 2. In Mango go to **Settings › Cloud Library › ✈️ Telegram channels**, enter them with your phone number, then the code Telegram sends you (and your two-step password if you use one).
-3. Tap **Add a channel** and paste its @username or t.me link. Each channel has its own settings: where files live (Telegram or GitHub), whether it may update apps you uploaded yourself, matching by name, keyword filter, and automatic checks every 10 minutes.
+3. Tap **Add a channel** and paste its @username or t.me link (a link to one post works too). Each channel has its own settings: where files live (Telegram or GitHub), skipping apps you already have, whether it may update apps you uploaded yourself, matching by name, keyword filter, and automatic hourly checks. Use **🔍 Scan older posts** to go further back in a channel's history.
+
+Only posts with an `.ipa` file attached are picked up (not links to file hosts). Telegram limits how fast an account can make requests; Mango saves each channel's id after the first lookup and checks Telegram channels after everything else to stay under those limits.
 
 ## Notes
 - JIT can't be switched on from a website; signing with **JIT support** lets tools like StikDebug attach to the app.
@@ -61,7 +74,8 @@ Uses [Telethon](https://github.com/LonamiWebs/Telethon) (MIT), installed in the 
 
 ## How it works
 - `server.js` – web server and API (no npm dependencies)
-- `lib/` – zip (local and HTTP range), plist, PNG (Apple CgBI icon), Mach-O, .deb, certificate, source and GitHub helpers
+- `whats-new.js` – the in-app What's New notes; its first entry is the app's version
+- `lib/` – zip (local and HTTP range), plist, PNG (Apple CgBI icons, resizing), Mach-O, .deb, certificate, source, GitHub, App Store lookup and Telegram helpers (`telegram_helper.py` runs Telethon)
 - `public/` – the iPhone web app
 - Signing is done by [zsign](https://github.com/zhlynn/zsign) (MIT License, by zhlynn), compiled in the Docker build.
 
