@@ -1490,7 +1490,7 @@ function remoteDownload(app, versionIndex = 0) {
       return { ...gh.download(r.ghAssetId), size: app.size, version: app.version };
     }
     if (!tgReady()) throw httpError(400, 'Telegram is not connected, so apps from Telegram channels can\'t be downloaded. Connect it in Settings › Telegram.');
-    return { telegram: { ref: r.ref, msgId: r.msgId }, size: app.size, version: app.version };
+    return { telegram: { ref: tgRefFor(r), msgId: r.msgId }, size: app.size, version: app.version };
   }
   if (r.kind === 'github') {
     const gh = ghClient();
@@ -2790,13 +2790,14 @@ const tg = telegram.createHelper();
 // Checks which of a channel's apps still have their post, 200 at a time (Telegram's limit per call).
 // Apps whose post is gone get marked removed; apps whose post is back get unmarked.
 // A batch that fails to check is left alone, so a hiccup never marks apps as removed.
-async function tgMarkRemoved(src) {
+async function tgMarkRemoved(src, job = null) {
   const linked = store.apps.filter((a) => a.remote && a.remote.kind === 'telegram' && a.remote.sourceId === src.id && !a.remote.ghAssetId);
   let newlyGone = 0;
   for (let i = 0; i < linked.length; i += 200) {
     const batch = linked.slice(i, i + 200);
     let exists;
-    try { ({ exists } = await tg.exists(src.ref, batch.map((a) => a.remote.msgId))); } catch { continue; }
+    try { ({ exists } = await tgTry(job, () => tg.exists(tgRef(src), batch.map((a) => a.remote.msgId)))); } catch { continue; }
+    if (job) job.counter = { label: 'apps checked', done: Math.min(linked.length, i + 200), total: linked.length };
     const have = new Set(exists);
     for (const a of batch) {
       const gone = !have.has(a.remote.msgId);
@@ -2808,6 +2809,36 @@ async function tgMarkRemoved(src) {
 }
 const tgSettings = () => store.settings.telegram || null;
 const tgReady = () => !!(tgSettings() && tgSettings().sessionEnc);
+// How to point the helper at a channel. After the first lookup Mango keeps the channel's id + key, so it
+// never has to look the @username up again (Telegram only allows a few of those lookups a day, and
+// running out made every check sit and wait).
+const tgRef = (src) => (src && src.peer ? `peer:${src.peer}` : src && src.ref);
+const tgRefFor = (remote) => { const src = store.sources.find((x) => x.id === remote.sourceId); return src ? tgRef(src) : remote.ref; };
+async function ensurePeer(src, job) {
+  if (src.peer) return;
+  const ch = await tgTry(job, () => tg.channel(src.ref));
+  if (ch && ch.id && ch.access_hash != null) { src.peer = `${ch.id}:${ch.access_hash}`; store.save(); }
+}
+// Runs a Telegram request, and if Telegram says "slow down, wait N seconds", says so in the log, waits,
+// and tries again (up to 3 times, and only for waits up to 10 minutes). Stop still works while waiting.
+async function tgTry(job, fn) {
+  for (let attempt = 0; ; attempt++) {
+    try { return await fn(); } catch (e) {
+      if (!e.wait || e.wait > 600 || attempt >= 3 || (job && job.cancelled)) {
+        if (e.wait) throw new Error(`Telegram asked Mango to wait ${fmtWait(e.wait)} before asking again. It'll try again on the next check.`);
+        throw e;
+      }
+      if (job) job.log.push(`⏸ Telegram asked to slow down, so waiting ${fmtWait(e.wait)} (it limits how fast an account can ask)…`);
+      const until = Date.now() + (e.wait + 1) * 1000;
+      while (Date.now() < until && !(job && job.cancelled)) {
+        await new Promise((r) => setTimeout(r, 1000));
+        if (job) job.counter = { label: 'seconds left to wait', done: Math.ceil((until - Date.now()) / 1000), total: null };
+      }
+      if (job) job.counter = null;
+    }
+  }
+}
+const fmtWait = (sec) => (sec >= 120 ? `${Math.round(sec / 60)} minutes` : `${sec} seconds`);
 function tgCreds(extra = {}) {
   const t = tgSettings();
   return { apiId: decrypt(t.apiIdEnc), apiHash: decrypt(t.apiHashEnc), session: t.sessionEnc ? decrypt(t.sessionEnc) : '', ...extra };
@@ -2895,7 +2926,7 @@ function cleanCaption(text) {
 const normName = (n) => String(n || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 
 async function tgPeek(src, post) {
-  const f = await tg.file(src.ref, post.id);
+  const f = await tg.file(tgRef(src), post.id);
   return ipa.inspect({ url: f.url, headers: f.headers });
 }
 // "Mortal Kombat - KamoHacks [7.4.1].ipa" and "...[7.4.0].ipa" are the same app: used to skip older reposts without reading them.
@@ -2903,7 +2934,7 @@ const fileKey = (name) => String(name || '').toLowerCase().replace(/\.ipa$/, '')
 
 async function tgImportPost(src, post, job, preMeta) {
   const opts = src.options;
-  const f = await tg.file(src.ref, post.id);
+  const f = await tg.file(tgRef(src), post.id);
   const meta = preMeta || await ipa.inspect({ url: f.url, headers: f.headers });
   if (!meta.bundleId) throw new Error("couldn't read the app inside");
   const bid = meta.bundleId.toLowerCase();
@@ -3098,12 +3129,14 @@ function tgSync(src, acc) {
       const opts = src.options;
       const first = !src.lastMsgId;
       job.log.push(first ? `Looking through ${src.name}'s recent posts…` : `Checking ${src.name} for new posts…`);
-      const { posts } = await tg.posts(src.ref, src.lastMsgId || 0, first ? 400 : 200);
+      await ensurePeer(src, job);
+      const { posts } = await tgTry(job, () => tg.posts(tgRef(src), src.lastMsgId || 0, first ? 400 : 200));
       const words = opts.keywords.split(',').map((w) => w.trim().toLowerCase()).filter(Boolean);
       let ipas = posts.filter((p) => p.file && /\.ipa$/i.test(p.file.name));
       if (words.length) ipas = ipas.filter((p) => words.some((w) => `${p.file.name}\n${p.text}`.toLowerCase().includes(w)));
       result.skipped = posts.length - ipas.length;
       if (first) ipas = ipas.slice(0, opts.backfill);
+      job.log.push(ipas.length ? `${ipas.length} new post${ipas.length === 1 ? '' : 's'} with an app` : 'No new apps posted ✓');
       // Newest post per app wins, so older builds in the same batch are skipped.
       ipas.reverse();
       src.failures = src.failures || {};
@@ -3130,8 +3163,15 @@ function tgSync(src, acc) {
       }
       const newest = posts.length ? Math.max(...posts.map((p) => p.id)) : 0;
       src.lastMsgId = blocked ? maxDone : Math.max(src.lastMsgId || 0, newest);
-      // Posts deleted from the channel: hide those apps (unless they were copied to GitHub).
-      result.removed += await tgMarkRemoved(src);
+      // Posts deleted from the channel: hide those apps (unless they were copied to GitHub). Checking
+      // every app's post takes a while on big channels, so it's done every 6 hours, not on every check.
+      const linkedCount = store.apps.filter((a) => a.remote && a.remote.kind === 'telegram' && a.remote.sourceId === src.id && !a.remote.ghAssetId).length;
+      if (!job.cancelled && linkedCount && (!src.removedCheckAt || Date.now() - new Date(src.removedCheckAt) > 6 * 3600_000)) {
+        job.log.push(`Checking your ${linkedCount.toLocaleString()} apps from ${src.name} are still posted…`);
+        result.removed += await tgMarkRemoved(src, job);
+        src.removedCheckAt = new Date().toISOString();
+        job.counter = null;
+      }
       if (job.cancelled) result.cancelled = true;
       Object.assign(src, { lastSync: new Date().toISOString(), lastError: null, lastResult: result });
       store.save();
@@ -3164,9 +3204,10 @@ function tgDeepScan(src, count, acc, { recheck = false, quick = true } = {}) {
       let offset = 0;
       let looked = 0;
       job.log.push(`Looking back through ${src.name}…`);
+      await ensurePeer(src, job);
       job.counter = { label: 'posts looked at', done: 0, total: null };
       while (found.length < want && !job.cancelled) {
-        const page = await tg.posts(src.ref, 0, 200, offset);
+        const page = await tgTry(job, () => tg.posts(tgRef(src), 0, 200, offset));
         if (!page.scanned) break;
         looked += page.scanned;
         for (const p of page.posts) {
@@ -3268,6 +3309,7 @@ route('POST', /^\/api\/telegram\/channels$/, async (req, res, m, acc) => {
     id: id(), kind: 'telegram', ref, url: ch.username ? `https://t.me/${ch.username}` : '', name: ch.title, username: ch.username,
     showInLibrary: b.showInLibrary !== false, categoryId: ['__auto', '__none'].includes(b.categoryId) ? b.categoryId : b.categoryId && catExists(b.categoryId) ? b.categoryId : '__auto',
     options: cleanTgOptions(b.options), addedAt: new Date().toISOString(), lastMsgId: 0,
+    peer: ch.access_hash != null ? `${ch.id}:${ch.access_hash}` : undefined,
   };
   store.sources.push(src);
   store.save();
@@ -3290,18 +3332,7 @@ function scheduleChecks(acc, { manual = false } = {}) {
 setTimeout(() => scheduleChecks(), 5 * 60_000).unref();
 setInterval(() => scheduleChecks(), 60 * 60_000).unref();
 
-// Shortly after start, re-check which channel posts still exist. Older versions only checked
-// the first 200 apps per channel, so the rest were wrongly marked "Removed from source".
-setTimeout(async () => {
-  if (!tgReady()) return;
-  let fixed = 0;
-  for (const src of store.sources.filter((x) => x.kind === 'telegram')) {
-    const before = store.apps.filter((a) => a.remote && a.remote.sourceId === src.id && a.remote.missing).length;
-    try { await tgMarkRemoved(src); } catch { continue; }
-    fixed += before - store.apps.filter((a) => a.remote && a.remote.sourceId === src.id && a.remote.missing).length;
-  }
-  if (fixed) { store.save(); console.log(`Un-marked ${fixed} apps that were wrongly shown as removed`); }
-}, 30_000);
+
 
 // ----- screenshots -----
 const IMG_TYPES = [

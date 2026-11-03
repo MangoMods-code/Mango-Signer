@@ -3,6 +3,23 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.9.0',
+    date: '2026-11-02',
+    title: 'Faster Channel Checks',
+    summary: 'Checking Telegram channels for new apps takes seconds instead of minutes.',
+    sections: [
+      {
+        title: '✈️ Telegram channels',
+        items: [
+          'Checking a channel for new apps now takes seconds. Before, it could sit for minutes.',
+          'If Telegram asks Mango to slow down, the check says so and counts down the wait instead of looking frozen.',
+          'Each check says what it found ("No new apps posted ✓" or "3 new posts with an app").',
+          'Apps whose post was deleted from a channel are noticed within a few hours instead of on every check, which keeps checks quick.',
+        ],
+      },
+    ],
+  },
+  {
     version: '1.8.9',
     date: '2026-11-02',
     title: 'Stop Means Stop',
