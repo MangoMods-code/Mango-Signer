@@ -1420,11 +1420,13 @@ function duplicateGroupsServer() {
   return [...by.values()].filter((g) => g.length > 1);
 }
 route('POST', /^\/api\/apps\/dedupe$/, async (req, res) => {
-  const { prefer = 'newest' } = await readJson(req);
-  const groups = duplicateGroupsServer();
+  // picks: { bundleId: appId } — copies you chose yourself. only: a bundle ID to clean up just that app.
+  const { prefer = 'newest', picks = {}, only = null } = await readJson(req);
+  const groups = duplicateGroupsServer().filter((g) => !only || normBid(g[0].bundleId) === normBid(only));
   let deleted = 0;
   for (const g of groups) {
-    const keep = dedupeKeeper(g, prefer);
+    const picked = picks && picks[normBid(g[0].bundleId)];
+    const keep = (picked && g.find((a) => a.id === picked)) || dedupeKeeper(g, prefer);
     for (const a of g) if (a !== keep) { await deleteApp(a.id, { exclude: true }); deleted++; }
   }
   store.save();
