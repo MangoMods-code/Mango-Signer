@@ -1428,13 +1428,23 @@ function cloudSettingsHtml() {
     <p class="hint" style="margin:8px 4px 0">Cloud apps only keep their info and icon here. The file is downloaded while signing and deleted right after, so your Railway volume stays empty.</p>`;
 }
 
+// A direct link to one app file (any website, not a GitHub repo page or a source list).
+const isIpaLink = (u) => { try { const x = new URL(/^[a-z]+:\/\//i.test(u) ? u : 'https://' + u); return /\.ipa$/i.test(decodeURIComponent(x.pathname)) && !/\/releases\/download\//.test(x.pathname); } catch { return false; } };
+// Adds one app from a direct .ipa link (works from anywhere: Add App, Add Source, or the + button).
+async function addIpaLink(url, el) {
+  if (!/^[a-z]+:\/\//i.test(url)) url = 'https://' + url;
+  await runWithProgress(el, async (setProgress) => {
+    const { jobId } = await api('POST', '/api/apps/link', { url });
+    return waitJob(jobId, (j) => setProgress(j.progress, j.progress != null ? `Reading ${Math.round(j.progress * 100)}%` : (j.log.slice(-1)[0] || 'Reading the app…')));
+  }, (app) => { toast(`Added ${app.name}`); editAppSheet(app, true); });
+}
 function addSourceSheet(prefill = '') {
   const have = new Set((state.sources || []).map((x) => x.url));
   const sugg = SUGGESTED_SOURCES.filter((x) => !have.has(rawGithub(x.url)));
   openSheet(`
     <h2>Add a Source</h2>
     <p class="muted small" style="margin-top:-6px">A source is a list of apps someone keeps up to date (the same kind AltStore, SideStore, ESign and Feather use). Its apps show up in your library as links — nothing is downloaded to your server until someone signs one.</p>
-    <div class="field"><label>Source link</label><input type="url" id="srcUrl" placeholder="https://…/source.json or github.com/owner/repo" value="${esc(typeof prefill === 'string' ? prefill : '')}" autocapitalize="off" autocorrect="off"><div class="hint">Works with AltStore-style sources, and with <b>GitHub repos</b>: paste github.com/owner/repo and every release with an .ipa becomes a version, with new releases showing up as updates.</div></div>
+    <div class="field"><label>Source link</label><input type="url" id="srcUrl" placeholder="https://…/source.json or github.com/owner/repo" value="${esc(typeof prefill === 'string' ? prefill : '')}" autocapitalize="off" autocorrect="off"><div class="hint">Works with AltStore-style sources, and with <b>GitHub repos</b>: paste github.com/owner/repo and every release with an .ipa becomes a version, with new releases showing up as updates. A link straight to one <b>.ipa</b> file from any website works too, and adds just that app.</div></div>
     <div class="group">${toggle('srcShow', 'Show its apps to everyone', 'Turn off to keep them just for you until you check them out', true)}</div>
     <button class="btn primary block" id="srcAdd" style="margin-top:12px">Add Source</button>
     ${sugg.length ? `<div class="section-title">Suggested</div><div class="list">${sugg.map((x, i) => `
@@ -1442,6 +1452,8 @@ function addSourceSheet(prefill = '') {
     <div id="addProgress"></div>`, (el) => {
     const add = async (url, btn) => {
       if (!url) return toast('Paste a source link first', true);
+      // A link to a single .ipa (from any website): add that app as a link instead of as a source.
+      if (isIpaLink(url)) return addIpaLink(url, el);
       el.querySelectorAll('button, input').forEach((b) => { b.disabled = true; });
       const old = btn.textContent;
       btn.textContent = 'Reading source…';
@@ -2516,7 +2528,7 @@ function addAppSheet() {
       <button class="file-btn" id="pickIpa">${ICONS.file}<div class="row-main"><div class="row-title">Choose .ipa file</div><div class="row-sub">${ghStoring() ? 'Saved to your GitHub repo, not this server.' : 'From Files, iCloud Drive or Downloads. Big files resume if your connection drops.'}</div></div></button>
     </div>
     <div class="section-title">Or add from a link</div>
-    <div class="field"><input type="url" id="ipaUrl" placeholder="https://example.com/app.ipa" autocapitalize="off" autocorrect="off"><div class="hint">Direct download links only. Dropbox links work (dl=0 is fixed for you).</div></div>
+    <div class="field"><input type="url" id="ipaUrl" placeholder="https://example.com/app.ipa" autocapitalize="off" autocorrect="off"><div class="hint">Any website's direct .ipa link works (like example.com/app.ipa). Dropbox links work too (dl=0 is fixed for you).</div></div>
     <div id="ghFollow" class="hint-card hidden"><span>This is a GitHub release. Follow the repo instead and new versions show up by themselves.</span><button class="btn small-btn" id="ghFollowBtn" type="button">Follow repo</button></div>
     <div class="group">${toggle('linkOnly', 'Link only (uses no storage)', "Only the app's info and icon are saved. The file is downloaded fresh each time someone signs it.", true)}</div>
     <button class="btn block" id="importUrl" style="margin-top:10px">Add from link</button>
@@ -2541,8 +2553,9 @@ function addAppSheet() {
       }, (app) => { toast(`Added ${app.name}`); editAppSheet(app, true); });
     };
     $('#importUrl', el).onclick = async () => {
-      const url = $('#ipaUrl', el).value.trim();
+      let url = $('#ipaUrl', el).value.trim();
       if (!url) return toast('Paste a link first', true);
+      if (!/^[a-z]+:\/\//i.test(url)) url = 'https://' + url;
       const linkOnly = $('#linkOnly', el).checked;
       await runWithProgress(el, async (setProgress) => {
         const { jobId } = await api('POST', linkOnly ? '/api/apps/link' : '/api/apps/import', { url });
