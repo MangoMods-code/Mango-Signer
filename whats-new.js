@@ -3,6 +3,20 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.9.8',
+    date: '2026-11-03',
+    title: 'GitHub Updates Fix',
+    summary: 'Apps from GitHub repos always show their newest version.',
+    sections: [
+      {
+        title: '🛠 Fixes',
+        items: [
+          'Apps from GitHub repos whose releases are named things like "build-8" instead of a version number now update to the newest release instead of getting stuck on an older one.',
+        ],
+      },
+    ],
+  },
+  {
     version: '1.9.7',
     date: '2026-11-03',
     title: 'Ready for the iPhone App',

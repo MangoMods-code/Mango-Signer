@@ -2804,7 +2804,16 @@ function mergedVersions(app, sourceVersions) {
   const man = (app.manualVersions || [])
     .filter((m) => !src.some((v) => versionCmp(v.version, m.version) === 0))
     .map((m) => ({ version: m.version, date: m.date, size: m.size, minOS: m.minOS, notes: m.notes, channel: 'Added by you', storage: m.storage, url: m.storage && m.storage.url, manualId: m.id }));
-  return [...man, ...src].sort((x, y) => versionCmp(y.version, x.version) || String(y.date || '').localeCompare(String(x.date || '')));
+  // Newest first. When every version is a number, sort by it; otherwise keep the source's own order (a GitHub
+  // repo's older releases go by their tag, like "build-6", while the newest goes by the app's real version,
+  // like "0.1.8", and those can't be compared). Your own uploads go in front of the first one they're newer than.
+  const numeric = src.every((v) => /^\s*v?\d/i.test(String(v.version || '')));
+  const out = numeric ? src.slice().sort((x, y) => versionCmp(y.version, x.version) || String(y.date || '').localeCompare(String(x.date || ''))) : src.slice();
+  for (const m of man.sort((x, y) => versionCmp(y.version, x.version))) {
+    const at = out.findIndex((v) => versionCmp(m.version, v.version) > 0);
+    if (at < 0) out.push(m); else out.splice(at, 0, m);
+  }
+  return out;
 }
 function dropSupersededManual(app, sourceVersions) {
   if (!(app.manualVersions || []).length) return;
