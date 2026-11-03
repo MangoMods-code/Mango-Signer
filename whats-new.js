@@ -3,6 +3,22 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.10.0',
+    date: '2026-11-03',
+    title: 'Signed Apps Stay on Your iPhone',
+    summary: 'The Mango Signer iPhone app can now keep every app you sign and put it back when the server cleans it up.',
+    sections: [
+      {
+        title: '📱 iPhone app',
+        items: [
+          'Everything you sign is saved inside the Mango Signer iPhone app too, like ESign.',
+          'If the server already removed a signed file, the app puts its saved copy back, so you can install it again without signing it again.',
+          'The app checks what\'s really installed on your iPhone, so your installed apps list stays right on its own.',
+        ],
+      },
+    ],
+  },
+  {
     version: '1.9.9',
     date: '2026-11-03',
     title: 'GitHub Updates Fix, Part 2',

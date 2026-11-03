@@ -30,7 +30,7 @@ Upload an `.ipa`, add a `.p12` + `.mobileprovision`, tap **Sign**, then **Instal
 - **Info.plist editing** – 120Hz ProMotion, Game Mode, full screen, plus any custom key (add, change or remove)
 - **Signing options** – change name, bundle ID, version, minimum iOS, icon; inject `.dylib` tweaks; remove extensions, Watch app or device limits; Files app sharing
 - **Install** – one-tap over-the-air install, shareable install pages, download signed `.ipa`
-- **Mango Signer iPhone app** – the native app ([Mango-Signer-iOS](https://github.com/MangoMods-code/Mango-Signer-iOS)) signs in to your server and shows the same library, certificates and signed apps. It can sign on the server, or download the original app (counts toward the daily sign limit, same as signing) and sign it right on the iPhone
+- **Mango Signer iPhone app** – the native app ([Mango-Signer-iOS](https://github.com/MangoMods-code/Mango-Signer-iOS)) signs in to your server and shows the same library, certificates and signed apps. It can sign on the server, or download the original app (counts toward the daily sign limit, same as signing) and sign it right on the iPhone. Like ESign, it keeps a copy of every signed app on the iPhone and puts it back on the server when the server has cleaned it up, and it checks what's really installed to keep your installed apps list right
 - **User management** – reset passwords, turn accounts off, unlink iPhones, delete users, invite codes, hide apps from the library, signing queue
 
 ## Deploy on Railway

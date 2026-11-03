@@ -1026,9 +1026,10 @@ async function cleanupSignedFiles(maxAgeDays = Number(store.settings.signedReten
     if (s.fileDeleted) continue;
     // Once an app finished installing, its signed file isn't needed any more (kept 15 minutes in case iOS retries).
     const installedLongEnough = store.settings.deleteAfterInstall && s.installedAt && Date.now() - new Date(s.installedAt) > 15 * 60 * 1000;
-    const tooOld = maxAgeDays && Date.now() - new Date(s.signedAt) >= maxAgeDays * 864e5;
+    const since = s.restoredAt || s.signedAt; // a file put back from the iPhone app gets a fresh start
+    const tooOld = maxAgeDays && Date.now() - new Date(since) >= maxAgeDays * 864e5;
     // Saved on GitHub: the copy here is just for a quick first install, so it goes after a few hours.
-    const backedUp = s.gh && Date.now() - new Date(s.signedAt) > 6 * 3600_000;
+    const backedUp = s.gh && Date.now() - new Date(since) > 6 * 3600_000;
     if (!installedLongEnough && !tooOld && !backedUp) continue;
     if (signedToGithubOn() && !s.gh && !archiveFailedForGood(s) && !(s.expires && new Date(s.expires) < Date.now())) continue; // wait until it's saved
     await rmQuiet(path.join(dirs.signed, s.id + '.ipa'));
@@ -4216,6 +4217,34 @@ route('POST', /^\/api\/jobs\/([a-f0-9]{16})\/cancel$/, (req, res, m, acc) => {
 
 // ----- signed apps -----
 const ownSigned = (acc, sid) => store.signed.find((s) => s.id === sid && s.ownerId === acc.id);
+
+// The signed file itself, so the Mango Signer iPhone app can keep its own copy. Unlike the install link,
+// downloading it here doesn't count as installing the app.
+route('GET', /^\/api\/signed\/([a-f0-9]{16})\/file$/, async (req, res, m, acc) => {
+  const s = ownSigned(acc, m[1]);
+  if (!s || !signedReady(s)) return fail(res, 404, 'This signed file was cleaned up');
+  const local = path.join(dirs.signed, s.id + '.ipa');
+  if (s.gh && !fs.existsSync(local)) return serveSignedFromGithub(req, res, s);
+  return serveFile(req, res, local, { download: `${s.name}.ipa` });
+});
+
+// Puts back a signed file the iPhone app kept, so an app whose file was cleaned up can be installed again.
+route('POST', /^\/api\/signed\/([a-f0-9]{16})\/restore$/, async (req, res, m, acc) => {
+  const s = ownSigned(acc, m[1]);
+  if (!s) return fail(res, 404, 'Not found');
+  const { uploadId } = await readJson(req);
+  const file = tmpPath(uploadId, acc);
+  try {
+    const meta = await ipa.inspect(file);
+    if (meta.bundleId !== s.bundleId) return fail(res, 400, "That file isn't this signed app");
+    await fsp.rename(file, path.join(dirs.signed, s.id + '.ipa'));
+  } finally {
+    await rmQuiet(file);
+  }
+  Object.assign(s, { fileDeleted: false, restoredAt: new Date().toISOString(), installedAt: null });
+  store.save();
+  json(res, { signed: signedView(s, req) });
+});
 
 route('DELETE', /^\/api\/signed\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
   const s = ownSigned(acc, m[1]);
