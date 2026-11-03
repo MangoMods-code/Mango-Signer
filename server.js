@@ -1639,16 +1639,20 @@ route('POST', /^\/api\/apps\/link$/, async (req, res, m, acc) => {
 
 // ----- sources -----
 async function fetchJson(url) {
+  const text = await fetchText(url);
+  try { return JSON.parse(text); } catch { throw new Error("That link isn't a source (it isn't JSON)"); }
+}
+async function fetchText(url, accept = 'application/json, text/html;q=0.9, */*;q=0.8') {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 30000);
   try {
-    const r = await fetch(url, { headers: { 'User-Agent': 'Mango-Signer', Accept: 'application/json' }, redirect: 'follow', signal: ctrl.signal });
+    const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Mango-Signer)', Accept: accept }, redirect: 'follow', signal: ctrl.signal });
     if (!r.ok) throw new Error(`Couldn't load the source (HTTP ${r.status})`);
     const len = Number(r.headers.get('content-length')) || 0;
     if (len > 25 * 1048576) throw new Error('That source is too big');
     const text = await r.text();
     if (text.length > 25 * 1048576) throw new Error('That source is too big');
-    try { return JSON.parse(text); } catch { throw new Error("That link isn't a source (it isn't JSON)"); }
+    return text;
   } catch (e) {
     if (e.name === 'AbortError') throw new Error('The source took too long to load');
     throw e;
@@ -1686,7 +1690,7 @@ const haveElsewhere = (bundleId, srcId) => {
   return !!b && store.apps.some((a) => normBid(a.bundleId) === b && !(a.remote && a.remote.sourceId === srcId) && !(a.remote && a.remote.missing));
 };
 // GitHub repos you follow are for that one app, so they always add it. Other sources skip apps you already have.
-const sourceSkipsHave = (src) => (src.skipHave === undefined ? src.kind !== 'ghrepo' : !!src.skipHave);
+const sourceSkipsHave = (src) => (src.skipHave === undefined ? !['ghrepo', 'webpage'].includes(src.kind) : !!src.skipHave);
 const isExcluded = (src, { key, bundleId }) => (src.excluded || []).some((e) => (key && e.key === key) || (normBid(bundleId) && e.bundleId === normBid(bundleId)));
 
 // ----- GitHub repos as sources -----
@@ -1778,7 +1782,17 @@ async function githubRepoSource(src) {
 }
 
 async function syncSource(src) {
-  const parsed = src.kind === 'ghrepo' ? await githubRepoSource(src) : sources.parseSource(await fetchJson(src.url));
+  let parsed;
+  if (src.kind === 'ghrepo') parsed = await githubRepoSource(src);
+  else if (src.kind === 'webpage') parsed = await webPageSource(src);
+  else {
+    const text = await fetchText(src.url);
+    let data;
+    try { data = JSON.parse(text); } catch { data = undefined; }
+    if (data !== undefined) parsed = sources.parseSource(data);
+    else if (/<(html|a|body)[\s>]/i.test(text)) { parsed = await webPageSource(src, text); src.kind = 'webpage'; } // a website's downloads page
+    else throw new Error("That link isn't a source (it isn't JSON) or a web page with .ipa links");
+  }
   const mine = store.apps.filter((a) => a.remote && a.remote.kind === 'source' && a.remote.sourceId === src.id);
   const byKey = new Map(mine.map((a) => [a.remote.key, a]));
   const seen = new Set();
@@ -1835,6 +1849,56 @@ async function syncSource(src) {
   return { added, updated, removed, total: parsed.apps.length };
 }
 
+// ----- a website's downloads page as a source -----
+// For apps whose developer posts the .ipa on their own site instead of GitHub. Every hour Mango reads the
+// page, and any .ipa link it hasn't seen before is read (name, version, icon) and added as the newest
+// version. Links it saw before are kept as older versions, even after the page drops them.
+function ipaLinksIn(html, base) {
+  const out = new Set();
+  const add = (raw) => {
+    try {
+      const u = new URL(raw.replace(/&amp;/g, '&'), base);
+      if (/^https?:$/.test(u.protocol) && /\.ipa$/i.test(decodeURIComponent(u.pathname))) { u.hash = ''; out.add(u.toString()); }
+    } catch { /* not a link */ }
+  };
+  for (const m of html.matchAll(/(?:href|src|data-url|data-href)\s*=\s*["']([^"']+)["']/gi)) add(m[1]);
+  for (const m of html.matchAll(/https?:\/\/[^\s"'<>()]+?\.ipa\b(?:\?[^\s"'<>]*)?/gi)) add(m[0]);
+  return [...out];
+}
+async function webPageSource(src, html) {
+  if (html === undefined) html = await fetchText(src.url, 'text/html,*/*;q=0.8');
+  const links = ipaLinksIn(html, src.url);
+  if (!links.length) throw new Error("No .ipa download links on that page. (If the page only shows its links after you tap something, paste the .ipa link itself instead.)");
+  const title = ((html.match(/<title[^>]*>([^<]{1,120})<\/title>/i) || [])[1] || '').replace(/\s+/g, ' ').trim();
+  src.seen = src.seen || {}; // variant -> [{ url, version, size, date, notes, name, bundleId, minOS }]
+  const known = store.apps.filter((a) => a.remote && a.remote.sourceId === src.id);
+  const fresh = new Map(); // variant -> meta of a newly found newest link (with icon)
+  for (const url of links) {
+    const fileName = decodeURIComponent(new URL(url).pathname.split('/').pop());
+    const variant = ipaVariant(fileName);
+    const list = (src.seen[variant] = src.seen[variant] || []);
+    if (list.some((v) => v.url === url)) continue;
+    let meta;
+    try { meta = await inspectLink(url, null); } catch (e) { if (!list.length && links.length === 1) throw new Error(`Found ${fileName} on the page, but couldn't read it (${e.message})`); continue; }
+    list.push({ url, version: meta.version || '', size: meta.size || 0, date: new Date().toISOString(), notes: '', name: meta.name, bundleId: meta.bundleId, minOS: meta.minOS || '' });
+    list.sort((x, y) => versionCmp(y.version, x.version));
+    if (list.length > 15) list.length = 15;
+    if (list[0].url === url) fresh.set(variant, { assetId: url, name: meta.name, bundleId: meta.bundleId, version: meta.version, minOS: meta.minOS, icon: meta.icon || null });
+  }
+  const apps = Object.entries(src.seen).filter(([, list]) => list.length).map(([variant, list]) => {
+    const key = `web:${variant}`;
+    const app = known.find((a) => a.remote.key === key);
+    const newest = list[0];
+    const meta = fresh.get(variant) || (app && app.remote.inspected) || { assetId: newest.url, name: newest.name, bundleId: newest.bundleId, version: newest.version, minOS: newest.minOS };
+    return {
+      key, name: newest.name || title || new URL(src.url).hostname, bundleId: newest.bundleId || '', developer: new URL(src.url).hostname.replace(/^www\./, ''),
+      subtitle: '', description: '', iconURL: '', tint: '', category: '', screenshots: [],
+      versions: list.map(({ name: _n, bundleId: _b, ...v }) => v), _meta: meta,
+    };
+  });
+  return { name: title || new URL(src.url).hostname, identifier: `web:${src.url}`, iconURL: '', subtitle: `Downloads page · ${new URL(src.url).hostname}`, apps };
+}
+
 // GitHub repo apps: keep what was read from the .ipa (so it's only read again for a new release) and its icon.
 async function saveRepoMeta(app, s) {
   if (!s._meta) return;
@@ -1847,7 +1911,7 @@ async function saveRepoMeta(app, s) {
   app.remote.inspected = meta;
 }
 
-const sourceView = ({ done: _d, failures: _f, ...src }) => ({ ...src, apps: store.apps.filter((a) => a.remote && a.remote.sourceId === src.id && !a.remote.missing).length });
+const sourceView = ({ done: _d, failures: _f, seen: _s, ...src }) => ({ ...src, apps: store.apps.filter((a) => a.remote && a.remote.sourceId === src.id && !a.remote.missing).length });
 
 route('POST', /^\/api\/sources$/, async (req, res, m, acc) => {
   const b = await readJson(req);

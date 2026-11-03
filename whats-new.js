@@ -3,6 +3,22 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.9.4',
+    date: '2026-11-02',
+    title: 'Apps From Websites',
+    summary: 'Apps that a developer posts on their own website now update by themselves too.',
+    sections: [
+      {
+        title: '🌐 Apps from websites',
+        items: [
+          'Apps whose developer posts them on their own website now update by themselves. When the site gets a new version, it shows up as an update.',
+          'Older versions stay available to sign, even after the website removes them.',
+          'Each app gets its real name, icon and version from the app itself.',
+        ],
+      },
+    ],
+  },
+  {
     version: '1.9.3',
     date: '2026-11-02',
     title: 'Links From Anywhere',
