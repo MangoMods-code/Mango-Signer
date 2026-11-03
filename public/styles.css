@@ -736,3 +736,11 @@ html[data-accent="red"] { --mango: #ff5c5c; --mango-2: #ff9b9b; --accent-2: #f03
 
 /* roles */
 .badge.tester { background: rgba(106, 168, 255, .16); color: var(--blue); }
+
+/* Sort by hand */
+.sort-card { flex-wrap: wrap; }
+.sort-card span { flex-basis: 100%; }
+.sort-card .btn { flex: 1; }
+.qs-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+.qs-grid .btn { padding: 12px 8px; font-size: 15px; }
+.btn .qs-why { display: block; font-size: 12px; font-weight: 500; opacity: .8; margin-top: 2px; }

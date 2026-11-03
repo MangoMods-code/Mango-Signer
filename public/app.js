@@ -966,6 +966,7 @@ function renderLibrary() {
       <button class="btn small-btn" data-act="toggle-select-mode">${state.lib.select ? 'Done' : 'Select'}</button>
     </div>` : ''}
     ${['installed', 'updates'].includes(cat) && libCount('installed') ? `<div class="hint-card"><span>Deleted something or updated it elsewhere?</span><button class="btn small-btn" data-act="my-apps">Fix the list</button></div>` : ''}
+    ${isStaff() && ['all', 'none'].includes(cat) && libCount('none') ? `<div class="hint-card sort-card"><span>📂 ${libCount('none')} app${libCount('none') === 1 ? ' has' : 's have'} no category</span><button class="btn small-btn" data-act="auto-sort">✨ Auto-sort</button><button class="btn small-btn" data-act="quick-sort">Sort by hand</button></div>` : ''}
     ${cat === 'missing' && isStaff() && libCount('missing') ? `<div class="warning bad" style="margin:0 0 12px;display:flex;align-items:center;gap:10px"><span style="flex:1">These apps were removed from their source and are hidden from everyone.</span><button class="btn small-btn danger" data-act="delete-missing">Delete all ${libCount('missing')}</button></div>` : ''}
     <div id="libList">${libraryListHtml()}</div>
     ${state.lib.select ? bulkBarHtml() : ''}`;
@@ -1385,6 +1386,8 @@ function bindView(view) {
         'toggle-select-mode': () => { state.lib.select = !state.lib.select; state.lib.selected.clear(); render(); },
         'toggle-select': () => { const s = state.lib.selected; s.has(idv) ? s.delete(idv) : s.add(idv); render(); },
         'manage-cats': manageCategoriesSheet,
+        'auto-sort': () => autoSortRun(false),
+        'quick-sort': () => quickSortSheet(),
         'check-cert': () => checkCert(idv, el),
         'default-cert': () => makeDefault(idv),
         'rename-cert': () => renameCert(idv),
@@ -3305,6 +3308,123 @@ function editAppSheet(a, isNew = false) {
   });
 }
 
+// Auto-sort: every app without a category (or every app, with all). Runs on the server, so it can keep going
+// after you close the screen. Apple only allows a few App Store lookups a minute, so big batches take a while.
+async function autoSortRun(all, back) {
+  if (all && !confirm('Re-sort every app? Apps you put in a category yourself stay where they are.')) return;
+  try {
+    const { jobId, count } = await api('POST', '/api/apps/auto-categorize', { all });
+    if (!count) return toast('Nothing to sort');
+    closeSheet.locked = true; $('#sheet').classList.add('locked');
+    let bg = false;
+    openSheet(`<div class="progress-wrap"><div class="spinner"></div><h2 style="margin:0 0 4px">Sorting ${count} app${count === 1 ? '' : 's'}…</h2>
+      <div class="bar" id="asBar"><div></div></div><div class="log" id="asLog"></div>
+      <p class="hint center">Apps the App Store has to look up take a few seconds each.</p>
+      <button class="btn block" id="asBg" type="button">Keep going in the background</button>
+      <button class="link-btn block" id="asStop" type="button">Stop</button></div>`, (el) => {
+      $('#asBg', el).onclick = () => { bg = true; closeSheet.locked = false; $('#sheet').classList.remove('locked'); closeSheet(); toast('Still sorting on the server. Refresh in a bit to see it.'); };
+      $('#asStop', el).onclick = () => api('POST', `/api/jobs/${jobId}/cancel`).catch(() => {});
+    });
+    const body = $('#sheetBody');
+    let r;
+    try {
+      r = await waitJob(jobId, (j) => {
+        if (bg) return;
+        $('#asBar > div', body).style.width = `${Math.round((j.progress || 0) * 100)}%`;
+        const l = $('#asLog', body); l.textContent = j.log.join('\n'); l.scrollTop = l.scrollHeight;
+      });
+    } catch (e) { if (!bg) throw e; return; }
+    closeSheet.locked = false; $('#sheet').classList.remove('locked');
+    await refresh();
+    if (bg) return toast(`Sorting finished: ${r.sorted} app${r.sorted === 1 ? '' : 's'} sorted`);
+    const how = [[r.byAppStore, 'App Store'], [r.bySimilar, 'like apps you sorted'], [r.byKeyword, 'by name'], [r.bySource, 'by source'], [r.byRule, 'your rules']].filter(([n]) => n).map(([n, l]) => `${n} ${l}`).join(', ');
+    toast(`Sorted ${r.sorted}${how ? ` (${how})` : ''}${r.unknown ? ` · ${r.unknown} still need you` : ''}`);
+    if (back) back(); else if (r.unknown) quickSortSheet(); else closeSheet();
+  } catch (e) { closeSheet.locked = false; $('#sheet').classList.remove('locked'); await refresh().catch(() => {}); toast(e.cancelled ? 'Stopped. Apps sorted so far keep their category.' : e.message, !e.cancelled); if (e.cancelled) closeSheet(); }
+}
+
+// Sort by hand: one app without a category at a time, with Mango's best guess on top. Tap a category and the next app comes up.
+async function quickSortSheet(back) {
+  const queue = state.apps.filter((a) => !catById(a.categoryId)).map((a) => a.id);
+  if (!queue.length) { toast('Every app has a category 🎉'); return back && back(); }
+  let guesses = {};
+  try { guesses = (await api('POST', '/api/apps/category-guesses', { ids: queue })).guesses || {}; } catch { /* guesses are a bonus */ }
+  const total = queue.length;
+  let i = 0, done = 0;
+  const history = [];
+  const next = () => { while (i < queue.length && !state.apps.find((a) => a.id === queue[i])) i++; };
+  const draw = () => {
+    next();
+    if (i >= queue.length) {
+      openSheet(`<div class="empty"><div class="empty-icon">🎉</div><h3>All done</h3><p>${done} sorted${total - done ? `, ${total - done} skipped` : ''}.</p></div>
+        ${history.length ? '<button class="btn block" id="qsUndo">↩ Undo the last one</button>' : ''}
+        <button class="btn primary block" id="qsClose" style="margin-top:8px">${back ? 'Back' : 'Close'}</button>`, (el) => {
+        if ($('#qsUndo', el)) $('#qsUndo', el).onclick = undo;
+        $('#qsClose', el).onclick = () => (back ? back() : closeSheet());
+      });
+      return;
+    }
+    const a = state.apps.find((x) => x.id === queue[i]);
+    const g = guesses[a.id];
+    const guessCat = g && g.categoryId && catById(g.categoryId);
+    const sub = [a.developer, a.bundleId, a.sourceName ? `${a.cloud === 'telegram' ? '✈️' : '☁'} ${a.sourceName}` : ''].filter(Boolean).join(' · ');
+    const about = String(a.description || a.notes || '').replace(/\s+/g, ' ').slice(0, 160);
+    openSheet(`
+      <p class="muted small center" style="margin:-4px 0 10px">${i + 1} of ${queue.length} · ${done} sorted</p>
+      <div class="sheet-head">${appIcon(a, true)}<div class="row-main"><h2>${esc(a.name)}</h2><div class="row-sub">${esc(sub)}</div></div></div>
+      ${about ? `<p class="muted small" style="margin:-4px 0 12px">${esc(about)}${about.length >= 160 ? '…' : ''}</p>` : ''}
+      ${guessCat ? `<button class="btn primary big block" data-qcat="${guessCat.id}">${esc(guessCat.emoji)} ${esc(guessCat.name)}<span class="qs-why">Best guess: ${esc(g.why)}</span></button>`
+        : g && g.newCategory ? `<button class="btn primary big block" data-qnew="${esc(g.newCategory)}">+ ${esc(g.newCategory)} (new)<span class="qs-why">Best guess: ${esc(g.why)}</span></button>` : ''}
+      <div class="qs-grid">${state.categories.filter((c) => !guessCat || c.id !== guessCat.id).map((c) => `<button class="btn" data-qcat="${c.id}">${esc(c.emoji)} ${esc(c.name)}</button>`).join('')}
+        <button class="btn" data-qnew="">+ New…</button></div>
+      <div class="actions" style="margin-top:12px">
+        <button class="btn block" id="qsSkip">Skip for now</button>
+        ${history.length ? '<button class="link-btn block" id="qsUndo" type="button">↩ Undo the last one</button>' : ''}
+        <button class="link-btn block" id="qsOpen" type="button">Open the app's page</button>
+        <button class="link-btn block" id="qsDone" type="button">${back ? 'Back' : 'Done'}</button>
+      </div>`, (el) => {
+      const put = async (cid) => {
+        el.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+        try {
+          await api('PATCH', `/api/apps/${a.id}`, { categoryId: cid });
+          a.categoryId = cid;
+          history.push(a.id);
+          done++; i++;
+          draw();
+        } catch (e) { toast(e.message, true); draw(); }
+      };
+      el.querySelectorAll('[data-qcat]').forEach((b) => { b.onclick = () => put(b.dataset.qcat); });
+      el.querySelectorAll('[data-qnew]').forEach((b) => {
+        b.onclick = async () => {
+          let cat;
+          if (b.dataset.qnew) {
+            try { ({ category: cat } = await api('POST', '/api/categories', { name: b.dataset.qnew, emoji: '📁' })); state.categories.push(cat); } catch (e) { return toast(e.message, true); }
+          } else cat = await promptNewCategory();
+          if (cat) put(cat.id);
+        };
+      });
+      $('#qsSkip', el).onclick = () => { i++; draw(); };
+      if ($('#qsUndo', el)) $('#qsUndo', el).onclick = undo;
+      $('#qsOpen', el).onclick = () => appSheet(a.id);
+      $('#qsDone', el).onclick = async () => { await refresh(); if (back) back(); else closeSheet(); };
+    });
+  };
+  const undo = async () => {
+    const aid = history.pop();
+    if (!aid) return;
+    try {
+      await api('PATCH', `/api/apps/${aid}`, { categoryId: null });
+      const a = state.apps.find((x) => x.id === aid);
+      if (a) a.categoryId = null;
+      done--;
+      i = queue.indexOf(aid);
+      draw();
+    } catch (e) { toast(e.message, true); }
+  };
+  draw();
+  refresh().catch(() => {});
+}
+
 async function promptNewCategory() {
   const name = prompt('New category name (e.g. Emulators)');
   if (!name) return null;
@@ -3334,28 +3454,16 @@ function manageCategoriesSheet() {
         </div>`).join('') || '<div class="setting muted">No categories yet</div>'}</div>
       <button class="btn primary block" id="cNew" style="margin-top:12px">+ New category</button>
       <div class="section-title">✨ Sort automatically</div>
-      <p class="hint" style="margin:0 4px 10px">Mango checks your keyword rules first, then looks the app up on the App Store and uses its category (Games, Social Networking…). It also fills in a missing developer, description and screenshots. Apps you put in a category yourself are never moved.</p>
+      <p class="hint" style="margin:0 4px 10px">Mango checks your keyword rules, the App Store, apps you already sorted that look the same (YouTube++ goes where YouTube is), giveaway words in the name (emulator, IPTV, VPN…) and where most apps from the same source or channel are. It also fills in a missing developer, description and screenshots. Re-sorting never moves apps you put in a category yourself.</p>
       <div class="actions" style="margin-top:0">
-        <button class="btn block" id="cAuto">Sort uncategorized apps (${state.apps.filter((a) => !catById(a.categoryId)).length})</button>
+        <button class="btn block" id="cAuto">✨ Auto-sort apps without a category (${state.apps.filter((a) => !catById(a.categoryId)).length})</button>
+        <button class="btn block" id="cQuick">Sort them by hand, one by one</button>
         <button class="btn block" id="cAutoAll">Re-sort every app</button>
         <button class="btn block" id="cRules">Keyword rules (${(state.settings.catRules || []).length})</button>
       </div>`, (el) => {
-      const runAuto = async (all) => {
-        if (all && !confirm('Re-sort every app? Apps you moved yourself stay where they are.')) return;
-        try {
-          const { jobId, count } = await api('POST', '/api/apps/auto-categorize', { all });
-          if (!count) return toast('Nothing to sort');
-          closeSheet.locked = true; $('#sheet').classList.add('locked');
-          openSheet(`<div class="progress-wrap"><div class="spinner"></div><h2 style="margin:0 0 4px">Sorting ${count} app${count === 1 ? '' : 's'}…</h2><div class="bar" id="asBar"><div></div></div><div class="log" id="asLog"></div></div>`);
-          const body = $('#sheetBody');
-          const r = await waitJob(jobId, (j) => { $('#asBar > div', body).style.width = `${Math.round((j.progress || 0) * 100)}%`; const l = $('#asLog', body); l.textContent = j.log.join('\n'); l.scrollTop = l.scrollHeight; });
-          closeSheet.locked = false; $('#sheet').classList.remove('locked');
-          await refresh();
-          toast(`Sorted ${r.sorted} (${r.byAppStore} from the App Store, ${r.byRule} by your rules)${r.unknown ? ` · ${r.unknown} not found` : ''}`);
-          draw();
-        } catch (e) { closeSheet.locked = false; $('#sheet').classList.remove('locked'); toast(e.message, true); }
-      };
+      const runAuto = (all) => autoSortRun(all, draw);
       $('#cAuto', el).onclick = () => runAuto(false);
+      $('#cQuick', el).onclick = () => quickSortSheet(draw);
       $('#cAutoAll', el).onclick = () => runAuto(true);
       $('#cRules', el).onclick = () => catRulesSheet(draw);
       const reorder = async (from, to) => {
