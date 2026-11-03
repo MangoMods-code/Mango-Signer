@@ -3,6 +3,22 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.9.2',
+    date: '2026-11-02',
+    title: 'Smarter Check Order',
+    summary: 'GitHub and source updates come in first, before the slower Telegram channels.',
+    sections: [
+      {
+        title: '🔄 Update checks',
+        items: [
+          'GitHub repos and sources are always checked before Telegram channels, so their updates show up first instead of waiting behind a big channel.',
+          'Smaller Telegram channels are checked before bigger ones.',
+          'Big channels are checked at a gentler pace, so Telegram doesn\'t make Mango wait as often.',
+        ],
+      },
+    ],
+  },
+  {
     version: '1.9.1',
     date: '2026-11-02',
     title: 'Channel Fix',

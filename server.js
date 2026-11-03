@@ -2798,6 +2798,7 @@ async function tgMarkRemoved(src, job = null) {
     let exists;
     try { ({ exists } = await tgTry(job, () => tg.exists(tgRef(src), batch.map((a) => a.remote.msgId)), src)); } catch { continue; }
     if (job) job.counter = { label: 'apps checked', done: Math.min(linked.length, i + 200), total: linked.length };
+    if (i + 200 < linked.length) await new Promise((r) => setTimeout(r, 1500)); // go easy on Telegram's limits
     const have = new Set(exists);
     for (const a of batch) {
       const gone = !have.has(a.remote.msgId);
@@ -3055,8 +3056,11 @@ function queueInfo(job) {
 }
 function runCheck(job, work) {
   job.isCheck = true;
-  checkQueue.push({ job, work });
-  if (checkRunning || checkQueue.length > 1) {
+  // Telegram has strict rate limits and its channels are the slow ones, so they always go last:
+  // a repo or source check that joins the line goes ahead of any Telegram channel still waiting.
+  const tgFirst = job.isTelegram ? -1 : checkQueue.findIndex((c) => c.job.isTelegram);
+  if (tgFirst >= 0) checkQueue.splice(tgFirst, 0, { job, work }); else checkQueue.push({ job, work });
+  if (checkRunning || checkQueue.length > 1 || checkQueue[0].job !== job) {
     job.status = 'queued';
     job.waitingFor = [queueInfo(job).waitingFor].filter(Boolean); // for the reply that started it
   }
@@ -3131,6 +3135,7 @@ function tgSync(src, acc) {
   job.cancellable = true;
   job.title = `Checking ${src.name}`;
   job.srcId = src.id;
+  job.isTelegram = true;
   tgSyncing.set(src.id, job.id);
   return runCheck(job, async () => {
     const result = { added: 0, updated: 0, same: 0, older: 0, skipped: 0, failed: 0, removed: 0 };
@@ -3203,6 +3208,7 @@ function tgDeepScan(src, count, acc, { recheck = false, quick = true } = {}) {
   job.cancellable = true;
   job.title = `Scanning ${src.name}`;
   job.srcId = src.id;
+  job.isTelegram = true;
   tgSyncing.set(src.id, job.id);
   return runCheck(job, async () => {
     const result = { added: 0, updated: 0, same: 0, older: 0, skipped: 0, failed: 0, removed: 0, known: 0 };
@@ -3330,7 +3336,10 @@ route('POST', /^\/api\/telegram\/channels$/, async (req, res, m, acc) => {
 // Every hour, line up a check of every channel, GitHub repo and source (one at a time, see runCheck).
 function scheduleChecks(acc, { manual = false } = {}) {
   let n = 0;
-  for (const src of store.sources) {
+  // Repos and sources first, Telegram channels last (smallest channels first).
+  const tgApps = (src) => store.apps.filter((a) => a.remote && a.remote.sourceId === src.id).length;
+  const order = [...store.sources.filter((x) => x.kind !== 'telegram'), ...store.sources.filter((x) => x.kind === 'telegram').sort((a, b) => tgApps(a) - tgApps(b))];
+  for (const src of order) {
     if (checkFor(src.id)) continue;
     if (src.kind === 'telegram') {
       if (tgReady() && (manual || (src.options && src.options.autoSync !== false))) { tgSync(src, acc); n++; }
