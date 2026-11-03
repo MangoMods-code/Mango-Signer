@@ -2796,7 +2796,7 @@ async function tgMarkRemoved(src, job = null) {
   for (let i = 0; i < linked.length; i += 200) {
     const batch = linked.slice(i, i + 200);
     let exists;
-    try { ({ exists } = await tgTry(job, () => tg.exists(tgRef(src), batch.map((a) => a.remote.msgId)))); } catch { continue; }
+    try { ({ exists } = await tgTry(job, () => tg.exists(tgRef(src), batch.map((a) => a.remote.msgId)), src)); } catch { continue; }
     if (job) job.counter = { label: 'apps checked', done: Math.min(linked.length, i + 200), total: linked.length };
     const have = new Set(exists);
     for (const a of batch) {
@@ -2812,18 +2812,28 @@ const tgReady = () => !!(tgSettings() && tgSettings().sessionEnc);
 // How to point the helper at a channel. After the first lookup Mango keeps the channel's id + key, so it
 // never has to look the @username up again (Telegram only allows a few of those lookups a day, and
 // running out made every check sit and wait).
-const tgRef = (src) => (src && src.peer ? `peer:${src.peer}` : src && src.ref);
+// (The key is a 64-bit number: it's sent as text, because JSON numbers would round it and break it.)
+const tgRef = (src) => (src && src.peerKey ? `peer:${src.peerKey}` : src && src.ref);
+// 1.9.0 saved rounded keys (field "peer"), which Telegram rejects as "private". Drop them; they're looked up again.
+{ let fixed = 0; for (const src of store.sources) if (src.peer !== undefined) { delete src.peer; fixed++; } if (fixed) store.save(); }
 const tgRefFor = (remote) => { const src = store.sources.find((x) => x.id === remote.sourceId); return src ? tgRef(src) : remote.ref; };
 async function ensurePeer(src, job) {
-  if (src.peer) return;
+  if (src.peerKey) return;
   const ch = await tgTry(job, () => tg.channel(src.ref));
-  if (ch && ch.id && ch.access_hash != null) { src.peer = `${ch.id}:${ch.access_hash}`; store.save(); }
+  if (ch && ch.id && typeof ch.access_hash === 'string' && /^-?\d+$/.test(ch.access_hash)) { src.peerKey = `${ch.id}:${ch.access_hash}`; store.save(); }
 }
 // Runs a Telegram request, and if Telegram says "slow down, wait N seconds", says so in the log, waits,
 // and tries again (up to 3 times, and only for waits up to 10 minutes). Stop still works while waiting.
-async function tgTry(job, fn) {
+async function tgTry(job, fn, src = null) {
   for (let attempt = 0; ; attempt++) {
     try { return await fn(); } catch (e) {
+      // The saved channel key stopped working: forget it and go back to the @username once.
+      if (src && src.peerKey && (e.status === 403 || e.status === 404) && attempt === 0) {
+        delete src.peerKey;
+        store.save();
+        if (job) job.log.push('Looking the channel up again…');
+        continue;
+      }
       if (!e.wait || e.wait > 600 || attempt >= 3 || (job && job.cancelled)) {
         if (e.wait) throw new Error(`Telegram asked Mango to wait ${fmtWait(e.wait)} before asking again. It'll try again on the next check.`);
         throw e;
@@ -3130,7 +3140,7 @@ function tgSync(src, acc) {
       const first = !src.lastMsgId;
       job.log.push(first ? `Looking through ${src.name}'s recent posts…` : `Checking ${src.name} for new posts…`);
       await ensurePeer(src, job);
-      const { posts } = await tgTry(job, () => tg.posts(tgRef(src), src.lastMsgId || 0, first ? 400 : 200));
+      const { posts } = await tgTry(job, () => tg.posts(tgRef(src), src.lastMsgId || 0, first ? 400 : 200), src);
       const words = opts.keywords.split(',').map((w) => w.trim().toLowerCase()).filter(Boolean);
       let ipas = posts.filter((p) => p.file && /\.ipa$/i.test(p.file.name));
       if (words.length) ipas = ipas.filter((p) => words.some((w) => `${p.file.name}\n${p.text}`.toLowerCase().includes(w)));
@@ -3207,7 +3217,7 @@ function tgDeepScan(src, count, acc, { recheck = false, quick = true } = {}) {
       await ensurePeer(src, job);
       job.counter = { label: 'posts looked at', done: 0, total: null };
       while (found.length < want && !job.cancelled) {
-        const page = await tgTry(job, () => tg.posts(tgRef(src), 0, 200, offset));
+        const page = await tgTry(job, () => tg.posts(tgRef(src), 0, 200, offset), src);
         if (!page.scanned) break;
         looked += page.scanned;
         for (const p of page.posts) {
@@ -3309,7 +3319,7 @@ route('POST', /^\/api\/telegram\/channels$/, async (req, res, m, acc) => {
     id: id(), kind: 'telegram', ref, url: ch.username ? `https://t.me/${ch.username}` : '', name: ch.title, username: ch.username,
     showInLibrary: b.showInLibrary !== false, categoryId: ['__auto', '__none'].includes(b.categoryId) ? b.categoryId : b.categoryId && catExists(b.categoryId) ? b.categoryId : '__auto',
     options: cleanTgOptions(b.options), addedAt: new Date().toISOString(), lastMsgId: 0,
-    peer: ch.access_hash != null ? `${ch.id}:${ch.access_hash}` : undefined,
+    peerKey: typeof ch.access_hash === 'string' && /^-?\d+$/.test(ch.access_hash) ? `${ch.id}:${ch.access_hash}` : undefined,
   };
   store.sources.push(src);
   store.save();

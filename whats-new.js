@@ -3,6 +3,20 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.9.1',
+    date: '2026-11-02',
+    title: 'Channel Fix',
+    summary: 'Fixed Telegram channels wrongly showing as private.',
+    sections: [
+      {
+        title: '✈️ Telegram channels',
+        items: [
+          'Fixed channels showing "That channel is private" after the last update, even though they\'re public. New apps from them come in again on the next check.',
+        ],
+      },
+    ],
+  },
+  {
     version: '1.9.0',
     date: '2026-11-02',
     title: 'Faster Channel Checks',
