@@ -176,8 +176,14 @@ async def r_messages(q, body):
     return {"exists": [m.id for m in found if m and m.document]}
 
 
+async def r_wait(q, body):
+    """How long Telegram has asked us to pause file downloads (so Mango can show a countdown)."""
+    return {"wait": max(0, round(flood["until"] - time.time())), "busy": flood["streams"]}
+
+
 ROUTES = {
     ("GET", "/status"): r_status,
+    ("GET", "/wait"): r_wait,
     ("POST", "/login/start"): r_login_start,
     ("POST", "/login/code"): r_login_code,
     ("POST", "/login/password"): r_login_password,
@@ -225,6 +231,10 @@ def friendly(e):
 # Messages are cached for a few minutes: reading one app's info takes several small reads of the same file,
 # and fetching the post again for each one was slow. A stale file reference is refreshed automatically.
 msg_cache = {}
+# When Telegram says "slow down" for file downloads, every download pauses until then (asking again
+# during the pause only makes the wait longer). Mango reads this through /wait to show a countdown.
+flood = {"until": 0.0, "streams": 0}
+MAX_FILE_WAIT = int(os.environ.get("TG_MAX_FILE_WAIT", "900") or 900)
 
 
 async def get_post(ref, msg_id, fresh=False):
@@ -248,7 +258,7 @@ def piece_size(length):
     return size
 
 
-async def stream_file(writer, q, headers):
+async def stream_file(reader, writer, q, headers):
     ref = q.get("ref", [""])[0]
     msg_id = int(q.get("msg", ["0"])[0])
     msg = await get_post(ref, msg_id)
@@ -283,9 +293,9 @@ async def stream_file(writer, q, headers):
     ]
     if partial:
         head.append(f"Content-Range: bytes {start}-{end}/{size}")
-    writer.write(("\r\n".join(head) + "\r\n\r\n").encode())
-    await writer.drain()
     if not length:
+        writer.write(("\r\n".join(head) + "\r\n\r\n").encode())
+        await writer.drain()
         return
     piece = piece_size(length)
     aligned = start - (start % piece)
@@ -295,54 +305,84 @@ async def stream_file(writer, q, headers):
 
     async def fetch(doc, offset):
         """One piece of the file. Retries a couple of times on hiccups; waits out flood limits."""
-        for attempt in range(4):
+        attempt = 0
+        while True:
+            # Everyone waits out an active "slow down" instead of asking again (which makes it longer).
+            while time.time() < flood["until"]:
+                await asyncio.sleep(min(2, flood["until"] - time.time() + 0.05))
             try:
                 async for chunk in client.iter_download(doc, offset=offset, request_size=piece, chunk_size=piece, limit=1, file_size=size):
                     return chunk
                 return b""
             except errors.FloodWaitError as e:
-                await asyncio.sleep(min(60, e.seconds + 1))
-            except Exception as e:
-                if "FileReference" in type(e).__name__ or attempt == 3:
+                secs = int(getattr(e, "seconds", 30) or 30)
+                if secs > MAX_FILE_WAIT:
                     raise
-                await asyncio.sleep(0.5 * (attempt + 1))
-        raise RuntimeError("Telegram kept failing to send part of the file")
+                if time.time() + secs + 1 > flood["until"]:
+                    flood["until"] = time.time() + secs + 1
+                    print(f"FLOOD wait {secs}s on file download", file=sys.stderr, flush=True)
+            except Exception as e:
+                attempt += 1
+                print(f"TGFILE {type(e).__name__}: {str(e)[:200]}", file=sys.stderr, flush=True)
+                if "FileReference" in type(e).__name__ or attempt >= 4:
+                    raise
+                await asyncio.sleep(0.5 * attempt)
 
-    for attempt in range(2):
-        tasks = {}
-        try:
-            left = length
-            skip_now = skip
-            nxt = 0
-            for i in range(len(offsets)):
-                # Keep up to PARALLEL pieces on the way while we send the earlier ones in order.
-                while nxt < len(offsets) and nxt < i + PARALLEL:
-                    tasks[nxt] = asyncio.ensure_future(fetch(msg.document, offsets[nxt]))
-                    nxt += 1
-                chunk = await tasks.pop(i)
-                if i < len(offsets) - 1 and len(chunk) < piece:
-                    raise RuntimeError("Telegram sent a short piece")
-                if skip_now:
-                    chunk = chunk[skip_now:]
-                    skip_now = 0
-                if len(chunk) > left:
-                    chunk = chunk[:left]
-                writer.write(chunk)
-                sent_any = True
-                await writer.drain()
-                left -= len(chunk)
-                if left <= 0:
-                    break
-            break
-        except Exception as e:
-            # Old file reference: get the post again and retry, as long as nothing was sent yet.
-            if attempt == 0 and not sent_any and "FileReference" in type(e).__name__:
-                msg = await get_post(ref, msg_id, fresh=True)
-                continue
-            raise
-        finally:
-            for t in tasks.values():
-                t.cancel()
+    async def next_chunk(task):
+        """Waits for a piece, but gives up right away if Mango hung up (the sign was cancelled)."""
+        done, _ = await asyncio.wait({task, gone}, return_when=asyncio.FIRST_COMPLETED)
+        if task in done:
+            return task.result()
+        task.cancel()
+        raise ConnectionError("Mango stopped this download")
+
+    # Nothing more is sent by Mango after the request, so a finished read means it closed the connection.
+    gone = asyncio.ensure_future(reader.read(1))
+    flood["streams"] += 1
+    head_sent = False
+
+    try:
+        for attempt in range(2):
+            tasks = {}
+            try:
+                left = length
+                skip_now = skip
+                nxt = 0
+                for i in range(len(offsets)):
+                    # Keep up to PARALLEL pieces on the way while we send the earlier ones in order.
+                    while nxt < len(offsets) and nxt < i + PARALLEL:
+                        tasks[nxt] = asyncio.ensure_future(fetch(msg.document, offsets[nxt]))
+                        nxt += 1
+                    chunk = await next_chunk(tasks.pop(i))
+                    if i < len(offsets) - 1 and len(chunk) < piece:
+                        raise RuntimeError("Telegram sent a short piece")
+                    if skip_now:
+                        chunk = chunk[skip_now:]
+                        skip_now = 0
+                    if len(chunk) > left:
+                        chunk = chunk[:left]
+                    if not head_sent:
+                        writer.write(("\r\n".join(head) + "\r\n\r\n").encode())
+                        head_sent = True
+                    writer.write(chunk)
+                    sent_any = True
+                    await writer.drain()
+                    left -= len(chunk)
+                    if left <= 0:
+                        break
+                break
+            except Exception as e:
+                # Old file reference: get the post again and retry, as long as nothing was sent yet.
+                if attempt == 0 and not sent_any and "FileReference" in type(e).__name__:
+                    msg = await get_post(ref, msg_id, fresh=True)
+                    continue
+                raise
+            finally:
+                for t in tasks.values():
+                    t.cancel()
+    finally:
+        gone.cancel()
+        flood["streams"] -= 1
 
 
 # ---------- tiny HTTP server ----------
@@ -379,7 +419,7 @@ async def handle(reader, writer):
         q = parse_qs(u.query)
         try:
             if method == "GET" and u.path == "/file":
-                return await stream_file(writer, q, headers)
+                return await stream_file(reader, writer, q, headers)
             fn = ROUTES.get((method, u.path))
             if not fn:
                 return await send_json(writer, 404, {"error": "not found"})
