@@ -70,7 +70,7 @@ Only posts with an `.ipa` file attached are picked up (not links to file hosts).
 ## Notes
 - JIT can't be switched on from a website; signing with **JIT support** lets tools like StikDebug attach to the app.
 - Memory entitlements only work if the capability is enabled for your App ID in your Apple Developer account.
-- Sign in with iPhone uses an iOS profile service to read the device UDID. It's a convenience login for customers only: someone who knows an iPhone's UDID could pretend to be it, so the **owner account always signs in with the password**, and the owner can turn iPhone sign-in off for everyone in Settings.
+- Sign in with iPhone uses an iOS profile service to read the device UDID. The iPhone signs its answer with the certificate Apple gave it, and Mango checks that signature against Apple's root certificate (downloaded from apple.com once and kept on the volume), so knowing someone's UDID isn't enough to sign in as them. If the check can't be done, people are asked for their password instead. The **owner account always signs in with the password**, and the owner can turn iPhone sign-in off for everyone in Settings.
 - **Security:** sessions are signed, HttpOnly, SameSite cookies; passwords use scrypt; certificate passwords, the GitHub token and the Telegram login are encrypted (AES-256-GCM) and never sent to the browser; logins are rate-limited per network and locked after repeated wrong passwords (per account and network, so nobody can lock you out on purpose); the Telegram helper only listens on 127.0.0.1 with a random token; pages can't be framed by other sites. Keep backup zips private: they contain the key that decrypts your saved secrets.
 
 ## How it works

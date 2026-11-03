@@ -838,16 +838,62 @@ route('GET', /^\/udid\/profile\.mobileconfig$/, (req, res) => {
   });
 }, 'open');
 
+// ----- proving an iPhone really is that iPhone -----
+// When an iPhone answers the "read my device ID" profile, it signs the answer with a certificate Apple gave
+// that iPhone. Checking that signature against Apple's root certificate proves the answer came from a real
+// iPhone with that ID, not from someone who typed the ID in. Signing in with an iPhone needs this proof;
+// without it, people sign in with their password instead (nothing breaks).
+const APPLE_ROOT = process.env.APPLE_ROOT_PEM || path.join(DATA_DIR, 'apple-root-ca.pem');
+let appleRootLoading = null;
+async function appleRoot() {
+  if (fs.existsSync(APPLE_ROOT)) return APPLE_ROOT;
+  if (process.env.APPLE_ROOT_PEM) return null;
+  if (!appleRootLoading) {
+    appleRootLoading = (async () => {
+      try {
+        // Downloaded over HTTPS straight from Apple, once, then kept on the volume.
+        const r = await fetch('https://www.apple.com/appleca/AppleIncRootCertificate.cer', { signal: AbortSignal.timeout(20000) });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const der = Buffer.from(await r.arrayBuffer());
+        const pem = await run('openssl', ['x509', '-inform', 'DER', '-outform', 'PEM'], { input: der });
+        const text = pem.stdout.toString();
+        if (pem.code !== 0 || !text.includes('BEGIN CERTIFICATE')) throw new Error('not a certificate');
+        const subj = await run('openssl', ['x509', '-noout', '-subject'], { input: Buffer.from(text) });
+        if (!/Apple Root CA/.test(subj.stdout.toString())) throw new Error('not Apple Root CA');
+        await fsp.writeFile(APPLE_ROOT, text);
+        return APPLE_ROOT;
+      } catch (e) {
+        console.error("Couldn't get Apple's root certificate (iPhone sign-in will ask for passwords):", e.message);
+        return null;
+      } finally { appleRootLoading = null; }
+    })();
+  }
+  return appleRootLoading;
+}
+setTimeout(() => appleRoot().catch(() => {}), 10_000);
+// Returns the verified plist bytes, or null if the answer isn't signed by an Apple-issued iPhone certificate.
+async function verifiedDeviceAnswer(buf) {
+  const root = await appleRoot();
+  if (!root) return null;
+  const r = await run('openssl', ['cms', '-verify', '-inform', 'DER', '-CAfile', root, '-purpose', 'any', '-no_check_time'], { input: buf, timeout: 15000 });
+  if (r.code !== 0 || !r.stdout.length) return null;
+  return r.stdout;
+}
+
 route('POST', /^\/udid\/callback$/, async (req, res) => {
   const state = req.query.get('s') || '';
   const st = udidStates.get(state);
   const base = baseUrl(req);
   try {
     const buf = await readBody(req, 256 * 1024);
-    const start = buf.indexOf('<?xml');
-    const end = buf.indexOf('</plist>');
+    // Use the signed contents when the signature checks out; otherwise read it, but don't trust it for sign-in.
+    const verified = st ? await verifiedDeviceAnswer(buf).catch(() => null) : null;
+    const body = verified || buf;
+    const start = body.indexOf('<?xml');
+    const end = body.indexOf('</plist>');
     if (!st || start < 0 || end < 0) throw new Error('bad');
-    const data = plist.parse(buf.subarray(start, end + 8));
+    const data = plist.parse(body.subarray(start, end + 8));
+    st.verified = !!verified;
     if (data.CHALLENGE !== state || !/^[0-9A-Fa-f-]{20,48}$/.test(data.UDID || '')) throw new Error('bad');
     st.udid = data.UDID.toUpperCase();
     st.deviceName = data.DEVICE_NAME || data.PRODUCT || 'iPhone';
@@ -883,9 +929,9 @@ route('GET', /^\/udid\/done$/, (req, res) => {
     const acc = accountById(holder);
     udidStates.delete(state);
     if (!acc) return redirect(res, '/?udid=disabled');
-    // The iPhone's answer can't be fully verified here, so someone who knows an iPhone's ID could pretend to
-    // be it. That's an acceptable shortcut for customers, but never for the owner: the owner signs in with the password.
+    // Even with the Apple signature check, the owner account (which controls everything) only signs in with the password.
     if (holder === 'owner') { secEvent(req, 'login-udid', 'owner', false, 'iPhone sign-in is off for the owner'); store.save(); return redirect(res, '/?udid=ownerpw'); }
+    if (!st.verified) { secEvent(req, 'login-udid', acc.username, false, "couldn't prove it was the real iPhone"); store.save(); return redirect(res, '/?udid=verify'); }
     if (holder !== 'owner') findUser(holder).lastLogin = new Date().toISOString();
     secEvent(req, 'login-udid', acc.username, true, acc.deviceName ? `with ${acc.deviceName}` : 'with iPhone');
     store.save();

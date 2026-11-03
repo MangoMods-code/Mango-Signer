@@ -3,6 +3,21 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.9.6',
+    date: '2026-11-02',
+    title: 'Safer iPhone Sign-In',
+    summary: 'Signing in with your iPhone now checks that it\'s really your iPhone.',
+    sections: [
+      {
+        title: '🔒 Sign in with iPhone',
+        items: [
+          'Signing in with your iPhone now checks Apple\'s signature on your iPhone\'s answer, so it only works from the real iPhone. Someone who knows your device ID can\'t use it to get into your account.',
+          'If the check can\'t be done for some reason, you\'re asked to sign in with your username and password instead.',
+        ],
+      },
+    ],
+  },
+  {
     version: '1.9.5',
     date: '2026-11-02',
     title: 'Security Check-Up',
