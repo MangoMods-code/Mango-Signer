@@ -725,3 +725,11 @@ html[data-accent="red"] { --mango: #ff5c5c; --mango-2: #ff9b9b; --accent-2: #f03
 .dup-head .link-btn.inline { flex-shrink: 0; text-transform: none; letter-spacing: 0; font-weight: 600; color: var(--mango); }
 .dup-row.keeps { background: rgba(92, 196, 92, .07); }
 .ver-big { font-size: 17px; font-weight: 700; }
+/* Activity screen */
+.act-card { display: flex; flex-direction: column; gap: 10px; margin: 0 0 4px; }
+.act-card .card-actions { display: flex; gap: 8px; }
+.act-card .card-actions .btn { flex: 1; }
+.task-last { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; opacity: .85; }
+.task-pill.done { border-color: rgba(92, 196, 92, .45); }
+.pill-ok { width: 18px; text-align: center; color: var(--leaf); font-weight: 800; }
+.hint-card .mini-spin { width: 16px; height: 16px; border-width: 2.5px; }

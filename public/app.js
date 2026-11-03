@@ -1186,6 +1186,7 @@ function accountSection() {
         <select data-act="upload-speed">${UPLOAD_MODES.map((m) => `<option value="${m.streams}" ${m.streams === uploadStreams() ? 'selected' : ''}>${m.label}</option>`).join('')}</select></div>
       <button class="row" data-act="appearance"><span class="row-main" style="font-weight:600">🎨 Appearance</span><span class="value muted">${esc(themeLabel())} ›</span></button>
       <button class="row" data-act="tour"><span class="row-main" style="font-weight:600">👋 Show the welcome tour</span><span class="value muted">›</span></button>
+      <button class="row" data-act="tasks"><span class="row-main" style="font-weight:600">⏳ Activity</span><span class="value muted">${(() => { const n = (state.tasks || []).filter((j) => ['running', 'queued'].includes(j.status)).length; return n ? `<span style="color:var(--mango)">${n} going</span>` : ''; })()} ›</span></button>
       <button class="row" data-act="whats-new"><span class="row-main" style="font-weight:600">✨ What's New</span><span class="value muted">V${esc(CLIENT_VERSION || state.server.version || '')} ›</span></button>
       <div class="setting"><span>Username</span><span class="value">${esc(a.username)}</span></div>
       <div class="setting"><span>iPhone</span><span class="value">${a.udid ? `${esc(a.deviceName || 'iPhone')}<br><span class="mono">${esc(shortUdid(a.udid))}</span>` : 'Not linked'}</span></div>
@@ -1352,6 +1353,7 @@ function bindView(view) {
         invite: () => inviteSheet(idv),
         user: () => userSheet(idv),
         'whats-new': whatsNewSheet,
+        tasks: () => tasksSheet(),
         'copy-udid': () => copy(state.account.udid, 'UDID copied'),
         'unlink-device': unlinkDevice,
         'change-password': changePasswordSheet,
@@ -1493,6 +1495,7 @@ function sourceSheet(sid) {
   const missing = apps.filter((a) => a.missing).length;
   openSheet(`
     <div class="sheet-head">${iconHtml(src.iconURL || null, src.name, true)}<div class="row-main"><h2>${esc(src.name)}</h2><div class="row-sub">${src.kind === 'ghrepo' ? `GitHub · ${esc(src.repo.owner)}/${esc(src.repo.repo)}` : esc(src.subtitle || 'App source')}</div></div></div>
+    ${srcTaskHtml(src.id)}
     ${src.lastError ? `<p class="warning bad">Last refresh failed: ${esc(src.lastError)}</p>` : ''}
     <dl class="kv card" style="margin:0">
       <dt>Apps</dt><dd>${src.apps}${missing ? ` <span class="muted small">(+${missing} removed upstream)</span>` : ''}</dd>
@@ -1659,7 +1662,7 @@ function tgRunSheet(title, jobId, back) {
     const log = $('#trLog', body);
     log.textContent = j.log.join('\n'); log.scrollTop = log.scrollHeight;
     // Waiting in line behind another check.
-    if (j.status === 'queued') { $('#trTitle', body).textContent = 'Waiting its turn…'; $('#trSub', body).textContent = 'Only one channel, repo or source is checked at a time. This starts by itself when the one ahead finishes.'; }
+    if (j.status === 'queued') { $('#trTitle', body).textContent = 'Waiting its turn…'; $('#trSub', body).textContent = `${j.waitingFor ? `Starts after ${j.waitingFor}` : 'Starts in a moment'}${j.position > 1 ? ` · #${j.position} in line` : ''}. Only one channel, repo or source is checked at a time.`; }
     else if (j.status === 'running' && $('#trTitle', body).textContent === 'Waiting its turn…') { $('#trTitle', body).textContent = title; $('#trSub', body).textContent = 'This can take a while for big files'; }
     if (j.progress != null) { $('#trBar', body).classList.remove('hidden'); $('#trBar > div', body).style.width = `${Math.round(j.progress * 100)}%`; } else $('#trBar', body).classList.add('hidden');
   }).then(async (r) => {
@@ -1737,6 +1740,7 @@ function tgChannelSheet(sid) {
   const tcMissing = apps.filter((a) => a.missing).length;
   openSheet(`
     <div class="sheet-head"><span class="app-icon big tw-icon">✈️</span><div class="row-main"><h2>${esc(src.name)}</h2><div class="row-sub">${src.username ? '@' + esc(src.username) : 'Telegram channel'}</div></div></div>
+    ${srcTaskHtml(src.id)}
     ${src.lastError ? `<p class="warning bad">Last check failed: ${esc(src.lastError)}</p>` : ''}
     <dl class="kv card" style="margin:0">
       <dt>Apps</dt><dd>${src.apps}</dd>
@@ -2087,68 +2091,162 @@ function backupSheet() {
 }
 
 // ---------- background tasks ----------
-// Scans, imports and signing run on the server. This little ⏳ button shows what's still going,
-// so you can leave the app and check back later.
+// Scans, checks, imports and signing run on the server. The ⏳ pill shows what's going on, and the
+// Activity screen (from the pill or Settings) shows everything: running, waiting in line and just finished.
+const ACTIVE = ['running', 'queued'];
+const fmtDur = (ms) => { const sec = Math.max(0, Math.round(ms / 1000)); if (sec < 60) return `${sec}s`; const m = Math.floor(sec / 60); if (m < 60) return `${m}m`; return `${Math.floor(m / 60)}h ${m % 60}m`; };
+const resultLine = (r) => (r ? [r.added && `${r.added} new`, r.updated && `${r.updated} updated`, r.removed && `${r.removed} removed`, r.failed && `${r.failed} failed`].filter(Boolean).join(' · ') || 'Nothing new' : '');
 async function pollTasks(force) {
   clearTimeout(pollTasks.timer);
+  pollTasks.timer = null;
   if (!state.account) return;
+  if (pollTasks.busy) { pollTasks.timer = setTimeout(() => pollTasks(), 1500); return; }
+  pollTasks.busy = true;
+  const wasActive = (state.tasks || []).some((j) => ACTIVE.includes(j.status));
   try {
-    const { jobs } = await api('GET', '/api/jobs');
-    state.tasks = jobs;
-  } catch { /* offline: try again later */ }
+    const d = await api('GET', '/api/jobs');
+    state.tasks = d.jobs;
+    state.checks = d.checks;
+    pollTasks.fails = 0;
+  } catch { pollTasks.fails = (pollTasks.fails || 0) + 1; /* offline: keep what we had and try again */ } finally { pollTasks.busy = false; }
+  const active = (state.tasks || []).some((j) => ACTIVE.includes(j.status));
+  if (wasActive && !active) { pollTasks.doneAt = Date.now(); refresh().catch(() => {}); }
   drawTaskPill();
-  const active = (state.tasks || []).some((j) => ['running', 'queued'].includes(j.status));
-  // While a channel scan is adding apps, refresh the library now and then so new apps show up.
-  if (active && state.tasks.some((j) => /^(Scanning|Checking)/.test(j.title) && j.status === 'running') && $('#sheet').classList.contains('hidden') && Date.now() - (pollTasks.lastRefresh || 0) > 20000) {
+  // While a scan or check is adding apps, refresh the library now and then so new apps show up.
+  if (active && state.tasks.some((j) => j.isCheck && j.status === 'running') && $('#sheet').classList.contains('hidden') && Date.now() - (pollTasks.lastRefresh || 0) > 20000) {
     pollTasks.lastRefresh = Date.now();
     api('GET', '/api/state').then((d) => { Object.assign(state, d); render(); }).catch(() => {});
   }
-  pollTasks.timer = active || force ? setTimeout(() => pollTasks(), active ? 4000 : 15000) : null;
+  const sheetOpen = !!$('#sheetBody .tasks-list');
+  // Fast while something runs or the Activity screen is open; slow otherwise (to notice hourly checks).
+  const wait = active ? (sheetOpen ? 2500 : 4000) : sheetOpen || force ? 8000 : 60000;
+  pollTasks.timer = setTimeout(() => pollTasks(), Math.min(60000, wait * (1 + Math.min(4, pollTasks.fails || 0))));
 }
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && state.account) pollTasks(); });
 function drawTaskPill() {
   let pill = $('#taskPill');
   if (!pill) {
     pill = document.createElement('button');
     pill.id = 'taskPill';
     pill.className = 'task-pill hidden';
-    pill.onclick = tasksSheet;
+    pill.onclick = () => tasksSheet();
     document.body.appendChild(pill);
   }
-  const active = (state.tasks || []).filter((j) => ['running', 'queued'].includes(j.status));
-  pill.classList.toggle('hidden', !active.length);
-  if (!active.length) return;
-  const j = active[0];
-  const pct = j.progress != null ? ` ${Math.round(j.progress * 100)}%` : j.counter ? ` ${j.counter.done.toLocaleString()}${j.counter.total ? '/' + j.counter.total.toLocaleString() : ''}` : '';
-  pill.innerHTML = `<span class="mini-spin"></span><span>${esc(j.title)}${pct}${active.length > 1 ? ` · +${active.length - 1}` : ''}</span>`;
+  const active = (state.tasks || []).filter((j) => ACTIVE.includes(j.status));
+  const justDone = !active.length && pollTasks.doneAt && Date.now() - pollTasks.doneAt < 6000;
+  pill.classList.toggle('hidden', !active.length && !justDone);
+  pill.classList.toggle('done', !!justDone);
+  if (justDone) {
+    const last = (state.tasks || [])[0];
+    pill.innerHTML = `<span class="pill-ok">${last && last.status === 'error' ? '⚠️' : '✓'}</span><span>${last && last.status === 'error' ? `${esc(last.title)} failed` : 'All done'}</span>`;
+    clearTimeout(drawTaskPill.hide);
+    drawTaskPill.hide = setTimeout(drawTaskPill, 6100);
+  } else if (active.length) {
+    const j = active.find((x) => x.status === 'running') || active[0];
+    const pct = j.progress != null ? ` ${Math.round(j.progress * 100)}%` : j.counter ? ` ${j.counter.done.toLocaleString()}${j.counter.total ? '/' + j.counter.total.toLocaleString() : ''}` : '';
+    const waiting = active.filter((x) => x.status === 'queued').length;
+    pill.innerHTML = `<span class="mini-spin"></span><span>${esc(j.status === 'queued' ? `Waiting: ${j.title}` : j.title)}${pct}${waiting && j.status === 'running' ? ` · ${waiting} waiting` : active.length > 1 ? ` · +${active.length - 1}` : ''}</span>`;
+  }
   if ($('#sheetBody .tasks-list')) tasksSheet(true);
+}
+function taskRowHtml(j) {
+  const now = Date.now();
+  const badge = { running: 'Running', queued: j.position ? `Waiting · #${j.position}` : 'Waiting', done: 'Done', error: 'Failed', cancelled: 'Stopped' }[j.status] || j.status;
+  let sub = '';
+  if (j.status === 'running') sub = `${j.counter ? `${j.counter.done.toLocaleString()}${j.counter.total ? ' / ' + j.counter.total.toLocaleString() : ''} ${esc(j.counter.label)} · ` : ''}running ${fmtDur(now - j.started)}`;
+  else if (j.status === 'queued') sub = j.waitingFor ? `Starts after ${esc(j.waitingFor)}` : 'Starts in a moment';
+  else sub = `${j.status === 'done' && j.result ? esc(resultLine(j.result)) + ' · ' : ''}${j.endedAt ? `${fmtDur(now - j.endedAt)} ago` : ''}`;
+  return `<div class="row task-row" data-job="${j.id}">
+    <div class="row-main">
+      <div class="row-title">${esc(j.title)} <span class="badge ${j.status === 'done' ? 'good' : j.status === 'error' ? 'bad' : j.status === 'running' ? 'mango' : ''}">${badge}</span></div>
+      ${j.progress != null && j.status === 'running' ? `<div class="bar" style="margin:6px 0 2px"><div style="width:${Math.round(j.progress * 100)}%"></div></div>` : ''}
+      <div class="row-sub">${sub}</div>
+      ${j.status === 'error' && j.error ? `<div class="row-sub bad-text">${esc(j.error)}</div>` : j.status === 'running' && j.last ? `<div class="row-sub task-last">${esc(j.last)}</div>` : ''}
+    </div>
+    ${j.cancellable ? `<button class="pill danger-pill" data-stop="${j.id}">${j.status === 'queued' ? 'Cancel' : 'Stop'}</button>` : '<span class="value muted">›</span>'}
+  </div>`;
 }
 function tasksSheet(redraw) {
   const list = state.tasks || [];
+  const run = list.filter((j) => j.status === 'running');
+  const wait = list.filter((j) => j.status === 'queued');
+  const done = list.filter((j) => !ACTIVE.includes(j.status));
+  const c = state.checks;
+  const section = (title, items) => (items.length ? `<div class="section-title">${title} <span class="count">${items.length}</span></div><div class="list">${items.map(taskRowHtml).join('')}</div>` : '');
   const html = `
-    <h2>⏳ Running on your server</h2>
-    <p class="muted small" style="margin-top:-6px">These keep going even if you close the app.</p>
-    <div class="list tasks-list">${list.map((j) => `
-      <div class="row task-row">
-        <div class="row-main">
-          <div class="row-title">${esc(j.title)} <span class="badge ${j.status === 'done' ? 'good' : j.status === 'error' ? 'bad' : ''}">${{ running: 'Running', queued: 'Waiting', done: 'Done', error: 'Failed', cancelled: 'Stopped' }[j.status] || j.status}</span></div>
-          ${j.counter ? `<div class="row-sub">${j.counter.done.toLocaleString()}${j.counter.total ? ' / ' + j.counter.total.toLocaleString() : ''} ${esc(j.counter.label)}</div>` : ''}
-          ${j.progress != null && j.status === 'running' ? `<div class="bar" style="margin:6px 0 2px"><div style="width:${Math.round(j.progress * 100)}%"></div></div>` : ''}
-          <div class="row-sub">${esc(j.error || j.last || '')}</div>
-          <div class="row-sub muted small">started ${ago(new Date(j.started).toISOString())}</div>
-        </div>
-        ${j.cancellable && ['running', 'queued'].includes(j.status) ? `<button class="pill danger-pill" data-stop="${j.id}">${j.status === 'queued' ? 'Cancel' : 'Stop'}</button>` : ''}
-      </div>`).join('') || '<p class="hint">Nothing running right now.</p>'}</div>`;
-  if (redraw === true && $('#sheetBody .tasks-list')) { $('#sheetBody').innerHTML = html; bindTasks($('#sheetBody')); return; }
+    <h2>⏳ Activity</h2>
+    <p class="muted small" style="margin-top:-6px">Everything here runs on your server, so it keeps going even if you close the app. Tap one to see its full log.</p>
+    ${c ? `<div class="card act-card">
+      <div class="row-main"><div class="row-title">${c.running ? 'Checking for updates now' : 'Update checks'}</div>
+        <div class="row-sub">${c.sources} channel${c.sources === 1 ? '' : 's'}, repo${c.sources === 1 ? '' : 's'} &amp; source${c.sources === 1 ? '' : 's'} · one at a time · ${c.running || c.waiting ? `${c.waiting} waiting` : `next automatic check in ${fmtDur(Math.max(0, c.nextAuto - Date.now()))}`}</div></div>
+      <div class="card-actions"><button class="btn" id="actAll" ${c.sources ? '' : 'disabled'}>Check all now</button>${run.length + wait.length ? '<button class="btn danger" id="actStop">Stop all</button>' : ''}</div>
+    </div>` : ''}
+    <div class="tasks-list">
+      ${section('Running', run)}${section('Waiting in line', wait)}${section('Finished', done)}
+      ${list.length ? '' : '<div class="empty" style="padding:24px 10px"><h3>Nothing going on</h3><p>Checks, scans, imports and signing show up here while they run.</p></div>'}
+    </div>`;
+  if (redraw === true && $('#sheetBody .tasks-list')) {
+    const y = $('#sheetBody').scrollTop;
+    $('#sheetBody').innerHTML = html; bindTasks($('#sheetBody')); $('#sheetBody').scrollTop = y;
+    return;
+  }
   openSheet(html, bindTasks);
   pollTasks(true);
 }
 function bindTasks(el) {
   el.querySelectorAll('[data-stop]').forEach((b) => {
-    b.onclick = async () => {
-      b.disabled = true;
-      try { await api('POST', `/api/jobs/${b.dataset.stop}/cancel`); toast('Stopping…'); pollTasks(true); } catch (e) { toast(e.message, true); }
+    b.onclick = async (e) => {
+      e.stopPropagation();
+      b.disabled = true; b.textContent = '…';
+      try { await api('POST', `/api/jobs/${b.dataset.stop}/cancel`); toast('Stopping…'); } catch (err) { toast(err.message, true); }
+      pollTasks(true);
     };
   });
+  el.querySelectorAll('[data-job]').forEach((r) => { r.onclick = () => jobLogSheet(r.dataset.job); r.style.cursor = 'pointer'; });
+  if ($('#actAll', el)) $('#actAll', el).onclick = async (e) => {
+    e.currentTarget.disabled = true;
+    try { const { queued } = await api('POST', '/api/checks/run-all'); toast(queued ? `Lined up ${queued} check${queued === 1 ? '' : 's'}` : 'Everything is already being checked'); } catch (err) { toast(err.message, true); }
+    pollTasks(true);
+  };
+  if ($('#actStop', el)) $('#actStop', el).onclick = async () => {
+    if (!confirm('Stop everything that\'s running and cancel everything waiting? Apps already added are kept.')) return;
+    try { const { stopped } = await api('POST', '/api/jobs/cancel-all'); toast(`Stopped ${stopped}`); } catch (err) { toast(err.message, true); }
+    pollTasks(true);
+  };
+}
+// One task's full log, updating live while it runs.
+function jobLogSheet(jobId) {
+  const draw = (j) => {
+    const body = $('#sheetBody');
+    if (!body || !$('#jlLog', body)) return false;
+    $('#jlStatus', body).innerHTML = taskRowHtml({ ...((state.tasks || []).find((x) => x.id === jobId) || {}), ...j, id: jobId });
+    const log = $('#jlLog', body);
+    const atEnd = log.scrollTop + log.clientHeight >= log.scrollHeight - 30;
+    log.textContent = (j.log || []).join('\n') || 'No details yet.';
+    if (atEnd) log.scrollTop = log.scrollHeight;
+    bindTasks($('#jlStatus', body));
+    $('#jlStatus .task-row', body).onclick = null;
+    return true;
+  };
+  openSheet(`<h2>Details</h2><div id="jlStatus" class="list"></div><div class="log" id="jlLog" style="margin-top:12px">Loading…</div>
+    <button class="btn block" id="jlBack" style="margin-top:12px">Back to Activity</button>`, (el) => { $('#jlBack', el).onclick = () => tasksSheet(); });
+  const tick = async () => {
+    let j;
+    try { j = await api('GET', `/api/jobs/${jobId}`); } catch (e) {
+      if (e.status === 404) { const l = $('#jlLog'); if (l) l.textContent = 'This one is no longer on the server (it finished a while ago, or the server restarted).'; return; }
+      setTimeout(tick, 3000); return;
+    }
+    const t = (state.tasks || []).find((x) => x.id === jobId);
+    if (!draw({ ...(t || {}), ...j, title: (t && t.title) || j.title })) return;
+    if (ACTIVE.includes(j.status)) setTimeout(tick, document.visibilityState === 'visible' ? 1500 : 4000);
+  };
+  tick();
+}
+// A small "being checked" note for a channel or source page, so you can see it and jump to it.
+function srcTaskHtml(srcId) {
+  const j = (state.tasks || []).find((x) => x.srcId === srcId && ACTIVE.includes(x.status));
+  if (!j) return '';
+  return `<div class="hint-card" data-act="tasks" style="cursor:pointer"><span class="mini-spin"></span><span>${j.status === 'queued' ? `Waiting in line${j.waitingFor ? ` behind ${esc(j.waitingFor)}` : ''}` : `${esc(j.title)}${j.counter ? ` · ${j.counter.done.toLocaleString()} ${esc(j.counter.label)}` : ''}`}</span><span class="value muted">View ›</span></div>`;
 }
 
 // ---------- tweaks library ----------
