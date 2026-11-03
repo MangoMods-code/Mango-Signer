@@ -3,6 +3,20 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.12.0',
+    date: '2026-11-03',
+    title: 'Better Sorted Library',
+    summary: 'More apps now sit in the right category, so they are easier to find.',
+    sections: [
+      {
+        title: '📂 Library',
+        items: [
+          'Apps are sorted into categories much better now, so browsing Games, Emulators, Music & Video and the rest finds more of what you are after.',
+        ],
+      },
+    ],
+  },
+  {
     version: '1.11.2',
     date: '2026-11-03',
     title: 'Telegram Apps Sign Again',

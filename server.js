@@ -2785,14 +2785,20 @@ route('DELETE', /^\/api\/presets\/([a-f0-9]{16})$/, async (req, res, m, acc) => 
 });
 
 // ----- automatic categories -----
-// Your keyword rules win; otherwise the App Store's category is used (Games, Social Networking, …).
+// In order: your keyword rules; the App Store (by bundle ID); apps you already sorted that look the same
+// (same bundle ID, or the same name with "++", "Plus", versions… taken off); built-in words (emulator,
+// IPTV, VPN…); the App Store by name; and finally what most apps from the same source or channel are in.
 const AS_TTL = 30 * 864e5;
-async function appStoreInfo(app) {
+// opts.cachedOnly: only use what's saved (no waiting on Apple). opts.fresh: ask again about apps that weren't
+// found before. Throws { busy } when Apple says slow down, so a "try later" is never saved as "not found".
+async function appStoreInfo(app, opts = {}) {
   const key = (app.bundleId || '').toLowerCase() || 'name:' + String(app.originalName || app.name).toLowerCase();
   const cache = (store.data.appStoreCache = store.data.appStoreCache || {});
   const hit = cache[key];
-  if (hit && Date.now() - hit.at < (hit.data ? AS_TTL : 3 * 864e5)) return hit.data;
-  const data = await appstore.lookup({ bundleId: app.bundleId, name: app.originalName || app.name }).catch(() => null);
+  if (hit && hit.data && Date.now() - hit.at < AS_TTL) return hit.data;
+  if (hit && !hit.data && !opts.fresh && Date.now() - hit.at < 3 * 864e5) return null;
+  if (opts.cachedOnly) return hit && hit.data ? hit.data : undefined;
+  const data = await appstore.lookup({ bundleId: app.bundleId, name: app.originalName || app.name });
   cache[key] = { at: Date.now(), data };
   const keys = Object.keys(cache);
   if (keys.length > 3000) for (const k of keys.slice(0, keys.length - 3000)) delete cache[k];
@@ -2806,32 +2812,140 @@ function ruleCategory(text) {
   }
   return null;
 }
-async function autoCategory(app, extraText = '') {
-  const byRule = ruleCategory(`${app.name} ${app.originalName || ''} ${app.fileName || ''} ${extraText}`);
-  const info = await appStoreInfo(app);
-  if (byRule) return { categoryId: byRule, info, how: 'rule' };
-  if (info && info.genre) return { categoryId: categoryIdFor(info.genre), info, how: 'appstore' };
+
+// Words that give an app away, for apps the App Store doesn't know (mods, emulators, IPTV…).
+const CATEGORY_WORDS = [
+  ['Emulators', /\b(emulators?|emu|retroarch|ppsspp|provenance|melon ?ds|citra|lime3ds|azahar|dolphin(ios)?|flycast|mame|dosbox|gba4ios|nds4ios|gbc4ios|pcsx\w*|aethersx2|nethersx2|play!|folium|manic ?emu|sudachi|yuzu|ryujinx|mupen\w*|snes\w*|nes ?emu|ps1|psx|n64|nds|gba|gbc|3ds|psp)\b/i],
+  ['Music & Video', /\b(iptv|ott|movies?|films?|cinema|anime|cartoons?|netflix|youtube|yt ?music|spotify|soundcloud|deezer|tidal|music|radio|podcasts?|hbo|hulu|disney\+?|crunchyroll|twitch|plex|jellyfin|kodi|vlc|infuse|stremio|streaming|live ?tv|tv ?shows?|sports? ?tv|video ?player|media ?player)\b/i],
+  ['Social', /\b(instagram|insta|whatsapp|telegram|facebook|messenger|snapchat|tiktok|twitter|threads|reddit|discord|bereal|pinterest|tumblr|signal|wechat|viber|kik|tinder|bumble|hinge|grindr)\b/i],
+  ['Games', /\b(games?|minecraft|roblox|pubg|fortnite|brawl ?stars|clash|subway ?surfers|geometry ?dash|gta|grand theft|call of duty|among us|free ?fire|pokemon|pok[eé]mon|genshin|candy ?crush|8 ?ball|chess|solitaire|sudoku|racing|shooter|rpg)\b/i],
+  ['Utilities', /\b(vpn|proxy|adblock\w*|ad ?blocker|dns|ssh|terminal|torrent|downloader|file ?manager|filza|browser|keyboard|scanner|calculator|clipboard|shortcuts?|stikdebug|stik|jit|sidestore|altstore|esign|feather|ksign|gbox|scarlet|trollstore|appdb|livecontainer)\b/i],
+];
+// Your category for one of the names above: one you already have with that name, or a new one.
+function categoryNamed(name) {
+  const want = name.toLowerCase();
+  const mine = store.categories.find((c) => c.name.toLowerCase() === want)
+    || store.categories.find((c) => { const m = sources.categoryFor(c.name); return m && m.name.toLowerCase() === want; });
+  return mine ? mine.id : categoryIdFor(name);
+}
+
+// Lookalikes: built from apps that already have a category, rebuilt at most every few seconds.
+const SIMILAR_STOP = new Set(['the', 'app', 'apps', 'pro', 'free', 'lite', 'plus', 'super', 'mango', 'ios', 'iphone', 'ipad', 'mobile', 'my', 'new', 'best', 'mod', 'hack', 'tweaked', 'beta', 'premium', 'official']);
+function nameKey(n) {
+  return String(n || '').toLowerCase()
+    .replace(/[\[(].*?[\])]/g, ' ')
+    .replace(/\+\+|\+/g, ' ')
+    .replace(/\b(v?\d+(\.\d+)*|plus|pro|premium|lite|beta|tweaked|hack(ed|s)?|mod(ded)?|ipa|cracked|unlocked|no ads|ad ?free|by \w+)\b/g, ' ')
+    .replace(/[^a-z0-9]+/g, ' ').trim();
+}
+let similarIndex = null;
+function similarIdx() {
+  if (similarIndex && Date.now() - similarIndex.at < 5000) return similarIndex;
+  const byBundle = new Map(), byName = new Map(), byWord = new Map(), bySource = new Map();
+  const add = (m, k, app) => { if (!k) return; const e = m.get(k) || []; e.push(app); m.set(k, e); };
+  for (const a of store.apps) {
+    if (!a.categoryId || !catExists(a.categoryId)) continue;
+    add(byBundle, normBid(a.bundleId), a);
+    for (const n of new Set([nameKey(a.name), nameKey(a.originalName)])) {
+      add(byName, n, a);
+      const w = n.split(' ')[0];
+      if (w && w.length >= 4 && !SIMILAR_STOP.has(w)) add(byWord, w, a);
+    }
+    if (a.remote && a.remote.sourceId) add(bySource, a.remote.sourceId, a);
+  }
+  similarIndex = { at: Date.now(), byBundle, byName, byWord, bySource };
+  return similarIndex;
+}
+// One category every match agrees on (or none if they disagree).
+function agreed(list, self) {
+  const others = (list || []).filter((a) => a.id !== self.id);
+  if (!others.length) return null;
+  const cats = new Set(others.map((a) => a.categoryId));
+  return cats.size === 1 ? { categoryId: others[0].categoryId, like: others[0].name } : null;
+}
+function similarCategory(app) {
+  const idx = similarIdx();
+  const bid = normBid(app.bundleId);
+  const hit = (bid && agreed(idx.byBundle.get(bid), app));
+  if (hit) return hit;
+  for (const n of new Set([nameKey(app.name), nameKey(app.originalName)])) {
+    const h = n && agreed(idx.byName.get(n), app);
+    if (h) return h;
+  }
+  for (const n of new Set([nameKey(app.name), nameKey(app.originalName)])) {
+    const w = n.split(' ')[0];
+    const h = w && w.length >= 4 && !SIMILAR_STOP.has(w) && agreed(idx.byWord.get(w), app);
+    if (h) return h;
+  }
+  return null;
+}
+// Most apps from the same source or channel are in one category: probably this one too.
+function sourceCategory(app) {
+  const sid = app.remote && app.remote.sourceId;
+  const list = sid ? (similarIdx().bySource.get(sid) || []).filter((a) => a.id !== app.id) : [];
+  if (list.length < 3) return null;
+  const counts = new Map();
+  for (const a of list) counts.set(a.categoryId, (counts.get(a.categoryId) || 0) + 1);
+  const [cid, n] = [...counts.entries()].sort((x, y) => y[1] - x[1])[0];
+  return n / list.length >= 0.7 ? { categoryId: cid, share: Math.round((100 * n) / list.length) } : null;
+}
+const catName = (cid) => (store.categories.find((c) => c.id === cid) || {}).name || '?';
+const HOW_LABEL = { rule: 'your rule', appstore: 'App Store', similar: 'like', keyword: 'name', source: 'same source' };
+
+// opts.localOnly: no App Store lookups (instant guesses). opts.fresh: ask Apple again about "not found" apps.
+// opts.throwBusy: let "Apple says slow down" through so a batch can wait and retry.
+async function autoCategory(app, extraText = '', opts = {}) {
+  const text = `${app.name} ${app.originalName || ''} ${app.fileName || ''} ${extraText}`;
+  const byRule = ruleCategory(text);
+  let info = await appStoreInfo(app, { cachedOnly: true });
+  if (byRule) return { categoryId: byRule, info, how: 'rule', why: HOW_LABEL.rule };
+  if (info && info.genre && info.matchedBy === 'bundleId') return { categoryId: categoryIdFor(info.genre), info, how: 'appstore', why: `App Store: ${info.genre}` };
+  const sim = similarCategory(app);
+  if (sim) return { categoryId: sim.categoryId, info, how: 'similar', why: `like ${sim.like}` };
+  const name = `${app.name} ${app.originalName || ''} ${app.fileName || ''} ${app.bundleId || ''}`;
+  const word = CATEGORY_WORDS.find(([, re]) => re.test(name)) || CATEGORY_WORDS.find(([, re]) => re.test(String(extraText).slice(0, 400)));
+  if (word) return { categoryId: opts.localOnly ? (store.categories.find((c) => c.name.toLowerCase() === word[0].toLowerCase()) || {}).id || `new:${word[0]}` : categoryNamed(word[0]), info, how: 'keyword', why: `name says ${word[0]}` };
+  if (info === undefined && !opts.localOnly) {
+    try { info = await appStoreInfo(app, { fresh: opts.fresh }); } catch (e) { if (opts.throwBusy) throw e; info = null; }
+  }
+  if (info && info.genre) return { categoryId: opts.localOnly ? null : categoryIdFor(info.genre), info, how: 'appstore', why: `App Store: ${info.genre}`, genre: info.genre };
+  const src = sourceCategory(app);
+  if (src) return { categoryId: src.categoryId, info, how: 'source', why: `${src.share}% of its source` };
   return { categoryId: null, info, how: null };
 }
 
 route('POST', /^\/api\/apps\/auto-categorize$/, async (req, res, m, acc) => {
   const b = await readJson(req);
+  // "all": re-sort every app (except ones you put in a category yourself).
+  // Otherwise every app without a category, including ones you had moved to Uncategorized.
   const list = store.apps.filter((a) => (Array.isArray(b.ids) ? b.ids.includes(a.id) : true)
-    && (b.all || !a.categoryId || !store.categories.some((c) => c.id === a.categoryId))
-    && !(a.locked || []).includes('categoryId'));
+    && (b.all ? !(a.locked || []).includes('categoryId') : (!a.categoryId || !catExists(a.categoryId))));
   const job = newJob(acc);
+  job.title = `Sorting ${list.length} app${list.length === 1 ? '' : 's'}`;
+  job.cancellable = true;
   json(res, { jobId: job.id, count: list.length });
   (async () => {
-    const result = { sorted: 0, byRule: 0, byAppStore: 0, unknown: 0, filled: 0 };
+    const result = { sorted: 0, byRule: 0, byAppStore: 0, bySimilar: 0, byKeyword: 0, bySource: 0, unknown: 0, filled: 0 };
+    const started = Date.now();
     for (const [i, app] of list.entries()) {
+      if (job.cancelled) break;
       job.progress = list.length ? i / list.length : 1;
-      const r = await autoCategory(app, app.notes || '');
+      let r;
+      for (let tries = 0; ; tries++) {
+        try { r = await autoCategory(app, app.notes || '', { fresh: b.fresh !== false, throwBusy: tries < 4 }); break; } catch (e) {
+          if (!e.busy) throw e;
+          job.log.push(`⏳ The App Store asked Mango to slow down. Waiting a minute, then carrying on… (${i} of ${list.length} done)`);
+          await new Promise((x) => setTimeout(x, Number(process.env.ITUNES_BUSY_WAIT_MS || 60000)));
+          if (job.cancelled) break;
+        }
+      }
+      if (!r) break;
       if (r.categoryId && r.categoryId !== app.categoryId) {
         app.categoryId = r.categoryId;
         result.sorted++;
-        if (r.how === 'rule') result.byRule++; else result.byAppStore++;
-        job.log.push(`${app.name} → ${(store.categories.find((c) => c.id === r.categoryId) || {}).name}`);
-      } else if (!r.categoryId) { result.unknown++; job.log.push(`${app.name}: not found`); }
+        result[{ rule: 'byRule', appstore: 'byAppStore', similar: 'bySimilar', keyword: 'byKeyword', source: 'bySource' }[r.how]]++;
+        job.log.push(`${app.name} → ${catName(r.categoryId)} (${r.why})`);
+      } else if (!r.categoryId) { result.unknown++; job.log.push(`${app.name}: no idea`); }
       // Fill in blanks from the App Store while we're at it.
       if (r.info && b.fill !== false) {
         let filled = false;
@@ -2840,14 +2954,34 @@ route('POST', /^\/api\/apps\/auto-categorize$/, async (req, res, m, acc) => {
         if (app.remote && !(app.remote.screenshots || []).length && r.info.screenshots.length && !(app.screenshots || []).length) { app.remote.screenshots = r.info.screenshots; filled = true; }
         if (filled) result.filled++;
       }
-      if (i % 10 === 9) store.save();
-      if (r.info === undefined) await new Promise((x) => setTimeout(x, 50));
+      if (i % 10 === 9) {
+        store.save();
+        const left = Math.round(((Date.now() - started) / (i + 1)) * (list.length - i - 1) / 60000);
+        if (left >= 2) job.log.push(`About ${left} minutes left. You can close this, it keeps going.`);
+      }
     }
     store.save();
     job.progress = 1;
     job.result = result;
     job.status = 'done';
   })().catch((e) => { job.error = e.message; job.status = 'error'; });
+}, 'staff');
+
+// Instant best guesses for apps (no App Store waiting), for sorting by hand.
+route('POST', /^\/api\/apps\/category-guesses$/, async (req, res) => {
+  const b = await readJson(req);
+  const ids = Array.isArray(b.ids) ? b.ids.slice(0, 3000) : store.apps.filter((a) => !a.categoryId || !catExists(a.categoryId)).map((a) => a.id);
+  const guesses = {};
+  for (const aid of ids) {
+    const app = store.apps.find((a) => a.id === aid);
+    if (!app) continue;
+    const r = await autoCategory(app, app.notes || '', { localOnly: true });
+    let cid = r.categoryId, suggest = null;
+    if (cid && cid.startsWith('new:')) { suggest = cid.slice(4); cid = null; }
+    if (!cid && r.genre) { const m = sources.categoryFor(r.genre); suggest = m && m.name; cid = m && (store.categories.find((c) => c.name.toLowerCase() === m.name.toLowerCase()) || {}).id || null; if (cid) suggest = null; }
+    if (cid || suggest) guesses[aid] = { categoryId: cid || null, newCategory: suggest, why: r.why || '' };
+  }
+  json(res, { guesses });
 }, 'staff');
 
 // ----- your own newer versions of source apps -----
@@ -3237,7 +3371,7 @@ async function tgImportPost(src, post, job, preMeta) {
       if (r.info.description) { rec.description = r.info.description; rec.descFromCaption = false; }
       remote.screenshots = r.info.screenshots;
     }
-    if (r.categoryId) job.log.push(`  → ${(store.categories.find((c) => c.id === r.categoryId) || {}).name}${r.how === 'rule' ? ' (your rule)' : ' (App Store)'}`);
+    if (r.categoryId) job.log.push(`  → ${catName(r.categoryId)} (${r.why})`);
   }
   if (meta.icon) await fsp.writeFile(path.join(dirs.apps, rec.id + '.png'), meta.icon);
   store.apps.unshift(rec);

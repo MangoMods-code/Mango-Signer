@@ -8,6 +8,7 @@ Upload an `.ipa`, add a `.p12` + `.mobileprovision`, tap **Sign**, then **Instal
 ## Features
 - **App Library** – the owner uploads apps (or imports from a link); invited users browse, search, sign and install them
 - **Organization** – categories with emoji, featured apps, search, sorting, bulk select, full app editing, Update IPA, and default sign settings per app
+- **Sorting apps into categories** – ✨ Auto-sort uses your keyword rules, the App Store, apps you already sorted that look the same (YouTube++ goes where YouTube is), giveaway words in the name (emulator, IPTV, VPN…) and the category most apps from the same source are in. It paces App Store lookups so Apple doesn't refuse them, and keeps going on the server after you close it. Whatever's left, **Sort by hand** shows one app at a time with Mango's best guess on top
 - **Cloud Library** – app files don't have to sit on your Railway volume. Add apps from:
   - **AltStore / SideStore / ESign sources** (JSON source links)
   - **GitHub repos** – paste `github.com/owner/repo`; every release with an `.ipa` becomes a version and new releases show up as updates
@@ -30,7 +31,7 @@ Upload an `.ipa`, add a `.p12` + `.mobileprovision`, tap **Sign**, then **Instal
 - **Info.plist editing** – 120Hz ProMotion, Game Mode, full screen, plus any custom key (add, change or remove)
 - **Signing options** – change name, bundle ID, version, minimum iOS, icon; inject `.dylib` tweaks; remove extensions, Watch app or device limits; Files app sharing
 - **Install** – one-tap over-the-air install, shareable install pages, download signed `.ipa`
-- **Mango Signer iPhone app** – the native app ([Mango-Signer-iOS](https://github.com/MangoMods-code/Mango-Signer-iOS)) signs in to your server and shows the same library, certificates and signed apps. It can sign on the server, or download the original app (counts toward the daily sign limit, same as signing) and sign it right on the iPhone. Like ESign, it keeps a copy of every signed app on the iPhone and puts it back on the server when the server has cleaned it up, and it checks what's really installed to keep your installed apps list right
+- **Mango Signer iPhone app** – the native app ([Mango-Signer-iOS](https://github.com/MangoMods-code/Mango-Signer-iOS)) signs in to your server and shows the same library, certificates and signed apps. Owners and admins can edit library apps and sort apps without a category from the iPhone too. It can sign on the server, or download the original app (counts toward the daily sign limit, same as signing) and sign it right on the iPhone. Like ESign, it keeps a copy of every signed app on the iPhone and puts it back on the server when the server has cleaned it up, and it checks what's really installed to keep your installed apps list right
 - **Admins & testers** – the owner can make people admins (manage the library, users, invites, requests, stats; no sign limit, but never the server settings, GitHub, Telegram sign-in or backups) or testers (see apps marked "Testers only" in their own list, get beta versions first, no sign limit, send bug reports)
 - **User management** – reset passwords, turn accounts off, unlink iPhones, delete users, invite codes, hide apps from the library, signing queue
 
