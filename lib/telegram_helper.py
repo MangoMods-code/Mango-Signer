@@ -147,7 +147,7 @@ async def r_channel(q, body):
     e = await entity(q.get("ref", [""])[0])
     title = getattr(e, "title", None) or " ".join(x for x in [getattr(e, "first_name", None), getattr(e, "last_name", None)] if x)
     return {"id": e.id, "title": title or str(e.id), "username": getattr(e, "username", None),
-            "members": getattr(e, "participants_count", None), "access_hash": getattr(e, "access_hash", None)}
+            "members": getattr(e, "participants_count", None), "access_hash": str(e.access_hash) if getattr(e, "access_hash", None) is not None else None}
 
 
 async def r_posts(q, body):
