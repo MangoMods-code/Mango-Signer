@@ -3,6 +3,21 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.12.6',
+    date: '2026-11-03',
+    title: 'Cleaner Lists',
+    summary: 'Tags and sizes are easier to see.',
+    sections: [
+      {
+        title: '✨ Look',
+        items: [
+          'Signed apps show "On your phone", days left and ☁ Saved on their own line, so nothing gets cut off.',
+          'App sizes show in grid view too, and come before the developer name in list view.',
+        ],
+      },
+    ],
+  },
+  {
     version: '1.12.5',
     date: '2026-11-03',
     title: 'No Doubles',
