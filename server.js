@@ -568,6 +568,18 @@ function enqueueSign(job, work) {
 
 // ---------- views ----------
 const isOwner = (acc) => acc && acc.role === 'owner';
+// Roles you can give people (only the owner can): admins help run the library and users (never the server
+// settings, GitHub, Telegram or backups); testers see apps marked "Testers only" and beta versions first.
+const RANKS = ['admin', 'tester'];
+const isAdmin = (acc) => !!acc && acc.role === 'user' && acc.rank === 'admin';
+const isStaff = (acc) => isOwner(acc) || isAdmin(acc);
+const isTester = (acc) => !!acc && acc.role === 'user' && acc.rank === 'tester';
+const seesTesterApps = (acc) => isStaff(acc) || isTester(acc);
+const staffIds = () => ['owner', ...store.users.filter((u) => u.rank === 'admin' && !u.disabled).map((u) => u.id)];
+// Sends an alert to you and every admin.
+function alertStaff(kind, title, body, extra = {}, exceptId = null) {
+  for (const uid of staffIds()) if (uid !== exceptId) addAlert(uid, kind, title, body, extra);
+}
 const deviceInProfile = (profile, udid) => {
   if (profile.type === 'Enterprise') return true;
   if (!udid || !Array.isArray(profile.devices)) return null;
@@ -646,11 +658,14 @@ function appView(a, acc) {
     extra.cloud = remote.kind; // 'link' | 'source' | 'github'
     extra.sourceName = src ? src.name : null;
     extra.missing = !!remote.missing;
-    extra.versions = (remote.kind === 'source' ? mergedVersions(a) : remote.versions || []).map((v) => ({ version: v.version, date: v.date, size: v.size, notes: (v.notes || '').slice(0, 400), channel: v.channel, manualId: v.manualId || undefined }));
+    // vi is the version's real number for signing, so lists that skip some still sign the right one.
+    extra.versions = (remote.kind === 'source' ? mergedVersions(a) : remote.versions || []).map((v, vi) => ({ vi, version: v.version, date: v.date, size: v.size, notes: (v.notes || '').slice(0, 400), channel: v.channel, manualId: v.manualId || undefined }));
+    // Beta versions are early access: testers and staff see them, everyone else gets the rest.
+    if (!seesTesterApps(acc)) extra.versions = extra.versions.filter((v, i) => i === 0 || !/^(beta|alpha|pre)/i.test(String(v.channel || '')));
     extra.remoteScreens = remote.screenshots || [];
-    if (isOwner(acc)) extra.remoteUrl = remote.kind === 'github' ? null : remote.url;
+    if (isStaff(acc)) extra.remoteUrl = remote.kind === 'github' ? null : remote.url;
   }
-  if (isOwner(acc)) return { ...base, ...extra };
+  if (isStaff(acc)) return { ...base, ...extra };
   const { fileName, source, ...rest } = base;
   return { ...rest, ...extra };
 }
@@ -671,7 +686,7 @@ function signedView(s, req) {
 }
 function userView(u) {
   return {
-    id: u.id, username: u.username, udid: u.udid || null, deviceName: u.deviceName || null,
+    id: u.id, username: u.username, rank: u.rank || null, udid: u.udid || null, deviceName: u.deviceName || null,
     createdAt: u.createdAt, lastLogin: u.lastLogin || null, disabled: !!u.disabled, invite: u.invite || null,
     certCount: store.certs.filter((c) => c.ownerId === u.id).length,
     signedCount: store.signed.filter((s) => s.ownerId === u.id).length,
@@ -680,7 +695,7 @@ function userView(u) {
   };
 }
 function accountView(acc) {
-  return { id: acc.id, username: acc.username, role: acc.role, udid: acc.udid || null, deviceName: acc.deviceName || null };
+  return { id: acc.id, username: acc.username, role: acc.role, rank: acc.role === 'owner' ? null : acc.rank || null, udid: acc.udid || null, deviceName: acc.deviceName || null };
 }
 function defaultCertId(acc) {
   if (isOwner(acc)) return store.settings.defaultCertId;
@@ -693,7 +708,12 @@ function setDefaultCert(acc, certId) {
 }
 const myCerts = (acc) => store.certs.filter((c) => c.ownerId === acc.id);
 const mySigned = (acc) => store.signed.filter((s) => s.ownerId === acc.id);
-const visibleApps = (acc) => (isOwner(acc) ? store.apps : store.apps.filter((a) => a.published && !(a.remote && a.remote.missing)));
+const visibleApps = (acc) => {
+  if (isStaff(acc)) return store.apps;
+  const tester = isTester(acc);
+  // "Testers only" apps show for testers (even while hidden from everyone else).
+  return store.apps.filter((a) => !(a.remote && a.remote.missing) && (a.testersOnly ? tester : a.published));
+};
 
 // ---------- routing ----------
 // access: 'open' (anyone), 'user' (any logged-in account), 'owner'
@@ -1049,8 +1069,9 @@ route('GET', /^\/api\/state$/, async (req, res, m, acc) => {
     categories: sortedCategories(),
     certs: myCerts(acc).map((c) => certView(c, acc)),
     signed: mySigned(acc).map((s) => signedView(s, req)),
-    collections: sortedCollections().filter((c) => isOwner(acc) || c.appIds.some((aid) => visibleApps(acc).some((a) => a.id === aid))),
-    requests: (isOwner(acc) ? store.requests : store.requests.filter((r) => r.ownerId === acc.id)).slice(-200).reverse(),
+    collections: sortedCollections().filter((c) => isStaff(acc) || c.appIds.some((aid) => visibleApps(acc).some((a) => a.id === aid))),
+    requests: (isStaff(acc) ? store.requests : store.requests.filter((r) => r.ownerId === acc.id)).slice(-200).reverse(),
+    bugs: (isStaff(acc) ? store.data.bugs : store.data.bugs.filter((b) => b.ownerId === acc.id)).slice(-200).reverse(),
     installs: store.installLog.filter((l) => l.ownerId === acc.id).slice(-60).reverse(),
     tweaks: visibleTweaks(acc).map((t) => tweakView(t, acc)),
     alerts: store.alerts.filter((a) => a.ownerId === acc.id).slice(-60).reverse().map(alertView),
@@ -1073,13 +1094,23 @@ route('GET', /^\/api\/state$/, async (req, res, m, acc) => {
     out.server = { ...out.server, zsign: zsignVersion, passwordSet: !!APP_PASSWORD, storage: await storageUsed(), storageBreakdown: await storageBreakdown(), disk: diskInfo() };
   } else {
     out.settings = { maxSignedPerUser: store.settings.maxSignedPerUser, signedRetentionDays: store.settings.signedRetentionDays, signedOnGithub: signedToGithubOn(), signsPerDay: signLimitFor(acc), signsToday: signsToday(acc.id) };
+    if (isAdmin(acc)) {
+      // Admins help with the library and users, but never see the server's settings, GitHub or Telegram logins.
+      out.settings.everyoneSignsPerDay = Number(store.settings.signsPerDay) || 0;
+      out.users = store.users.map(userView);
+      out.invites = store.invites;
+      out.sources = store.sources.map(sourceView);
+      out.github = { connected: ghView().connected };
+      out.telegram = { connected: tgView().connected };
+      out.securityLog = store.securityLog.slice(-200).reverse();
+    }
   }
   json(res, out);
 });
 
 // ----- uploads -----
 route('POST', /^\/api\/upload$/, async (req, res, m, acc) => {
-  const limit = isOwner(acc) ? MAX_UPLOAD : MAX_USER_UPLOAD;
+  const limit = isStaff(acc) ? MAX_UPLOAD : MAX_USER_UPLOAD;
   const uid = id();
   const dest = path.join(dirs.tmp, uid);
   let size = 0;
@@ -1106,7 +1137,7 @@ route('POST', /^\/api\/upload$/, async (req, res, m, acc) => {
 route('POST', /^\/api\/upload\/start$/, async (req, res, m, acc) => {
   const { size, chunkSize } = await readJson(req);
   const total = Number(size);
-  const limit = isOwner(acc) ? MAX_UPLOAD : MAX_USER_UPLOAD;
+  const limit = isStaff(acc) ? MAX_UPLOAD : MAX_USER_UPLOAD;
   if (!Number.isFinite(total) || total <= 0) return fail(res, 400, 'Empty file');
   if (total > limit) return fail(res, 413, 'File is too large');
   const disk = diskInfo();
@@ -1274,7 +1305,7 @@ route('POST', /^\/api\/apps$/, async (req, res, m, acc) => {
   }
   job.result = { app: appView(rec, acc) };
   job.status = 'done';
-}, 'owner');
+}, 'staff');
 
 route('POST', /^\/api\/apps\/import$/, async (req, res, m, acc) => {
   const { url } = await readJson(req);
@@ -1295,7 +1326,7 @@ route('POST', /^\/api\/apps\/import$/, async (req, res, m, acc) => {
       job.status = 'error';
     }
   })();
-}, 'owner');
+}, 'staff');
 
 route('POST', /^\/api\/apps\/([a-f0-9]{16})\/replace$/, async (req, res, m, acc) => {
   const app = store.apps.find((a) => a.id === m[1]);
@@ -1356,7 +1387,7 @@ route('POST', /^\/api\/apps\/([a-f0-9]{16})\/replace$/, async (req, res, m, acc)
       job.status = 'error';
     }
   })();
-}, 'owner');
+}, 'staff');
 
 function cleanSignDefaults(d) {
   if (!d || typeof d !== 'object') return {};
@@ -1387,6 +1418,7 @@ route('PATCH', /^\/api\/apps\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
   if (typeof b.developer === 'string') app.developer = b.developer.trim().slice(0, 80);
   if (typeof b.published === 'boolean') app.published = b.published;
   if (typeof b.featured === 'boolean') app.featured = b.featured;
+  if (typeof b.testersOnly === 'boolean') app.testersOnly = b.testersOnly;
   if (typeof b.useIconWhenSigning === 'boolean') app.useIconWhenSigning = b.useIconWhenSigning;
   if (b.versionOverride !== undefined) {
     const v = String(b.versionOverride || '').trim();
@@ -1422,7 +1454,7 @@ route('PATCH', /^\/api\/apps\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
   app.updatedAt = new Date().toISOString();
   store.save();
   json(res, { app: appView(app, acc) });
-}, 'owner');
+}, 'staff');
 
 async function deleteApp(appId, { keepRemote = false, exclude = false } = {}) {
   const i = store.apps.findIndex((a) => a.id === appId);
@@ -1449,7 +1481,7 @@ route('DELETE', /^\/api\/apps\/([a-f0-9]{16})$/, async (req, res, m) => {
   if (!(await deleteApp(m[1], { exclude: true }))) return fail(res, 404, 'App not found');
   store.save();
   json(res, { ok: true });
-}, 'owner');
+}, 'staff');
 
 route('POST', /^\/api\/apps\/bulk$/, async (req, res) => {
   const { ids = [], action, categoryId = null } = await readJson(req);
@@ -1467,7 +1499,7 @@ route('POST', /^\/api\/apps\/bulk$/, async (req, res) => {
   }
   store.save();
   json(res, { ok: true, count: apps.length });
-}, 'owner');
+}, 'staff');
 
 // Cleans up duplicates in one go: for every bundle ID in the library more than once, keeps one copy and
 // deletes the rest. Which one stays: copies from the place you pick (if it has one), otherwise the newest
@@ -1500,7 +1532,7 @@ route('POST', /^\/api\/apps\/dedupe$/, async (req, res) => {
   }
   store.save();
   json(res, { ok: true, groups: groups.length, deleted });
-}, 'owner');
+}, 'staff');
 
 // Deletes every app marked "Removed from source" (optionally just one source's).
 // Telegram channels are re-checked first, so only apps whose post is really gone are deleted.
@@ -1515,7 +1547,7 @@ route('POST', /^\/api\/apps\/delete-removed$/, async (req, res) => {
   for (const id of gone) await deleteApp(id);
   store.save();
   json(res, { ok: true, count: gone.length });
-}, 'owner');
+}, 'staff');
 
 route('GET', /^\/api\/apps\/([a-f0-9]{16})\/icon$/, (req, res, m, acc) => {
   const app = visibleApps(acc).find((a) => a.id === m[1]);
@@ -1545,7 +1577,7 @@ route('GET', /^\/api\/apps\/([a-f0-9]{16})\/download$/, async (req, res, m) => {
     return pipeline(Readable.fromWeb(r.body), res).catch(() => {});
   }
   return serveFile(req, res, path.join(dirs.apps, m[1] + '.ipa'), { download: `${app.name} ${app.version}.ipa` });
-}, 'owner');
+}, 'staff');
 
 // ----- cloud library: link-only apps, sources and GitHub storage -----
 // Link-only apps keep just a download link (and a small icon). The .ipa is fetched only while signing.
@@ -1703,7 +1735,7 @@ route('POST', /^\/api\/apps\/link$/, async (req, res, m, acc) => {
       job.status = 'error';
     }
   })();
-}, 'owner');
+}, 'staff');
 
 // ----- sources -----
 async function fetchJson(url) {
@@ -2011,7 +2043,7 @@ route('POST', /^\/api\/sources$/, async (req, res, m, acc) => {
   store.save();
   const job = sourceCheck(src, acc);
   json(res, { source: sourceView(src), jobId: job.id, waitingFor: job.waitingFor || null });
-}, 'owner');
+}, 'staff');
 
 route('POST', /^\/api\/sources\/([a-f0-9]{16})\/sync$/, async (req, res, m, acc) => {
   const src = store.sources.find((x) => x.id === m[1]);
@@ -2024,7 +2056,7 @@ route('POST', /^\/api\/sources\/([a-f0-9]{16})\/sync$/, async (req, res, m, acc)
   }
   const job = sourceCheck(src, acc);
   json(res, { jobId: job.id, waitingFor: job.status === 'queued' ? job.waitingFor : null, source: sourceView(src) });
-}, 'owner');
+}, 'staff');
 
 // Checks an AltStore-style source or a GitHub repo, in the same one-at-a-time line as Telegram.
 function sourceCheck(src, acc) {
@@ -2071,7 +2103,7 @@ route('PATCH', /^\/api\/sources\/([a-f0-9]{16})$/, async (req, res, m) => {
   }
   store.save();
   json(res, { source: sourceView(src) });
-}, 'owner');
+}, 'staff');
 
 // Bring back an app you deleted from a source: it's added again on the next refresh (started right away).
 route('POST', /^\/api\/sources\/([a-f0-9]{16})\/restore$/, async (req, res, m, acc) => {
@@ -2087,7 +2119,7 @@ route('POST', /^\/api\/sources\/([a-f0-9]{16})\/restore$/, async (req, res, m, a
   }
   try { await syncSource(src); } catch (e) { src.lastError = e.message; store.save(); }
   json(res, { ok: true, restored: gone.name, source: sourceView(src) });
-}, 'owner');
+}, 'staff');
 
 route('DELETE', /^\/api\/sources\/([a-f0-9]{16})$/, async (req, res, m) => {
   const i = store.sources.findIndex((x) => x.id === m[1]);
@@ -2096,7 +2128,7 @@ route('DELETE', /^\/api\/sources\/([a-f0-9]{16})$/, async (req, res, m) => {
   store.sources.splice(i, 1);
   store.save();
   json(res, { ok: true });
-}, 'owner');
+}, 'staff');
 
 // Sources are checked every hour by scheduleChecks (with Telegram channels, one at a time).
 
@@ -2256,7 +2288,7 @@ function countSign(uid, appId) {
 }
 // 0 = no limit. A per-user limit (set on their page) wins over the everyone limit.
 function signLimitFor(acc) {
-  if (isOwner(acc)) return 0;
+  if (isOwner(acc) || isAdmin(acc) || isTester(acc)) return 0; // no daily limit for you, admins and testers
   const u = findUser(acc.id);
   if (u && u.signLimit !== null && u.signLimit !== undefined) return u.signLimit;
   return Number(store.settings.signsPerDay) || 0;
@@ -2429,7 +2461,7 @@ route('GET', /^\/api\/stats$/, (req, res) => {
     },
     activity,
   });
-}, 'owner');
+}, 'staff');
 
 route('POST', /^\/api\/broadcast$/, async (req, res) => {
   const b = await readJson(req);
@@ -2511,9 +2543,9 @@ function tweakView(t, acc) {
     files: t.files.map((f) => ({ name: f.name, size: f.size, needsSubstrate: f.needsSubstrate, missing: f.missing })),
     warnings: t.warnings || [], addedAt: t.addedAt, published: t.published !== false,
   };
-  return isOwner(acc) ? base : { ...base, package: undefined };
+  return isStaff(acc) ? base : { ...base, package: undefined };
 }
-const visibleTweaks = (acc) => store.tweaks.filter((t) => isOwner(acc) || t.published !== false);
+const visibleTweaks = (acc) => store.tweaks.filter((t) => isStaff(acc) || t.published !== false);
 
 function tweakWarnings(files, extra = {}) {
   const w = [];
@@ -2585,7 +2617,7 @@ route('POST', /^\/api\/tweaks$/, async (req, res, m, acc) => {
     await rmQuiet(file);
     await fsp.rm(work, { recursive: true, force: true });
   }
-}, 'owner');
+}, 'staff');
 
 route('PATCH', /^\/api\/tweaks\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
   const t = store.tweaks.find((x) => x.id === m[1]);
@@ -2596,7 +2628,7 @@ route('PATCH', /^\/api\/tweaks\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
   if (typeof b.published === 'boolean') t.published = b.published;
   store.save();
   json(res, { tweak: tweakView(t, acc) });
-}, 'owner');
+}, 'staff');
 
 route('DELETE', /^\/api\/tweaks\/([a-f0-9]{16})$/, async (req, res, m) => {
   const i = store.tweaks.findIndex((x) => x.id === m[1]);
@@ -2607,7 +2639,7 @@ route('DELETE', /^\/api\/tweaks\/([a-f0-9]{16})$/, async (req, res, m) => {
   store.save();
   await fsp.rm(path.join(dirs.tweaks, m[1]), { recursive: true, force: true });
   json(res, { ok: true });
-}, 'owner');
+}, 'staff');
 
 const FRAMEWORK_PLIST = () => plist.build({
   CFBundleDevelopmentRegion: 'en', CFBundleExecutable: 'CydiaSubstrate', CFBundleIdentifier: 'com.saurik.substrate',
@@ -2679,7 +2711,7 @@ route('PUT', /^\/api\/substrate$/, async (req, res, m, acc) => {
     await rmQuiet(file);
     await fsp.rm(work, { recursive: true, force: true });
   }
-}, 'owner');
+}, 'staff');
 
 route('DELETE', /^\/api\/substrate$/, async (req, res) => {
   await fsp.rm(path.dirname(SUBSTRATE_DIR()), { recursive: true, force: true });
@@ -2687,7 +2719,7 @@ route('DELETE', /^\/api\/substrate$/, async (req, res) => {
   for (const t of store.tweaks) t.warnings = tweakWarnings(t.files, t.extra);
   store.save();
   json(res, { substrate: substrateView() });
-}, 'owner');
+}, 'staff');
 
 // ----- presets (saved sign settings, per account) -----
 function cleanPresetOptions(o = {}) {
@@ -2787,7 +2819,7 @@ route('POST', /^\/api\/apps\/auto-categorize$/, async (req, res, m, acc) => {
     job.result = result;
     job.status = 'done';
   })().catch((e) => { job.error = e.message; job.status = 'error'; });
-}, 'owner');
+}, 'staff');
 
 // ----- your own newer versions of source apps -----
 // "Add a newer version" on a source app: your file goes to GitHub storage (or stays a link), becomes the
@@ -2911,7 +2943,7 @@ route('POST', /^\/api\/apps\/([a-f0-9]{16})\/versions$/, async (req, res, m, acc
       if (tmp) await rmQuiet(tmp);
     }
   })();
-}, 'owner');
+}, 'staff');
 
 route('DELETE', /^\/api\/apps\/([a-f0-9]{16})\/versions\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
   const app = store.apps.find((a) => a.id === m[1]);
@@ -2925,7 +2957,7 @@ route('DELETE', /^\/api\/apps\/([a-f0-9]{16})\/versions\/([a-f0-9]{16})$/, async
   if (app.version !== before) { app.previousVersion = null; app.updatedAt = new Date().toISOString(); }
   store.save();
   json(res, { app: appView(app, acc) });
-}, 'owner');
+}, 'staff');
 
 // ----- Telegram channels -----
 // Mango signs in to Telegram as you (through lib/telegram_helper.py) and watches channels for new .ipa posts.
@@ -3457,7 +3489,7 @@ route('POST', /^\/api\/sources\/([a-f0-9]{16})\/scan$/, async (req, res, m, acc)
   const { count, recheck, quick } = await readJson(req);
   const job = tgDeepScan(src, Math.max(0, Math.min(1e6, Number(count) || 0)), acc, { recheck: !!recheck, quick: quick !== false });
   json(res, { jobId: job.id, waitingFor: job.waitingFor || null });
-}, 'owner');
+}, 'staff');
 
 route('POST', /^\/api\/telegram\/channels$/, async (req, res, m, acc) => {
   if (!tgReady()) return fail(res, 400, 'Connect Telegram first');
@@ -3476,7 +3508,7 @@ route('POST', /^\/api\/telegram\/channels$/, async (req, res, m, acc) => {
   store.save();
   const job = tgSync(src, acc);
   json(res, { source: sourceView(src), jobId: job.id, waitingFor: job.status === 'queued' ? job.waitingFor : null });
-}, 'owner');
+}, 'staff');
 
 // Every hour, line up a check of every channel, GitHub repo and source (one at a time, see runCheck).
 function scheduleChecks(acc, { manual = false } = {}) {
@@ -3521,7 +3553,7 @@ route('POST', /^\/api\/apps\/([a-f0-9]{16})\/screenshots$/, async (req, res, m, 
   app.screenshots = [...(app.screenshots || []), { id: sid, ext: kind.ext }];
   store.save();
   json(res, { app: appView(app, acc) });
-}, 'owner');
+}, 'staff');
 
 route('DELETE', /^\/api\/apps\/([a-f0-9]{16})\/screenshots\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
   const app = store.apps.find((a) => a.id === m[1]);
@@ -3531,7 +3563,7 @@ route('DELETE', /^\/api\/apps\/([a-f0-9]{16})\/screenshots\/([a-f0-9]{16})$/, as
   await rmQuiet(path.join(dirs.apps, app.id + '-shots', `${shot.id}.${shot.ext}`));
   store.save();
   json(res, { app: appView(app, acc) });
-}, 'owner');
+}, 'staff');
 
 route('POST', /^\/api\/apps\/([a-f0-9]{16})\/screenshots\/order$/, async (req, res, m, acc) => {
   const app = store.apps.find((a) => a.id === m[1]);
@@ -3540,7 +3572,7 @@ route('POST', /^\/api\/apps\/([a-f0-9]{16})\/screenshots\/order$/, async (req, r
   app.screenshots = [...(app.screenshots || [])].sort((x, y) => ids.indexOf(x.id) - ids.indexOf(y.id));
   store.save();
   json(res, { app: appView(app, acc) });
-}, 'owner');
+}, 'staff');
 
 route('GET', /^\/api\/apps\/([a-f0-9]{16})\/screenshots\/([a-f0-9]{16})$/, (req, res, m, acc) => {
   const app = visibleApps(acc).find((a) => a.id === m[1]);
@@ -3577,7 +3609,7 @@ route('POST', /^\/api\/collections$/, async (req, res) => {
   store.collections.push(c);
   store.save();
   json(res, { collection: c });
-}, 'owner');
+}, 'staff');
 route('PATCH', /^\/api\/collections\/([a-f0-9]{16})$/, async (req, res, m) => {
   const c = store.collections.find((x) => x.id === m[1]);
   if (!c) return fail(res, 404, 'Collection not found');
@@ -3585,7 +3617,7 @@ route('PATCH', /^\/api\/collections\/([a-f0-9]{16})$/, async (req, res, m) => {
   if (!c.name) c.name = 'Collection';
   store.save();
   json(res, { collection: c });
-}, 'owner');
+}, 'staff');
 route('DELETE', /^\/api\/collections\/([a-f0-9]{16})$/, (req, res, m) => {
   const i = store.collections.findIndex((x) => x.id === m[1]);
   if (i < 0) return fail(res, 404, 'Collection not found');
@@ -3593,7 +3625,7 @@ route('DELETE', /^\/api\/collections\/([a-f0-9]{16})$/, (req, res, m) => {
   sortedCollections().forEach((c, n) => { c.order = n; });
   store.save();
   json(res, { ok: true });
-}, 'owner');
+}, 'staff');
 
 // ----- app requests -----
 route('POST', /^\/api\/requests$/, async (req, res, m, acc) => {
@@ -3601,7 +3633,7 @@ route('POST', /^\/api\/requests$/, async (req, res, m, acc) => {
   const name = String(b.name || '').trim().slice(0, 80);
   if (!name) return fail(res, 400, 'Which app do you want?');
   const open = store.requests.filter((r) => r.ownerId === acc.id && r.status === 'pending');
-  if (!isOwner(acc) && open.length >= 10) return fail(res, 400, 'You have 10 open requests — wait for some to be answered');
+  if (!isStaff(acc) && open.length >= 10) return fail(res, 400, 'You have 10 open requests — wait for some to be answered');
   const r = {
     id: id(), ownerId: acc.id, username: acc.username, name,
     link: String(b.link || '').trim().slice(0, 500), note: String(b.note || '').trim().slice(0, 500),
@@ -3609,7 +3641,7 @@ route('POST', /^\/api\/requests$/, async (req, res, m, acc) => {
   };
   store.requests.push(r);
   if (store.requests.length > 1000) store.requests.splice(0, store.requests.length - 1000);
-  if (!isOwner(acc)) addAlert('owner', 'request', `🙋 ${acc.username} wants ${name}`, r.note || r.link || '', { requestId: r.id });
+  alertStaff('request', `🙋 ${acc.username} wants ${name}`, r.note || r.link || '', { requestId: r.id }, acc.id);
   store.save();
   json(res, { request: r });
 });
@@ -3627,9 +3659,9 @@ route('PATCH', /^\/api\/requests\/([a-f0-9]{16})$/, async (req, res, m) => {
   r.updatedAt = new Date().toISOString();
   store.save();
   json(res, { request: r });
-}, 'owner');
+}, 'staff');
 route('DELETE', /^\/api\/requests\/([a-f0-9]{16})$/, (req, res, m, acc) => {
-  const i = store.requests.findIndex((x) => x.id === m[1] && (isOwner(acc) || (x.ownerId === acc.id && x.status === 'pending')));
+  const i = store.requests.findIndex((x) => x.id === m[1] && (isStaff(acc) || (x.ownerId === acc.id && x.status === 'pending')));
   if (i < 0) return fail(res, 404, 'Request not found');
   store.requests.splice(i, 1);
   store.save();
@@ -3659,7 +3691,7 @@ route('POST', /^\/api\/categories$/, async (req, res) => {
   store.categories.push(cat);
   store.save();
   json(res, { category: cat });
-}, 'owner');
+}, 'staff');
 
 route('PATCH', /^\/api\/categories\/([a-f0-9]{16})$/, async (req, res, m) => {
   const cat = store.categories.find((c) => c.id === m[1]);
@@ -3669,7 +3701,7 @@ route('PATCH', /^\/api\/categories\/([a-f0-9]{16})$/, async (req, res, m) => {
   if (typeof emoji === 'string' && emoji.trim()) cat.emoji = emoji.trim().slice(0, 8);
   store.save();
   json(res, { category: cat });
-}, 'owner');
+}, 'staff');
 
 route('DELETE', /^\/api\/categories\/([a-f0-9]{16})$/, (req, res, m) => {
   const i = store.categories.findIndex((c) => c.id === m[1]);
@@ -3679,14 +3711,14 @@ route('DELETE', /^\/api\/categories\/([a-f0-9]{16})$/, (req, res, m) => {
   sortedCategories().forEach((c, n) => { c.order = n; });
   store.save();
   json(res, { ok: true });
-}, 'owner');
+}, 'staff');
 
 route('POST', /^\/api\/categories\/order$/, async (req, res) => {
   const { ids = [] } = await readJson(req);
   ids.forEach((cid, n) => { const c = store.categories.find((x) => x.id === cid); if (c) c.order = n; });
   store.save();
   json(res, { categories: sortedCategories() });
-}, 'owner');
+}, 'staff');
 
 // ----- certificates (each account has its own) -----
 const ownCert = (acc, certId) => store.certs.find((c) => c.id === certId && c.ownerId === acc.id);
@@ -4161,7 +4193,7 @@ function jobView(j) {
   };
 }
 // Owner: check every channel, repo and source now / stop everything that's running or waiting.
-route('POST', /^\/api\/checks\/run-all$/, (req, res, m, acc) => json(res, { queued: scheduleChecks(acc, { manual: true }) }), 'owner');
+route('POST', /^\/api\/checks\/run-all$/, (req, res, m, acc) => json(res, { queued: scheduleChecks(acc, { manual: true }) }), 'staff');
 route('POST', /^\/api\/jobs\/cancel-all$/, (req, res, m, acc) => {
   let n = 0;
   for (const j of jobs.values()) {
@@ -4176,28 +4208,28 @@ route('POST', /^\/api\/jobs\/cancel-all$/, (req, res, m, acc) => {
     n++;
   }
   json(res, { stopped: n });
-}, 'owner');
+}, 'staff');
 
 route('GET', /^\/api\/jobs\/([a-f0-9]{16})$/, (req, res, m, acc) => {
   const job = jobs.get(m[1]);
-  if (!job || job.owner !== acc.id) return fail(res, 404, 'This task stopped because the server restarted (probably an update). Start it again.');
+  if (!job || (job.owner !== acc.id && !(job.isCheck && isStaff(acc)))) return fail(res, 404, 'This task stopped because the server restarted (probably an update). Start it again.');
   json(res, { ...jobView(job), log: job.log.slice(-300), result: job.result });
 });
 
 // Background tasks you can come back to after leaving the app.
 route('GET', /^\/api\/jobs$/, (req, res, m, acc) => {
   // Everything still going, plus what finished in the last half hour.
-  const list = [...jobs.values()].filter((j) => (j.owner === acc.id || (isOwner(acc) && j.isCheck)) && j.title && (['running', 'queued'].includes(j.status) || Date.now() - (j.endedAt || Date.now()) < 30 * 60 * 1000));
+  const list = [...jobs.values()].filter((j) => (j.owner === acc.id || (isStaff(acc) && j.isCheck)) && j.title && (['running', 'queued'].includes(j.status) || Date.now() - (j.endedAt || Date.now()) < 30 * 60 * 1000));
   const rank = (v) => (v.status === 'running' ? 0 : v.status === 'queued' ? 1 : 2);
   json(res, {
     jobs: list.map(jobView).sort((a, b) => rank(a) - rank(b) || (a.position || 0) - (b.position || 0) || (b.endedAt || b.started) - (a.endedAt || a.started)),
-    checks: isOwner(acc) ? { nextAuto: nextAutoCheck, sources: store.sources.length, running: !!checkRunning, waiting: checkQueue.length } : null,
+    checks: isStaff(acc) ? { nextAuto: nextAutoCheck, sources: store.sources.length, running: !!checkRunning, waiting: checkQueue.length } : null,
   });
 });
 
 route('POST', /^\/api\/jobs\/([a-f0-9]{16})\/cancel$/, (req, res, m, acc) => {
   const job = jobs.get(m[1]);
-  if (!job || job.owner !== acc.id) return fail(res, 404, 'Job not found');
+  if (!job || (job.owner !== acc.id && !(job.isCheck && isStaff(acc)))) return fail(res, 404, 'Job not found');
   if (job.status === 'done' || job.status === 'error') return json(res, { ok: true, status: job.status });
   job.cancelled = true;
   job.log.push(job.status === 'queued' ? '✕ Cancelled before it started' : '✕ Cancelled — stopping…');
@@ -4297,6 +4329,43 @@ route('POST', /^\/api\/maintenance$/, async (req, res) => {
   return fail(res, 400, 'Unknown action');
 }, 'owner');
 
+// ----- bug reports (testers, admins and you) -----
+if (!Array.isArray(store.data.bugs)) store.data.bugs = [];
+route('POST', /^\/api\/bugs$/, async (req, res, m, acc) => {
+  if (!seesTesterApps(acc) || isOwner(acc)) return fail(res, 403, 'Bug reports are for testers and admins');
+  const b = await readJson(req);
+  const text = String(b.text || '').trim().slice(0, 2000);
+  if (!text) return fail(res, 400, 'Say what went wrong');
+  const app = b.appId ? store.apps.find((a) => a.id === b.appId) : null;
+  const mine = store.data.bugs.filter((x) => x.ownerId === acc.id && x.status === 'open');
+  if (mine.length >= 30) return fail(res, 400, 'You have 30 open reports — wait for some to be looked at');
+  const bug = { id: id(), ownerId: acc.id, username: acc.username, text, appId: app ? app.id : null, appName: app ? app.name : null,
+    device: shortUa(req.headers['user-agent']), status: 'open', createdAt: new Date().toISOString() };
+  store.data.bugs.push(bug);
+  if (store.data.bugs.length > 500) store.data.bugs.splice(0, store.data.bugs.length - 500);
+  alertStaff('bug', `🐞 ${acc.username} reported a bug${app ? ` in ${app.name}` : ''}`, text.slice(0, 300), { bugId: bug.id, appId: bug.appId }, acc.id);
+  store.save();
+  json(res, { bug });
+});
+route('PATCH', /^\/api\/bugs\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
+  const bug = store.data.bugs.find((x) => x.id === m[1]);
+  if (!bug) return fail(res, 404, 'Report not found');
+  const b = await readJson(req);
+  if (['open', 'fixed', 'wontfix'].includes(b.status)) bug.status = b.status;
+  if (typeof b.reply === 'string') bug.reply = b.reply.trim().slice(0, 500);
+  bug.updatedAt = new Date().toISOString();
+  if (bug.ownerId !== acc.id) addAlert(bug.ownerId, 'bug', bug.status === 'fixed' ? '✅ Your bug report was fixed' : '💬 Your bug report got an answer', bug.reply || bug.text.slice(0, 200), { bugId: bug.id });
+  store.save();
+  json(res, { bug });
+}, 'staff');
+route('DELETE', /^\/api\/bugs\/([a-f0-9]{16})$/, (req, res, m, acc) => {
+  const i = store.data.bugs.findIndex((x) => x.id === m[1] && (isStaff(acc) || x.ownerId === acc.id));
+  if (i < 0) return fail(res, 404, 'Report not found');
+  store.data.bugs.splice(i, 1);
+  store.save();
+  json(res, { ok: true });
+});
+
 function inviteCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let s = '';
@@ -4314,7 +4383,7 @@ route('POST', /^\/api\/invites$/, async (req, res) => {
   store.invites.unshift(inv);
   store.save();
   json(res, { invite: inv, signupUrl: `${baseUrl(req)}/?invite=${inv.code}` });
-}, 'owner');
+}, 'staff');
 
 route('DELETE', /^\/api\/invites\/([A-Z0-9-]{4,20})$/, (req, res, m) => {
   const i = store.invites.findIndex((x) => x.code === m[1]);
@@ -4322,12 +4391,23 @@ route('DELETE', /^\/api\/invites\/([A-Z0-9-]{4,20})$/, (req, res, m) => {
   store.invites.splice(i, 1);
   store.save();
   json(res, { ok: true });
-}, 'owner');
+}, 'staff');
 
-route('PATCH', /^\/api\/users\/([a-f0-9]{16})$/, async (req, res, m) => {
+route('PATCH', /^\/api\/users\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
   const u = findUser(m[1]);
   if (!u) return fail(res, 404, 'User not found');
   const b = await readJson(req);
+  // Admins look after everyone else, but only you can change admins or give out roles.
+  if (!isOwner(acc) && (u.rank === 'admin' || b.rank !== undefined)) return fail(res, 403, 'Only the owner can change admins and roles');
+  if (b.rank !== undefined) {
+    const rank = b.rank ? String(b.rank) : null;
+    if (rank && !RANKS.includes(rank)) return fail(res, 400, 'Unknown role');
+    if ((u.rank || null) !== rank) {
+      u.rank = rank;
+      addAlert(u.id, 'user', rank === 'admin' ? '⭐ You\'re now an admin' : rank === 'tester' ? '🧪 You\'re now a tester' : 'Your role was removed',
+        rank === 'admin' ? 'You can now manage the library and users.' : rank === 'tester' ? 'You can see apps for testers, try beta versions first and send bug reports.' : '');
+    }
+  }
   if (typeof b.disabled === 'boolean') { u.disabled = b.disabled; u.sv = (u.sv || 0) + 1; }
   if (b.password !== undefined) {
     if (String(b.password).length < 6) return fail(res, 400, 'Password must be at least 6 characters');
@@ -4339,9 +4419,10 @@ route('PATCH', /^\/api\/users\/([a-f0-9]{16})$/, async (req, res, m) => {
   if (b.signLimit !== undefined) u.signLimit = b.signLimit === null ? null : Math.max(0, Math.min(500, Number(b.signLimit) || 0));
   store.save();
   json(res, { user: userView(u) });
-}, 'owner');
+}, 'staff');
 
-route('DELETE', /^\/api\/users\/([a-f0-9]{16})$/, async (req, res, m) => {
+route('DELETE', /^\/api\/users\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
+  { const t = findUser(m[1]); if (t && t.rank === 'admin' && !isOwner(acc)) return fail(res, 403, 'Only the owner can delete an admin'); }
   const u = findUser(m[1]);
   if (!u) return fail(res, 404, 'User not found');
   for (const c of store.certs.filter((x) => x.ownerId === u.id)) await deleteCertRecord(c);
@@ -4352,7 +4433,7 @@ route('DELETE', /^\/api\/users\/([a-f0-9]{16})$/, async (req, res, m) => {
   store.data.requests = store.requests.filter((r) => r.ownerId !== u.id);
   store.save();
   json(res, { ok: true });
-}, 'owner');
+}, 'staff');
 
 // ----- public install endpoints (iOS fetches these without cookies) -----
 const findByToken = (t) => store.signed.find((s) => s.token === t);
@@ -4550,6 +4631,7 @@ const server = http.createServer(async (req, res) => {
         acc = getAccount(req);
         if (!acc) return fail(res, 401, 'Please log in');
         if (r.access === 'owner' && !isOwner(acc)) return fail(res, 403, 'Only the owner can do that');
+        if (r.access === 'staff' && !isStaff(acc)) return fail(res, 403, 'Only the owner or an admin can do that');
       }
       return await r.handler(req, res, m, acc);
     }

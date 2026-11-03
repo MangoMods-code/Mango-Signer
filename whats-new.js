@@ -3,6 +3,29 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.11.0',
+    date: '2026-11-03',
+    title: 'Admins & Testers',
+    summary: 'The owner can now make people admins or testers.',
+    sections: [
+      {
+        title: '⭐ Admins',
+        items: [
+          'Admins can help run Mango: add and edit apps, sources, categories and tweaks, look after users and invites, answer requests, and see stats and activity.',
+          'Admins have no daily sign limit.',
+        ],
+      },
+      {
+        title: '🧪 Testers',
+        items: [
+          'Testers see apps marked "Testers only", in a 🧪 For testers list at the top of their library.',
+          'Testers get beta versions first, and have no daily sign limit.',
+          'Testers can send bug reports straight from an app\'s page or their Account tab, and see the answer.',
+        ],
+      },
+    ],
+  },
+  {
     version: '1.10.0',
     date: '2026-11-03',
     title: 'Signed Apps Stay on Your iPhone',
