@@ -72,7 +72,7 @@ const saveLibPrefs = () => { try { localStorage.setItem('mango.lib', JSON.string
 // ---------- api ----------
 async function api(method, url, body) {
   // Never wait forever: if the server or the connection goes quiet, give up with a clear message.
-  const slow = /\/(sync|delete-removed|auto-categorize|restore|bulk|scan)\b/.test(url);
+  const slow = /\/(sync|delete-removed|auto-categorize|restore|bulk|scan|dedupe)\b/.test(url);
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), slow ? 300000 : 60000);
   let r;
@@ -1325,7 +1325,7 @@ function bindView(view) {
         broadcast: broadcastSheet,
         backup: backupSheet,
         'security-log': securityLogSheet,
-        dupes: duplicatesSheet,
+        dupes: () => duplicatesSheet(),
         filters: filterSheet,
         'my-apps': myAppsSheet,
         'delete-missing': () => deleteRemovedApps(null, libCount('missing')),
@@ -1500,7 +1500,8 @@ function sourceSheet(sid) {
       <dt>Link</dt><dd class="mono small-break">${esc(src.url)}</dd>
     </dl>
     <p class="hint" style="margin:8px 4px 0">Refreshes by itself every hour${src.kind === 'ghrepo' ? ': each new GitHub release with an .ipa becomes the new version, and older ones stay downloadable' : ''}. New versions show as UPDATED in the library. Anything you edit on an app (name, category, description…) is kept when it refreshes.</p>
-    <div class="group" style="margin-top:12px">${toggle('srcShow', 'Show its apps to everyone', 'Off = only you can see them', src.showInLibrary !== false)}</div>
+    <div class="group" style="margin-top:12px">${toggle('srcShow', 'Show its apps to everyone', 'Off = only you can see them', src.showInLibrary !== false)}
+      ${toggle('srcSkip', 'Skip apps I already have', 'Don\'t add an app that\'s already in your library from somewhere else', src.skipHave === undefined ? src.kind !== 'ghrepo' : !!src.skipHave)}</div>
     <div class="field" style="margin-top:12px"><label>Name in your library</label><input type="text" id="srcName" value="${esc(src.name)}" maxlength="60"></div>
     <div class="actions">
       <button class="btn primary block" id="srcSync">Refresh now</button>
@@ -1512,6 +1513,9 @@ function sourceSheet(sid) {
     ${excludedHtml(src)}`, (el) => {
     bindExcluded(el, src, () => sourceSheet(sid));
     if ($('#srcDelMissing', el)) $('#srcDelMissing', el).onclick = () => deleteRemovedApps(sid, missing);
+    $('#srcSkip', el).onchange = async (e) => {
+      try { await api('PATCH', `/api/sources/${sid}`, { skipHave: e.target.checked }); await refresh(); toast(e.target.checked ? 'Apps you already have are skipped' : 'It adds every app, even ones you have'); } catch (err) { toast(err.message, true); }
+    };
     $('#srcShow', el).onchange = async (e) => {
       try { await api('PATCH', `/api/sources/${sid}`, { showInLibrary: e.target.checked }); await refresh(); toast(e.target.checked ? 'Shown to everyone' : 'Only you can see these apps now'); } catch (err) { toast(err.message, true); }
     };
@@ -1620,6 +1624,7 @@ function tgOptionsHtml(o = {}, src = {}) {
       </select>
       <div class="hint">Link only is fastest to set up. A GitHub copy keeps working even if the channel deletes the post.</div></div>
     <div class="group">
+      ${toggle('tcSkip', 'Skip apps I already have', 'Don\'t add an app that\'s already in your library from another channel, repo or upload', o.skipHave !== false)}
       ${toggle('tcMine', 'Update apps I added myself', 'If the channel posts a newer version of an app you uploaded, replace yours with it', !!o.updateMine)}
       ${toggle('tcName', 'Also match by app name', 'For channels that change the bundle ID between builds', !!o.matchName)}
       ${toggle('tcNotes', 'Use the post\'s text as “What\'s new”', 'Promo lines (Tap Here, links, @mentions) are left out', o.captionNotes !== false)}
@@ -1636,7 +1641,7 @@ function tgOptionsHtml(o = {}, src = {}) {
 }
 const readTgOptions = (el) => ({
   storage: $('#tcStore', el).value, updateMine: $('#tcMine', el).checked, matchName: $('#tcName', el).checked,
-  captionNotes: $('#tcNotes', el).checked, autoSync: $('#tcAuto', el).checked, keywords: $('#tcWords', el).value,
+  captionNotes: $('#tcNotes', el).checked, autoSync: $('#tcAuto', el).checked, skipHave: $('#tcSkip', el).checked, keywords: $('#tcWords', el).value,
 });
 
 function tgRunSheet(title, jobId, back) {
@@ -2257,20 +2262,61 @@ function duplicateGroups() {
   }
   return [...by.values()].filter((g) => g.length > 1);
 }
-function duplicatesSheet() {
+// Which copy a cleanup keeps (same rule as the server): copies from the place you prefer, then the newest
+// version, then the most installed, then the one you had first.
+function verCmp(a, b) {
+  const pa = String(a || '').split(/[^0-9]+/).filter(Boolean).map(Number), pb = String(b || '').split(/[^0-9]+/).filter(Boolean).map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) { const d = (pa[i] || 0) - (pb[i] || 0); if (d) return d; }
+  return 0;
+}
+function dupKeeper(group, prefer) {
+  const isMine = (a) => !isSrcApp(a);
+  const srcName = prefer && prefer !== 'newest' && prefer !== 'mine' ? ((state.sources || []).find((x) => x.id === prefer) || {}).name : null;
+  const pref = prefer === 'mine' ? group.filter(isMine) : srcName ? group.filter((a) => isSrcApp(a) && a.sourceName === srcName) : [];
+  const pool = pref.length ? pref : group;
+  return [...pool].sort((x, y) => verCmp(y.version, x.version) || (y.installCount || 0) - (x.installCount || 0) || String(x.addedAt).localeCompare(String(y.addedAt)))[0];
+}
+function duplicatesSheet(prefer = duplicatesSheet.prefer || 'newest') {
+  duplicatesSheet.prefer = prefer;
   const groups = duplicateGroups();
+  const extra = groups.reduce((n, g) => n + g.length - 1, 0);
+  const places = (state.sources || []).filter((src) => groups.some((g) => g.some((a) => isSrcApp(a) && a.sourceName === src.name)));
   openSheet(`
     <h2>🔁 Duplicates</h2>
-    <p class="muted small" style="margin-top:-6px">Apps that share a bundle ID — usually the same app added twice, or once from a source and once by you. Keep the one you want and delete the rest.</p>
-    ${groups.length ? groups.map((g) => `
+    <p class="muted small" style="margin-top:-6px">Apps that share a bundle ID — usually the same app added twice, or once from a source and once by you.</p>
+    ${groups.length ? `
+    <div class="card" style="margin:0 0 6px">
+      <p style="margin:0 0 10px"><b>${groups.length}</b> app${groups.length === 1 ? ' has' : 's have'} copies · <b>${extra}</b> extra cop${extra === 1 ? 'y' : 'ies'}</p>
+      <div class="field" style="margin:0 0 10px"><label>When cleaning up, keep</label>
+        <select id="dpPrefer">
+          <option value="newest" ${prefer === 'newest' ? 'selected' : ''}>The newest version</option>
+          <option value="mine" ${prefer === 'mine' ? 'selected' : ''}>The one I added myself</option>
+          ${places.map((src) => `<option value="${src.id}" ${prefer === src.id ? 'selected' : ''}>The one from ${esc(src.name)}</option>`).join('')}
+        </select>
+        <div class="hint">If an app has no copy from your choice, its newest version is kept. Deleted copies won't come back when their channel or source refreshes.</div></div>
+      <button class="btn primary block" id="dpAll">Clean up all — delete ${extra} extra cop${extra === 1 ? 'y' : 'ies'}</button>
+    </div>
+    <p class="hint" style="margin:0 4px 4px">Or pick yourself below. ✓ marks the copy a cleanup would keep.</p>` : ''}
+    ${groups.length ? groups.map((g) => { const keep = dupKeeper(g, prefer); return `
       <div class="section-title">${esc(g[0].bundleId)}</div>
       <div class="list">${g.map((a) => `
         <div class="row" data-open="${a.id}">${appIcon(a)}
-          <div class="row-main"><div class="row-title">${esc(a.name)}</div>
+          <div class="row-main"><div class="row-title">${esc(a.name)} ${a === keep ? '<span class="badge good">✓ Keeps</span>' : ''}</div>
             <div class="row-sub">v${esc(shownVersion(a) || '?')} · ${fmtSize(a.size)} · ${esc(isSrcApp(a) ? a.sourceName || 'source' : a.cloud === 'github' ? 'GitHub' : a.cloud === 'link' ? 'link' : 'this server')} · ${a.installCount || 0} installs</div>
             <div class="row-sub">${a.updatedAt && a.updatedAt !== a.addedAt ? 'Updated' : 'Added'} ${ago(a.updatedAt || a.addedAt)}</div></div>
           <button class="pill danger-pill" data-del="${a.id}">Delete</button>
-        </div>`).join('')}</div>`).join('') : '<div class="empty" style="padding:30px 10px"><h3>No duplicates 🎉</h3></div>'}`, (el) => {
+        </div>`).join('')}</div>`; }).join('') : '<div class="empty" style="padding:30px 10px"><h3>No duplicates 🎉</h3></div>'}`, (el) => {
+    if ($('#dpPrefer', el)) $('#dpPrefer', el).onchange = (e) => duplicatesSheet(e.target.value);
+    if ($('#dpAll', el)) $('#dpAll', el).onclick = async (e) => {
+      if (!confirm(`Delete ${extra} extra cop${extra === 1 ? 'y' : 'ies'} and keep one of each app? People who installed a deleted copy keep it on their phone.`)) return;
+      const b = e.currentTarget; b.disabled = true; b.textContent = 'Cleaning up…';
+      try {
+        const r = await api('POST', '/api/apps/dedupe', { prefer: $('#dpPrefer', el).value });
+        await refresh();
+        toast(`Deleted ${r.deleted} duplicate${r.deleted === 1 ? '' : 's'} ✓`);
+        duplicatesSheet();
+      } catch (err) { b.disabled = false; b.textContent = 'Clean up all'; toast(err.message, true); }
+    };
     el.querySelectorAll('[data-open]').forEach((b) => { b.onclick = () => appSheet(b.dataset.open); b.style.cursor = 'pointer'; });
     el.querySelectorAll('[data-del]').forEach((b) => {
       b.onclick = async (e) => {
