@@ -719,3 +719,9 @@ html[data-accent="red"] { --mango: #ff5c5c; --mango-2: #ff9b9b; --accent-2: #f03
 #sheetBody .ver-notes { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; white-space: pre-line; cursor: pointer; }
 #sheetBody .ver-notes.open { display: block; -webkit-line-clamp: unset; overflow: visible; }
 .ver-row .row-main { min-width: 0; }
+/* Duplicates: pick the copy to keep */
+.dup-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.dup-head > span { min-width: 0; overflow-wrap: anywhere; }
+.dup-head .link-btn.inline { flex-shrink: 0; text-transform: none; letter-spacing: 0; font-weight: 600; color: var(--mango); }
+.dup-row.keeps { background: rgba(92, 196, 92, .07); }
+.ver-big { font-size: 17px; font-weight: 700; }

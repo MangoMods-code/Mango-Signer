@@ -2278,51 +2278,80 @@ function dupKeeper(group, prefer) {
 }
 function duplicatesSheet(prefer = duplicatesSheet.prefer || 'newest') {
   duplicatesSheet.prefer = prefer;
+  // Copies you picked yourself (bundle ID -> app id). They win over the "keep" rule above.
+  const picks = (duplicatesSheet.picks = duplicatesSheet.picks || {});
   const groups = duplicateGroups();
+  const keeperOf = (g) => g.find((a) => a.id === picks[g[0].bundleId.toLowerCase()]) || dupKeeper(g, prefer);
   const extra = groups.reduce((n, g) => n + g.length - 1, 0);
+  const picked = groups.filter((g) => g.some((a) => a.id === picks[g[0].bundleId.toLowerCase()])).length;
   const places = (state.sources || []).filter((src) => groups.some((g) => g.some((a) => isSrcApp(a) && a.sourceName === src.name)));
+  const byVersion = (g) => [...g].sort((x, y) => verCmp(y.version, x.version));
   openSheet(`
     <h2>🔁 Duplicates</h2>
     <p class="muted small" style="margin-top:-6px">Apps that share a bundle ID — usually the same app added twice, or once from a source and once by you.</p>
     ${groups.length ? `
     <div class="card" style="margin:0 0 6px">
-      <p style="margin:0 0 10px"><b>${groups.length}</b> app${groups.length === 1 ? ' has' : 's have'} copies · <b>${extra}</b> extra cop${extra === 1 ? 'y' : 'ies'}</p>
-      <div class="field" style="margin:0 0 10px"><label>When cleaning up, keep</label>
+      <p style="margin:0 0 10px"><b>${groups.length}</b> app${groups.length === 1 ? ' has' : 's have'} copies · <b>${extra}</b> extra cop${extra === 1 ? 'y' : 'ies'}${picked ? ` · <b>${picked}</b> picked by you` : ''}</p>
+      <div class="field" style="margin:0 0 10px"><label>For apps you haven't picked, keep</label>
         <select id="dpPrefer">
           <option value="newest" ${prefer === 'newest' ? 'selected' : ''}>The newest version</option>
           <option value="mine" ${prefer === 'mine' ? 'selected' : ''}>The one I added myself</option>
           ${places.map((src) => `<option value="${src.id}" ${prefer === src.id ? 'selected' : ''}>The one from ${esc(src.name)}</option>`).join('')}
         </select>
-        <div class="hint">If an app has no copy from your choice, its newest version is kept. Deleted copies won't come back when their channel or source refreshes.</div></div>
+        <div class="hint">Tap <b>Keep</b> on any copy below to choose it yourself. If an app has no copy from your choice, its newest version is kept. Deleted copies won't come back when their channel or source refreshes.</div></div>
       <button class="btn primary block" id="dpAll">Clean up all — delete ${extra} extra cop${extra === 1 ? 'y' : 'ies'}</button>
-    </div>
-    <p class="hint" style="margin:0 4px 4px">Or pick yourself below. ✓ marks the copy a cleanup would keep.</p>` : ''}
-    ${groups.length ? groups.map((g) => { const keep = dupKeeper(g, prefer); return `
-      <div class="section-title">${esc(g[0].bundleId)}</div>
-      <div class="list">${g.map((a) => `
-        <div class="row" data-open="${a.id}">${appIcon(a)}
-          <div class="row-main"><div class="row-title">${esc(a.name)} ${a === keep ? '<span class="badge good">✓ Keeps</span>' : ''}</div>
-            <div class="row-sub">v${esc(shownVersion(a) || '?')} · ${fmtSize(a.size)} · ${esc(isSrcApp(a) ? a.sourceName || 'source' : a.cloud === 'github' ? 'GitHub' : a.cloud === 'link' ? 'link' : 'this server')} · ${a.installCount || 0} installs</div>
-            <div class="row-sub">${a.updatedAt && a.updatedAt !== a.addedAt ? 'Updated' : 'Added'} ${ago(a.updatedAt || a.addedAt)}</div></div>
-          <button class="pill danger-pill" data-del="${a.id}">Delete</button>
+      ${picked ? '<button class="link-btn block" id="dpReset" type="button">Undo my picks</button>' : ''}
+    </div>` : ''}
+    ${groups.length ? groups.map((g) => { const keep = keeperOf(g); const mine = keep.id === picks[g[0].bundleId.toLowerCase()]; return `
+      <div class="section-title dup-head"><span>${esc(g[0].name)} <span class="muted mono" style="text-transform:none">${esc(g[0].bundleId)}</span></span>
+        <button class="link-btn inline" data-only="${esc(g[0].bundleId)}" type="button">Keep ✓, delete ${g.length - 1}</button></div>
+      <div class="list">${byVersion(g).map((a) => `
+        <div class="row dup-row ${a === keep ? 'keeps' : ''}" data-open="${a.id}">${appIcon(a)}
+          <div class="row-main"><div class="row-title"><span class="ver-big">v${esc(shownVersion(a) || '?')}</span> ${a === keep ? `<span class="badge good">✓ Keeps${mine ? ' · your pick' : ''}</span>` : ''}</div>
+            <div class="row-sub">${esc(isSrcApp(a) ? a.sourceName || 'source' : a.cloud === 'github' ? 'GitHub' : a.cloud === 'link' ? 'link' : 'Added by you')} · ${fmtSize(a.size)} · ${a.installCount || 0} installs</div>
+            <div class="row-sub">${esc(a.name)} · ${a.updatedAt && a.updatedAt !== a.addedAt ? 'updated' : 'added'} ${ago(a.updatedAt || a.addedAt)}</div></div>
+          <div class="row-btns">
+            ${a === keep ? '' : `<button class="pill" data-pick="${a.id}">Keep</button>`}
+            <button class="pill danger-pill" data-del="${a.id}" aria-label="Delete this copy">✕</button>
+          </div>
         </div>`).join('')}</div>`; }).join('') : '<div class="empty" style="padding:30px 10px"><h3>No duplicates 🎉</h3></div>'}`, (el) => {
-    if ($('#dpPrefer', el)) $('#dpPrefer', el).onchange = (e) => duplicatesSheet(e.target.value);
-    if ($('#dpAll', el)) $('#dpAll', el).onclick = async (e) => {
-      if (!confirm(`Delete ${extra} extra cop${extra === 1 ? 'y' : 'ies'} and keep one of each app? People who installed a deleted copy keep it on their phone.`)) return;
-      const b = e.currentTarget; b.disabled = true; b.textContent = 'Cleaning up…';
-      try {
-        const r = await api('POST', '/api/apps/dedupe', { prefer: $('#dpPrefer', el).value });
-        await refresh();
-        toast(`Deleted ${r.deleted} duplicate${r.deleted === 1 ? '' : 's'} ✓`);
-        duplicatesSheet();
-      } catch (err) { b.disabled = false; b.textContent = 'Clean up all'; toast(err.message, true); }
+    const run = async (body, msg) => {
+      const r = await api('POST', '/api/apps/dedupe', { prefer: duplicatesSheet.prefer, picks, ...body });
+      await refresh();
+      toast(msg(r));
+      duplicatesSheet();
     };
+    if ($('#dpPrefer', el)) $('#dpPrefer', el).onchange = (e) => duplicatesSheet(e.target.value);
+    if ($('#dpReset', el)) $('#dpReset', el).onclick = () => { duplicatesSheet.picks = {}; duplicatesSheet(); };
+    if ($('#dpAll', el)) $('#dpAll', el).onclick = async (e) => {
+      if (!confirm(`Delete ${extra} extra cop${extra === 1 ? 'y' : 'ies'} and keep the ✓ one of each app? People who installed a deleted copy keep it on their phone.`)) return;
+      const b = e.currentTarget; b.disabled = true; b.textContent = 'Cleaning up…';
+      try { await run({}, (r) => `Deleted ${r.deleted} duplicate${r.deleted === 1 ? '' : 's'} ✓`); } catch (err) { b.disabled = false; b.textContent = 'Clean up all'; toast(err.message, true); }
+    };
+    // Keep: choose this copy for its app (nothing is deleted until you clean up).
+    el.querySelectorAll('[data-pick]').forEach((b) => {
+      b.onclick = (e) => {
+        e.stopPropagation();
+        const a = state.apps.find((x) => x.id === b.dataset.pick);
+        if (a) picks[a.bundleId.toLowerCase()] = a.id;
+        const y = $('#sheetBody').scrollTop;
+        duplicatesSheet();
+        $('#sheetBody').scrollTop = y;
+      };
+    });
+    // Just this app: keep the ✓ copy and delete its other copies now.
+    el.querySelectorAll('[data-only]').forEach((b) => {
+      b.onclick = async () => {
+        b.disabled = true;
+        try { await run({ only: b.dataset.only }, (r) => `Kept 1, deleted ${r.deleted}`); } catch (err) { b.disabled = false; toast(err.message, true); }
+      };
+    });
     el.querySelectorAll('[data-open]').forEach((b) => { b.onclick = () => appSheet(b.dataset.open); b.style.cursor = 'pointer'; });
     el.querySelectorAll('[data-del]').forEach((b) => {
       b.onclick = async (e) => {
         e.stopPropagation();
         const a = state.apps.find((x) => x.id === b.dataset.del);
-        if (!a || !confirm(`Delete this copy of ${a.name}?`)) return;
+        if (!a || !confirm(`Delete this copy of ${a.name} (v${shownVersion(a) || '?'})?`)) return;
         try { await api('DELETE', `/api/apps/${a.id}`); await refresh(); toast('Deleted'); duplicatesSheet(); } catch (e) { toast(e.message, true); }
       };
     });
