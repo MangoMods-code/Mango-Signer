@@ -2019,7 +2019,7 @@ function alertsSheet() {
   }
 }
 
-const SIGNIN_LABEL = { login: 'Signed in', 'login-udid': 'Signed in with iPhone', 'signout-all': 'Signed out other devices', signup: 'Joined', locked: 'Locked' };
+const SIGNIN_LABEL = { login: 'Signed in', 'login-udid': 'Signed in with iPhone', 'signout-all': 'Signed out other devices', signup: 'Joined', locked: 'Locked', 'cert-download': 'Certificate sent to the iPhone app' };
 function signinRow(e) {
   return `<div class="row"><span class="alert-ic">${e.ok ? (e.type === 'signout-all' ? '🚪' : '✅') : '⛔'}</span>
     <div class="row-main"><div class="row-title">${esc(e.ok ? SIGNIN_LABEL[e.type] || e.type : e.type === 'locked' ? 'Locked after wrong passwords' : 'Wrong password')}</div>
