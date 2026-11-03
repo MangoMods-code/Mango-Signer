@@ -3,6 +3,20 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.12.2',
+    date: '2026-11-03',
+    title: 'Join as a Tester',
+    summary: 'Some invites now make you a tester the moment you sign up.',
+    sections: [
+      {
+        title: '🧪 Testers',
+        items: [
+          'If you joined with a tester invite, you are a tester right away: testers-only apps, beta versions, no sign limit and a 🧪 badge.',
+        ],
+      },
+    ],
+  },
+  {
     version: '1.12.1',
     date: '2026-11-03',
     title: 'Tune-up',

@@ -783,11 +783,12 @@ route('POST', /^\/api\/signup$/, async (req, res) => {
     id: id(), username: name, salt, hash, sv: 0, udid, deviceName,
     createdAt: new Date().toISOString(), lastLogin: new Date().toISOString(), invite: code, disabled: false,
   };
+  if (inv.rank && RANKS.includes(inv.rank)) user.rank = inv.rank;
   store.users.push(user);
   inv.uses += 1;
   inv.usedBy = [...(inv.usedBy || []), name];
   secEvent(req, 'signup', name, true, `invite ${code}`);
-  addAlert('owner', 'user', `👋 ${name} joined`, `Used invite ${code}${inv.note ? ` (${inv.note})` : ''}.`, { userId: user.id });
+  addAlert('owner', 'user', `👋 ${name} joined${user.rank ? ` as ${user.rank === 'admin' ? 'an admin ⭐' : 'a tester 🧪'}` : ''}`, `Used invite ${code}${inv.note ? ` (${inv.note})` : ''}.`, { userId: user.id });
   store.save();
   rl.ok();
   send(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(req, user) });
@@ -1109,7 +1110,7 @@ route('GET', /^\/api\/state$/, async (req, res, m, acc) => {
       // Admins help with the library and users, but never see the server's settings, GitHub or Telegram logins.
       out.settings.everyoneSignsPerDay = Number(store.settings.signsPerDay) || 0;
       out.users = store.users.map(userView);
-      out.invites = store.invites;
+      out.invites = store.invites.filter((i) => i.rank !== 'admin'); // admin invites stay with the owner
       out.sources = store.sources.map(sourceView);
       out.github = { connected: ghView().connected };
       out.telegram = { connected: tgView().connected };
@@ -4602,20 +4603,25 @@ function inviteCode() {
   return `${s.slice(0, 4)}-${s.slice(4)}`;
 }
 
-route('POST', /^\/api\/invites$/, async (req, res) => {
+route('POST', /^\/api\/invites$/, async (req, res, m, acc) => {
   const b = await readJson(req);
+  // An invite can give everyone who uses it a role (tester or admin). Only the owner gives out roles.
+  const rank = b.rank ? String(b.rank) : null;
+  if (rank && !RANKS.includes(rank)) return fail(res, 400, 'Unknown role');
+  if (rank && !isOwner(acc)) return fail(res, 403, 'Only the owner can make invites that give a role');
   const inv = {
     code: inviteCode(), note: String(b.note || '').trim().slice(0, 60),
     maxUses: Math.min(1000, Math.max(1, Number(b.maxUses) || 1)), uses: 0, usedBy: [], createdAt: new Date().toISOString(),
     expiresAt: Number(b.expiresDays) > 0 ? new Date(Date.now() + Math.min(365, Number(b.expiresDays)) * 864e5).toISOString() : null,
   };
+  if (rank) inv.rank = rank;
   store.invites.unshift(inv);
   store.save();
   json(res, { invite: inv, signupUrl: `${baseUrl(req)}/?invite=${inv.code}` });
 }, 'staff');
 
-route('DELETE', /^\/api\/invites\/([A-Z0-9-]{4,20})$/, (req, res, m) => {
-  const i = store.invites.findIndex((x) => x.code === m[1]);
+route('DELETE', /^\/api\/invites\/([A-Z0-9-]{4,20})$/, (req, res, m, acc) => {
+  const i = store.invites.findIndex((x) => x.code === m[1] && (isOwner(acc) || x.rank !== 'admin'));
   if (i < 0) return fail(res, 404, 'Invite not found');
   store.invites.splice(i, 1);
   store.save();
