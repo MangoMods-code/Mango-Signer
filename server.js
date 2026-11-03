@@ -1298,6 +1298,21 @@ async function downloadToTmp(u, job) {
   return dest;
 }
 
+// Two links count as the same if they only differ in http/https, "www.", capital letters in the address,
+// a trailing slash, the #part or tracking bits like ?utm_source=. Used to stop adding something twice.
+function linkKey(url) {
+  let u;
+  try { u = new URL(String(url || '').trim()); } catch { return String(url || '').trim().toLowerCase(); }
+  const host = u.hostname.toLowerCase().replace(/^www\./, '');
+  const params = [...u.searchParams.entries()].filter(([k]) => !/^(utm_|fbclid$|gclid$|ref$|si$|dl$)/i.test(k)).sort(([a], [b]) => a.localeCompare(b));
+  let p = decodeURIComponent(u.pathname).replace(/\/+$/, '');
+  if (host === 'github.com') p = p.toLowerCase().replace(/\.git$/, '').replace(/\/(releases|tags)(\/.*)?$/, '');
+  const port = u.port && !['80', '443'].includes(u.port) ? `:${u.port}` : '';
+  return `${host}${port}${p}${params.length ? '?' + params.map(([k, v]) => `${k}=${v}`).join('&') : ''}`;
+}
+// Links being added right now, so pasting the same link twice in a row (or in one batch) is caught too.
+const addingLinks = new Set();
+
 // Links the server downloads must be on the internet, not this server or the private network it runs on.
 function isPrivateHost(hostname) {
   const h = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
@@ -1790,6 +1805,11 @@ function lockFields(app, fields) {
 route('POST', /^\/api\/apps\/link$/, async (req, res, m, acc) => {
   const { url } = await readJson(req);
   const u = parseLink(url);
+  const key = linkKey(u.toString());
+  const have = store.apps.find((a) => a.remote && a.remote.url && linkKey(a.remote.url) === key);
+  if (have) return fail(res, 409, `That link is already in your library as ${have.name}`);
+  if (addingLinks.has(key)) return fail(res, 409, 'That link is already being added');
+  addingLinks.add(key);
   const job = newJob(acc);
   job.title = `Adding from ${u.hostname}`;
   json(res, { jobId: job.id });
@@ -1806,6 +1826,8 @@ route('POST', /^\/api\/apps\/link$/, async (req, res, m, acc) => {
     } catch (e) {
       job.error = isNoSpace(e) ? storageFullMessage() : e.message;
       job.status = 'error';
+    } finally {
+      addingLinks.delete(key);
     }
   })();
 }, 'staff');
@@ -2105,11 +2127,15 @@ route('POST', /^\/api\/sources$/, async (req, res, m, acc) => {
   const repo = parseGithubRepo(b.url);
   try { if (!repo && /\.ipa$/i.test(new URL(b.url).pathname)) return fail(res, 400, "That's a link to one app, not a source. Add it with + › Add App › Or add from a link."); } catch { /* checked below */ }
   try { url = repo ? repo.url : sources.normalizeSourceUrl(b.url); } catch (e) { return fail(res, 400, e.message); }
-  if (store.sources.some((x) => x.url.toLowerCase() === url.toLowerCase())) return fail(res, 400, 'That source is already added');
+  const same = store.sources.find((x) => x.kind !== 'telegram' && (linkKey(x.url) === linkKey(url)
+    || (repo && x.repo && x.repo.owner.toLowerCase() === repo.owner.toLowerCase() && x.repo.repo.toLowerCase() === repo.repo.toLowerCase())));
+  if (same) return fail(res, 409, `That ${repo ? 'GitHub repo' : 'source'} is already added (${same.name})`);
+  if (addingLinks.has(linkKey(url))) return fail(res, 409, 'That source is already being added');
   const src = { id: id(), url, name: repo ? repo.repo : 'Source', showInLibrary: b.showInLibrary !== false, addedAt: new Date().toISOString() };
   if (repo) Object.assign(src, { kind: 'ghrepo', repo: { owner: repo.owner, repo: repo.repo } });
   // Nothing else checking: add it right away (and tell you if the link is wrong).
   if (!checkBusy()) {
+    addingLinks.add(linkKey(url));
     try {
       store.sources.push(src);
       const result = await syncSource(src);
@@ -2118,6 +2144,8 @@ route('POST', /^\/api\/sources$/, async (req, res, m, acc) => {
       store.sources.splice(store.sources.indexOf(src), 1);
       store.save();
       return fail(res, 400, e.message);
+    } finally {
+      addingLinks.delete(linkKey(url));
     }
   }
   // Another check is running: add it now and let its first check wait its turn.
@@ -3721,7 +3749,11 @@ route('POST', /^\/api\/telegram\/channels$/, async (req, res, m, acc) => {
   let ch;
   try { ch = await tg.channel(b.ref); } catch (e) { return fail(res, e.status || 400, e.message); }
   const ref = ch.username || String(ch.id);
-  if (store.sources.some((x) => x.kind === 'telegram' && String(x.ref).toLowerCase() === ref.toLowerCase())) return fail(res, 400, 'That channel is already added');
+  // Same channel, whether it was added by @username, link or number.
+  const sameCh = store.sources.find((x) => x.kind === 'telegram' && (String(x.ref).toLowerCase() === ref.toLowerCase()
+    || (ch.username && String(x.username || '').toLowerCase() === String(ch.username).toLowerCase())
+    || String(x.ref) === String(ch.id) || (x.peerKey && x.peerKey.split(':')[0] === String(ch.id))));
+  if (sameCh) return fail(res, 409, `That channel is already added (${sameCh.name})`);
   const src = {
     id: id(), kind: 'telegram', ref, url: ch.username ? `https://t.me/${ch.username}` : '', name: ch.title, username: ch.username,
     showInLibrary: b.showInLibrary !== false, categoryId: ['__auto', '__none'].includes(b.categoryId) ? b.categoryId : b.categoryId && catExists(b.categoryId) ? b.categoryId : '__auto',

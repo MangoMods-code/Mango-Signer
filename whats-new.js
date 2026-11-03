@@ -3,6 +3,20 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.12.5',
+    date: '2026-11-03',
+    title: 'No Doubles',
+    summary: 'The library no longer gets the same app twice from the same link.',
+    sections: [
+      {
+        title: '📚 Library',
+        items: [
+          'Fewer duplicate apps: the same source, repo, channel or link can only be added once.',
+        ],
+      },
+    ],
+  },
+  {
     version: '1.12.4',
     date: '2026-11-03',
     title: 'Your Certificates, Everywhere',
