@@ -3,6 +3,21 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.12.1',
+    date: '2026-11-03',
+    title: 'Tune-up',
+    summary: 'Small fixes to keep things safe and quick.',
+    sections: [
+      {
+        title: '🔧 Fixes',
+        items: [
+          'The iPhone app no longer flashes back to older info when you tap things quickly.',
+          'Behind-the-scenes safety and speed fixes on the server.',
+        ],
+      },
+    ],
+  },
+  {
     version: '1.12.0',
     date: '2026-11-03',
     title: 'Better Sorted Library',

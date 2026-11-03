@@ -8,7 +8,7 @@ Upload an `.ipa`, add a `.p12` + `.mobileprovision`, tap **Sign**, then **Instal
 ## Features
 - **App Library** – the owner uploads apps (or imports from a link); invited users browse, search, sign and install them
 - **Organization** – categories with emoji, featured apps, search, sorting, bulk select, full app editing, Update IPA, and default sign settings per app
-- **Sorting apps into categories** – ✨ Auto-sort uses your keyword rules, the App Store, apps you already sorted that look the same (YouTube++ goes where YouTube is), giveaway words in the name (emulator, IPTV, VPN…) and the category most apps from the same source are in. It paces App Store lookups so Apple doesn't refuse them, and keeps going on the server after you close it. Whatever's left, **Sort by hand** shows one app at a time with Mango's best guess on top
+- **Sorting apps into categories** – ✨ Auto-sort uses your keyword rules, the App Store, apps you already sorted that look the same (YouTube++ goes where YouTube is), giveaway words in the name (emulator, IPTV, VPN…) and the category most apps from the same source are in. It paces App Store lookups so Apple doesn't refuse them, and keeps going on the server after you close it. Whatever's left, **Sort by hand** shows one app at a time with Mango's best guess on top, or deletes it from the library
 - **Cloud Library** – app files don't have to sit on your Railway volume. Add apps from:
   - **AltStore / SideStore / ESign sources** (JSON source links)
   - **GitHub repos** – paste `github.com/owner/repo`; every release with an `.ipa` becomes a version and new releases show up as updates

@@ -978,15 +978,26 @@ async function dirSize(dir) {
   await walk(dir);
   return total;
 }
-const storageUsed = () => dirSize(DATA_DIR);
-async function storageBreakdown() {
-  return {
-    library: (await dirSize(dirs.apps)) + (await dirSize(dirs.tweaks)),
-    signed: await dirSize(dirs.signed),
-    certs: await dirSize(dirs.certs),
-    temp: (await dirSize(dirs.tmp)) + (await dirSize(dirs.work)) + (await dirSize(dirs.cache)),
-  };
+// Adding up every file is slow on a big server, so the totals are worked out at most once a minute
+// (the app asks for them on every refresh). Two refreshes at once share the same count.
+let storageMemo = null;
+function storageTotals() {
+  if (storageMemo && Date.now() - storageMemo.at < 60000) return storageMemo.p;
+  const p = (async () => {
+    const b = {
+      library: (await dirSize(dirs.apps)) + (await dirSize(dirs.tweaks)),
+      signed: await dirSize(dirs.signed),
+      certs: await dirSize(dirs.certs),
+      temp: (await dirSize(dirs.tmp)) + (await dirSize(dirs.work)) + (await dirSize(dirs.cache)),
+    };
+    return { used: await dirSize(DATA_DIR), breakdown: b };
+  })();
+  storageMemo = { at: Date.now(), p };
+  p.catch(() => { storageMemo = null; });
+  return p;
 }
+const storageUsed = async () => (await storageTotals()).used;
+const storageBreakdown = async () => (await storageTotals()).breakdown;
 
 // ----- download cache -----
 // Apps that live elsewhere (Telegram, GitHub, links) are downloaded each time they're signed. The last
@@ -1280,10 +1291,28 @@ async function downloadToTmp(u, job) {
   return dest;
 }
 
+// Links the server downloads must be on the internet, not this server or the private network it runs on.
+function isPrivateHost(hostname) {
+  const h = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (!h || h === 'localhost' || /\.(localhost|local|internal|lan|home)$/.test(h) || !h.includes('.') && !h.includes(':')) return true;
+  const v4 = h.replace(/^::ffff:/, '').match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (v4) {
+    const [a, b] = [Number(v4[1]), Number(v4[2])];
+    return a === 0 || a === 10 || a === 127 || (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254)
+      || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || a >= 224;
+  }
+  if (h.includes(':')) return h === '::' || h === '::1' || /^f[cd]/.test(h) || /^fe[89ab]/.test(h);
+  return false;
+}
+function checkPublicUrl(u) {
+  if (isPrivateHost(u.hostname)) throw httpError(400, "That link points inside your server's own network, which isn't allowed. Use a public link.");
+}
+
 function parseLink(url) {
   let u;
   try { u = new URL(String(url).trim()); } catch { throw httpError(400, 'Enter a valid link'); }
   if (!/^https?:$/.test(u.protocol)) throw httpError(400, 'Link must start with http or https');
+  checkPublicUrl(u);
   // Friendly fix for Dropbox share links
   if (/(^|\.)dropbox\.com$/.test(u.hostname) && u.searchParams.get('dl') === '0') u.searchParams.set('dl', '1');
   return u;
@@ -1724,6 +1753,14 @@ async function inspectLink(url, headers, job) {
   }
 }
 
+// People who aren't testers can't sign or download beta versions (they're hidden from them).
+function checkVersionAllowed(app, acc, versionIndex) {
+  if (!versionIndex || seesTesterApps(acc) || !app.remote) return;
+  const list = app.remote.kind === 'source' ? mergedVersions(app) : (app.remote.versions || []);
+  const v = list[versionIndex];
+  if (v && /^(beta|alpha|pre)/i.test(String(v.channel || ''))) throw httpError(403, 'That version is only for testers');
+}
+
 function newLibraryRecord(meta, extra = {}) {
   const now = new Date().toISOString();
   return {
@@ -1775,11 +1812,20 @@ async function fetchText(url, accept = 'application/json, text/html;q=0.9, */*;q
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 30000);
   try {
+    checkPublicUrl(new URL(url));
     const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Mango-Signer)', Accept: accept }, redirect: 'follow', signal: ctrl.signal });
     if (!r.ok) throw new Error(`Couldn't load the source (HTTP ${r.status})`);
     const len = Number(r.headers.get('content-length')) || 0;
     if (len > 25 * 1048576) throw new Error('That source is too big');
-    const text = await r.text();
+    // Read it in pieces so a source without a size can't be endless.
+    const chunks = [];
+    let got = 0;
+    for await (const c of r.body) {
+      got += c.length;
+      if (got > 25 * 1048576) { ctrl.abort(); throw new Error('That source is too big'); }
+      chunks.push(c);
+    }
+    const text = Buffer.concat(chunks).toString('utf8');
     if (text.length > 25 * 1048576) throw new Error('That source is too big');
     return text;
   } catch (e) {
@@ -2822,12 +2868,13 @@ const CATEGORY_WORDS = [
   ['Utilities', /\b(vpn|proxy|adblock\w*|ad ?blocker|dns|ssh|terminal|torrent|downloader|file ?manager|filza|browser|keyboard|scanner|calculator|clipboard|shortcuts?|stikdebug|stik|jit|sidestore|altstore|esign|feather|ksign|gbox|scarlet|trollstore|appdb|livecontainer)\b/i],
 ];
 // Your category for one of the names above: one you already have with that name, or a new one.
-function categoryNamed(name) {
+function existingCategoryNamed(name) {
   const want = name.toLowerCase();
-  const mine = store.categories.find((c) => c.name.toLowerCase() === want)
+  return store.categories.find((c) => c.name.toLowerCase() === want)
     || store.categories.find((c) => { const m = sources.categoryFor(c.name); return m && m.name.toLowerCase() === want; });
-  return mine ? mine.id : categoryIdFor(name);
 }
+function categoryNamed(name) { const mine = existingCategoryNamed(name); return mine ? mine.id : categoryIdFor(name); }
+function categoryGuessNamed(name) { const mine = existingCategoryNamed(name); return mine ? mine.id : `new:${name}`; }
 
 // Lookalikes: built from apps that already have a category, rebuilt at most every few seconds.
 const SIMILAR_STOP = new Set(['the', 'app', 'apps', 'pro', 'free', 'lite', 'plus', 'super', 'mango', 'ios', 'iphone', 'ipad', 'mobile', 'my', 'new', 'best', 'mod', 'hack', 'tweaked', 'beta', 'premium', 'official']);
@@ -2889,6 +2936,13 @@ function sourceCategory(app) {
   const [cid, n] = [...counts.entries()].sort((x, y) => y[1] - x[1])[0];
   return n / list.length >= 0.7 ? { categoryId: cid, share: Math.round((100 * n) / list.length) } : null;
 }
+// Like categoryIdFor, but never makes a category: a missing one comes back as "new:Name" (for guesses).
+function categoryGuessFor(genre) {
+  const c = sources.categoryFor(genre);
+  if (!c) return null;
+  const mine = store.categories.find((x) => x.name.toLowerCase() === c.name.toLowerCase());
+  return mine ? mine.id : `new:${c.name}`;
+}
 const catName = (cid) => (store.categories.find((c) => c.id === cid) || {}).name || '?';
 const HOW_LABEL = { rule: 'your rule', appstore: 'App Store', similar: 'like', keyword: 'name', source: 'same source' };
 
@@ -2899,16 +2953,17 @@ async function autoCategory(app, extraText = '', opts = {}) {
   const byRule = ruleCategory(text);
   let info = await appStoreInfo(app, { cachedOnly: true });
   if (byRule) return { categoryId: byRule, info, how: 'rule', why: HOW_LABEL.rule };
-  if (info && info.genre && info.matchedBy === 'bundleId') return { categoryId: categoryIdFor(info.genre), info, how: 'appstore', why: `App Store: ${info.genre}` };
+  const fromGenre = (g) => (opts.localOnly ? categoryGuessFor(g) : categoryIdFor(g));
+  if (info && info.genre && info.matchedBy === 'bundleId') return { categoryId: fromGenre(info.genre), info, how: 'appstore', why: `App Store: ${info.genre}` };
   const sim = similarCategory(app);
   if (sim) return { categoryId: sim.categoryId, info, how: 'similar', why: `like ${sim.like}` };
   const name = `${app.name} ${app.originalName || ''} ${app.fileName || ''} ${app.bundleId || ''}`;
   const word = CATEGORY_WORDS.find(([, re]) => re.test(name)) || CATEGORY_WORDS.find(([, re]) => re.test(String(extraText).slice(0, 400)));
-  if (word) return { categoryId: opts.localOnly ? (store.categories.find((c) => c.name.toLowerCase() === word[0].toLowerCase()) || {}).id || `new:${word[0]}` : categoryNamed(word[0]), info, how: 'keyword', why: `name says ${word[0]}` };
+  if (word) return { categoryId: opts.localOnly ? categoryGuessNamed(word[0]) : categoryNamed(word[0]), info, how: 'keyword', why: `name says ${word[0]}` };
   if (info === undefined && !opts.localOnly) {
     try { info = await appStoreInfo(app, { fresh: opts.fresh }); } catch (e) { if (opts.throwBusy) throw e; info = null; }
   }
-  if (info && info.genre) return { categoryId: opts.localOnly ? null : categoryIdFor(info.genre), info, how: 'appstore', why: `App Store: ${info.genre}`, genre: info.genre };
+  if (info && info.genre) return { categoryId: fromGenre(info.genre), info, how: 'appstore', why: `App Store: ${info.genre}` };
   const src = sourceCategory(app);
   if (src) return { categoryId: src.categoryId, info, how: 'source', why: `${src.share}% of its source` };
   return { categoryId: null, info, how: null };
@@ -2978,7 +3033,6 @@ route('POST', /^\/api\/apps\/category-guesses$/, async (req, res) => {
     const r = await autoCategory(app, app.notes || '', { localOnly: true });
     let cid = r.categoryId, suggest = null;
     if (cid && cid.startsWith('new:')) { suggest = cid.slice(4); cid = null; }
-    if (!cid && r.genre) { const m = sources.categoryFor(r.genre); suggest = m && m.name; cid = m && (store.categories.find((c) => c.name.toLowerCase() === m.name.toLowerCase()) || {}).id || null; if (cid) suggest = null; }
     if (cid || suggest) guesses[aid] = { categoryId: cid || null, newCategory: suggest, why: r.why || '' };
   }
   json(res, { guesses });
@@ -4142,6 +4196,7 @@ route('GET', /^\/api\/apps\/([a-f0-9]{16})\/ipa$/, async (req, res, m, acc) => {
   const limit = signLimitFor(acc);
   if (limit && signsToday(acc.id) >= limit) return fail(res, 429, `You've used all ${limit} signs for today. It resets at midnight (server time).`);
   const versionIndex = Math.max(0, Math.min(14, Number(req.query.get('v')) || 0));
+  checkVersionAllowed(app, acc, versionIndex);
   const count = () => { if (req.method !== 'HEAD') { countSign(acc.id, app.id); store.save(); } };
   const fileName = `${app.name} ${app.version || ''}.ipa`.replace(/[^\w.\- ]/g, '_');
   if (!app.remote) { count(); return serveFile(req, res, path.join(dirs.apps, app.id + '.ipa'), { download: fileName }); }
@@ -4184,6 +4239,7 @@ route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
   const entEdits = cleanEdits(b.entitlements, 'entitlement');
   const plistEdits = cleanEdits(b.plist, 'Info.plist');
   const versionIndex = Math.max(0, Math.min(14, Number(b.versionIndex) || 0));
+  checkVersionAllowed(app, acc, versionIndex);
   if (app.remote && app.remote.missing) return fail(res, 410, 'This app was removed from its source');
 
   const iconFile = b.iconUploadId ? tmpPath(b.iconUploadId, acc) : null;
