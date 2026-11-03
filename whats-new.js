@@ -3,6 +3,22 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.11.2',
+    date: '2026-11-03',
+    title: 'Telegram Apps Sign Again',
+    summary: 'Apps from Telegram channels no longer get stuck on "Downloading".',
+    sections: [
+      {
+        title: '✍️ Signing',
+        items: [
+          'When Telegram makes Mango wait before sending a file, signing shows a countdown and carries on by itself instead of looking stuck.',
+          'Cancelling a sign now stops its Telegram download right away, so it doesn\'t slow down the next one.',
+          'If a Telegram file can\'t be downloaded, you see the real reason instead of a spinner.',
+        ],
+      },
+    ],
+  },
+  {
     version: '1.11.1',
     date: '2026-11-03',
     title: 'Sign in the Background',

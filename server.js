@@ -1641,13 +1641,40 @@ async function fetchAuthed(url, headers, signal) {
   return first;
 }
 
-async function fetchToFile(url, headers, dest, job, label) {
+// While a Telegram download is quiet, asks the helper whether Telegram told us to pause. A pause is
+// shown as a countdown in the sign log (and doesn't count as a stall); returns a stop function.
+function watchTelegramWait(job, idle, lastData) {
+  let shown = -1;
+  const t = setInterval(async () => {
+    if (Date.now() - lastData() < 4000) return;
+    let w = 0;
+    try { w = Number((await tg.call('GET', '/wait')).wait) || 0; } catch { return; }
+    if (w <= 0) return;
+    idle.kick();
+    if (!job) return;
+    const line = `Telegram asked Mango to wait ${Math.floor(w / 60)}:${String(w % 60).padStart(2, '0')} before sending more of this file. It will carry on by itself…`;
+    if (shown >= 0 && job.log[shown] && job.log[shown].startsWith('Telegram asked Mango to wait')) job.log[shown] = line;
+    else { job.log.push(line); shown = job.log.length - 1; }
+  }, 3000);
+  t.unref && t.unref();
+  return () => clearInterval(t);
+}
+
+async function fetchToFile(url, headers, dest, job, label, opts = {}) {
   if (job && label) job.log.push(label);
   if (job) job.cancellable = true;
   const idle = idleSignal(job && job.signal);
+  let lastData = Date.now();
+  const stopWatch = opts.telegram ? watchTelegramWait(job, idle, () => lastData) : () => {};
   let r;
-  try { r = await fetchAuthed(url, headers, idle.signal); } catch (e) { idle.done(); throw idle.stalled() ? idle.signal.reason : e; }
-  if (!r.ok || !r.body) { idle.done(); throw new Error(`Download failed (HTTP ${r.status}). The link may have moved or expired.`); }
+  try { r = await fetchAuthed(url, headers, idle.signal); } catch (e) { idle.done(); stopWatch(); throw idle.stalled() ? idle.signal.reason : e; }
+  if (!r.ok || !r.body) {
+    idle.done(); stopWatch();
+    // The Telegram helper explains what went wrong (e.g. the post was deleted, or a long rate limit).
+    let why = '';
+    if (opts.telegram) { try { why = (await r.json()).error || ''; } catch { /* */ } }
+    throw new Error(why || `Download failed (HTTP ${r.status}). The link may have moved or expired.`);
+  }
   if (/text\/html/i.test(r.headers.get('content-type') || '')) {
     idle.done();
     r.body.cancel().catch(() => {});
@@ -1659,6 +1686,7 @@ async function fetchToFile(url, headers, dest, job, label) {
   const body = Readable.fromWeb(r.body);
   body.on('data', (c) => {
     got += c.length;
+    lastData = Date.now();
     idle.kick();
     if (job) {
       job.progress = total ? got / total : null;
@@ -1673,6 +1701,7 @@ async function fetchToFile(url, headers, dest, job, label) {
     throw idle.stalled() ? idle.signal.reason : e;
   } finally {
     idle.done();
+    stopWatch();
   }
   if (total && got < total) {
     await rmQuiet(dest);
@@ -4123,7 +4152,7 @@ route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
           job.log.push(`Using ${app.name}${dl.version ? ' ' + dl.version : ''} downloaded earlier — no download needed ✓`);
         } else {
           const t0 = Date.now();
-          const got = await fetchToFile(dl.url, dl.headers, input, job, `Downloading ${app.name}${dl.version ? ' ' + dl.version : ''}…`);
+          const got = await fetchToFile(dl.url, dl.headers, input, job, `Downloading ${app.name}${dl.version ? ' ' + dl.version : ''}${dl.telegram ? ' from Telegram' : ''}…`, { telegram: !!dl.telegram });
           const secs = Math.max(1, (Date.now() - t0) / 1000);
           if (got > 5 * 1048576) job.log.push(`Downloaded ${gb(got)} in ${Math.round(secs)}s (${(got / 1048576 / secs).toFixed(1)} MB/s)`);
           await cachePut(input, key);
