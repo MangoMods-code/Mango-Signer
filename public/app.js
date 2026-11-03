@@ -806,7 +806,7 @@ function appRow(a, { age = false } = {}) {
   const checked = state.lib.selected.has(a.id);
   const rating = a.likes + a.dislikes ? `👍 ${Math.round((100 * a.likes) / (a.likes + a.dislikes))}%` : '';
   const when = age ? `${a.updatedAt && a.updatedAt !== a.addedAt ? 'Updated' : 'Added'} ${ago(a.updatedAt || a.addedAt)}` : '';
-  const sub2 = [when, a.developer, fmtSize(a.size), a.installCount ? `🔥 ${a.installCount}` : '', rating].filter(Boolean).join(' · ');
+  const sub2 = [when, fmtSize(a.size), a.developer, a.installCount ? `🔥 ${a.installCount}` : '', rating].filter(Boolean).join(' · ');
   return `
     <div class="row ${checked ? 'selected' : ''}" data-act="${sel ? 'toggle-select' : 'app'}" data-id="${a.id}">
       ${sel ? `<span class="check ${checked ? 'on' : ''}">${checked ? ICONS.check : ''}</span>` : ''}
@@ -825,7 +825,7 @@ function appTile(a) {
   return `<button class="tile" data-act="app" data-id="${a.id}">
     <span class="tile-icon">${appIcon(a, true)}${hasUpdate(a) ? '<i class="tile-dot up">⬆</i>' : a.installed ? '<i class="tile-dot ok">✓</i>' : isNewApp(a) ? '<i class="tile-dot new">NEW</i>' : ''}</span>
     <span class="tile-name">${esc(a.name)}</span>
-    <span class="tile-sub">${esc(shownVersion(a) || '')}</span>
+    <span class="tile-sub">${esc([shownVersion(a), fmtSize(a.size)].filter(Boolean).join(' · '))}</span>
   </button>`;
 }
 
@@ -1093,9 +1093,10 @@ function renderSigned() {
     <div class="row" data-act="signed" data-id="${s.id}">
       ${signedIcon(s)}
       <div class="row-main">
-        <div class="row-title">${esc(s.name)} ${s.onPhone ? '<span class="badge good">On your phone</span>' : ''} ${badge}</div>
+        <div class="row-title">${esc(s.name)}</div>
+        ${s.onPhone || badge || s.savedOnGithub ? `<div class="row-badges">${s.onPhone ? '<span class="badge good">On your phone</span>' : ''}${badge}${s.savedOnGithub ? '<span class="badge">☁ Saved</span>' : ''}</div>` : ''}
         <div class="row-sub">${esc(s.version || '—')} · ${esc(s.certLabel)}</div>
-        <div class="row-sub">Signed ${ago(s.signedAt)} · ${fmtSize(s.size)}${s.savedOnGithub ? ' · ☁ saved' : ''}</div>
+        <div class="row-sub">Signed ${ago(s.signedAt)} · ${fmtSize(s.size)}</div>
       </div>
       ${s.fileAvailable ? `<button class="pill" data-act="install" data-id="${s.id}">Get</button>` : `<button class="pill dim" data-act="resign" data-id="${s.id}">Re-sign</button>`}
     </div>`;
