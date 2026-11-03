@@ -3,6 +3,20 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.9.9',
+    date: '2026-11-03',
+    title: 'GitHub Updates Fix, Part 2',
+    summary: 'Apps from GitHub repos now always pick the release that came out last.',
+    sections: [
+      {
+        title: '🛠 Fixes',
+        items: [
+          'GitHub doesn\'t always list releases newest first, so some apps from GitHub repos stayed on an older release. Mango now goes by the date each release came out.',
+        ],
+      },
+    ],
+  },
+  {
     version: '1.9.8',
     date: '2026-11-03',
     title: 'GitHub Updates Fix',
