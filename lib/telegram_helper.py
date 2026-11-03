@@ -19,7 +19,7 @@ from urllib.parse import urlparse, parse_qs
 try:
     from telethon import TelegramClient, errors, utils
     from telethon.sessions import StringSession
-    from telethon.tl.types import DocumentAttributeFilename
+    from telethon.tl.types import DocumentAttributeFilename, InputPeerChannel
 except Exception as e:  # pragma: no cover
     print(f"ERROR telethon is not installed ({e})", flush=True)
     sys.exit(3)
@@ -37,7 +37,7 @@ PARALLEL = max(1, min(16, int(os.environ.get("TG_PARALLEL", "8") or 8)))
 
 client = TelegramClient(StringSession(SESSION or None), API_ID, API_HASH,
                         device_model="Mango Signer", app_version="1.7", system_version="Server",
-                        flood_sleep_threshold=60, connection_retries=5, retry_delay=2)
+                        flood_sleep_threshold=5, connection_retries=5, retry_delay=2)
 login = {"phone": None}
 entities = {}
 
@@ -59,6 +59,11 @@ def clean_ref(ref):
 
 
 async def entity(ref):
+    # "peer:<id>:<access_hash>" is a channel Mango already looked up once. Using it directly skips
+    # looking the @username up again, which Telegram only allows a limited number of times a day.
+    m = re.match(r"^peer:(\d+):(-?\d+)$", str(ref or ""))
+    if m:
+        return InputPeerChannel(int(m.group(1)), int(m.group(2)))
     key = clean_ref(ref)
     if key not in entities:
         entities[key] = await client.get_entity(key)
@@ -142,7 +147,7 @@ async def r_channel(q, body):
     e = await entity(q.get("ref", [""])[0])
     title = getattr(e, "title", None) or " ".join(x for x in [getattr(e, "first_name", None), getattr(e, "last_name", None)] if x)
     return {"id": e.id, "title": title or str(e.id), "username": getattr(e, "username", None),
-            "members": getattr(e, "participants_count", None)}
+            "members": getattr(e, "participants_count", None), "access_hash": getattr(e, "access_hash", None)}
 
 
 async def r_posts(q, body):
@@ -383,8 +388,10 @@ async def handle(reader, writer):
             pass
         except Exception as e:  # turn Telegram errors into short messages
             status, msg = friendly(e)
+            if status == 429:
+                print(f"FLOOD wait {getattr(e, 'seconds', '?')}s on {target.split('?')[0]}", file=sys.stderr, flush=True)
             try:
-                await send_json(writer, status, {"error": msg})
+                await send_json(writer, status, {"error": msg, "wait": getattr(e, "seconds", None) if status == 429 else None})
             except Exception:
                 pass
     finally:
