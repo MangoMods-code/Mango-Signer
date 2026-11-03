@@ -4056,6 +4056,23 @@ route('POST', /^\/api\/certs\/zip$/, async (req, res, m, acc) => {
   }
 });
 
+// Your own certificate's files, so the iPhone app can sign on the phone with the certificates on your account
+// (no importing them twice, and they come back after reinstalling the app). Only ever your own.
+route('GET', /^\/api\/certs\/([a-f0-9]{16})\/bundle$/, async (req, res, m, acc) => {
+  const c = ownCert(acc, m[1]);
+  if (!c) return fail(res, 404, 'Certificate not found');
+  const dir = path.join(dirs.certs, c.id);
+  let p12, profile;
+  try {
+    [p12, profile] = await Promise.all([fsp.readFile(path.join(dir, 'cert.p12')), fsp.readFile(path.join(dir, 'profile.mobileprovision'))]);
+  } catch { return fail(res, 410, "This certificate's files are missing on the server. Add it again."); }
+  let password = '';
+  try { password = decrypt(c.password); } catch { return fail(res, 500, "Couldn't read this certificate's password. Add it again."); }
+  secEvent(req, 'cert-download', acc.username, true, `${c.label} to the iPhone app`);
+  res.setHeader('Cache-Control', 'no-store');
+  json(res, { id: c.id, label: c.label, p12: p12.toString('base64'), profile: profile.toString('base64'), password });
+});
+
 route('POST', /^\/api\/certs\/([a-f0-9]{16})\/check$/, async (req, res, m, acc) => {
   const c = ownCert(acc, m[1]);
   if (!c) return fail(res, 404, 'Certificate not found');

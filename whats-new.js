@@ -3,6 +3,21 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.12.4',
+    date: '2026-11-03',
+    title: 'Your Certificates, Everywhere',
+    summary: 'Signing on your iPhone now uses the certificates on your account.',
+    sections: [
+      {
+        title: '📱 iPhone app',
+        items: [
+          'Sign on this iPhone works with the certificates on your account (marked ☁). No need to add them a second time.',
+          'Reinstalled the app? Your account certificates come back by themselves.',
+        ],
+      },
+    ],
+  },
+  {
     version: '1.12.3',
     date: '2026-11-03',
     title: 'Privacy Tune-up',
