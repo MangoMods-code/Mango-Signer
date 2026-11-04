@@ -16,6 +16,7 @@ Upload an `.ipa`, add a `.p12` + `.mobileprovision`, tap **Sign**, then **Instal
   - **Any direct `.ipa` link** (link-only apps), or your own IPAs kept in a (private) GitHub repo's release
   - Files are downloaded only while signing; recent downloads are kept briefly (up to 1 GB, 2 days) so signing the same app again skips the download. Older versions can be picked when signing
 - **Telegram channels** – sign in once and Mango watches channels you pick: new `.ipa` posts are added to the library (or update the existing app), kept as links on Telegram or copied to your GitHub storage. Downloads fetch 8 pieces at once, and Telegram's rate limits are shown with a countdown instead of hanging
+- **Telegram bot** – announces new Mango Signer versions and iPhone app builds in your updates channel, posts new and updated library apps as branded cards in an apps channel, and moderates your chat (human check for newcomers, anti-spam, banned words, flood control, /warn /mute /ban /lock and more)
 - **No doubles** – adding a source, GitHub repo, Telegram channel or app link that's already there is refused, even if the link is written a little differently (http/https, www, capitals, a trailing slash, a releases page or tracking bits)
 - **Update checks & Activity** – every channel, repo, page and source is checked every hour, one at a time (repos and sources first, Telegram channels last, smallest first). The ⏳ Activity screen shows what's running, waiting in line and finished, with live logs, Check all now / Stop all, and a watchdog that stops anything stuck
 - **No duplicates** – "Skip apps I already have" per channel/source, a Duplicates screen to pick which copy of each app to keep (or clean them all up in one tap), and apps you delete from a source are remembered so refreshes don't bring them back (restore them from the source's page)
@@ -62,6 +63,14 @@ The owner signs in with the password only (leave username blank). Everyone else 
 Mango creates a release tagged `mango-library` and keeps each app as a release asset (up to 2 GB each). You can also drop `.ipa` files onto that release on github.com and tap **Sync**. The token is stored encrypted and never sent to the browser.
 
 With **Keep signed apps on GitHub** on (private repos only), signed apps go into a separate release tagged `mango-signed` (then `mango-signed-2`, `-3`… before GitHub's 1,000-file limit). Mango manages it: deleting a signed app in the Signed tab deletes it there too.
+
+## Telegram bot (optional)
+1. In Telegram, open **@BotFather**, send `/newbot`, and copy the token it gives you.
+2. In Mango Signer, go to **Settings › 🤖 Telegram bot** and paste the token.
+3. Add the bot to your updates channel, apps channel and chat as an **admin** (post, delete and ban rights), then send a message in each so the bot sees it.
+4. Pick each chat in the bot's settings and turn on what you want.
+
+The bot only posts apps everyone can see (never hidden or testers-only ones), and turning the apps channel on starts from that moment instead of posting your whole library. In the chat, admins can reply to a message with `/warn`, `/mute 2h`, `/kick`, `/ban`, `/del` or `/pin`, or send `/lock` and `/unlock`.
 
 ## Telegram channels (optional)
 Uses [Telethon](https://github.com/LonamiWebs/Telethon) (MIT), installed in the Docker build.

@@ -3,6 +3,21 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.13.0',
+    date: '2026-11-03',
+    title: 'Mango Signer on Telegram',
+    summary: 'Updates and new apps now get posted on Telegram.',
+    sections: [
+      {
+        title: '🤖 Telegram',
+        items: [
+          'New Mango Signer versions, iPhone app builds and library apps are announced on Telegram.',
+          'Tap "Get it on Mango Signer" on an app post and that app opens right here.',
+        ],
+      },
+    ],
+  },
+  {
     version: '1.12.6',
     date: '2026-11-03',
     title: 'Cleaner Lists',

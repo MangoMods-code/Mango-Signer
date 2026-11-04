@@ -23,6 +23,7 @@ const deb = require('./lib/deb');
 const zipLib = require('./lib/zip');
 const telegram = require('./lib/telegram');
 const appstore = require('./lib/appstore');
+const tgbotLib = require('./lib/tgbot');
 
 // whats-new.js lives in the main folder (older versions kept it in lib/).
 const WHATS_NEW = (() => { try { return require('./whats-new'); } catch (e) { if (e.code !== 'MODULE_NOT_FOUND') throw e; return require('./lib/whats-new'); } })();
@@ -4953,6 +4954,139 @@ process.on('uncaughtException', (e) => {
 });
 server.headersTimeout = 60_000;
 
+// ----- Telegram bot (announcements + chat moderation) -----
+// Its settings live outside store.settings so they never go out with the owner's settings; the token is encrypted.
+if (!store.data.tgBot || typeof store.data.tgBot !== 'object') store.data.tgBot = {};
+const botCfg = () => store.data.tgBot;
+const tgbot = tgbotLib.createBot({
+  cfg: botCfg,
+  save: () => store.save(),
+  token: () => { const c = botCfg(); if (!c.tokenEnc) return null; try { return decrypt(c.tokenEnc); } catch { return null; } },
+  log: (msg) => console.log(msg),
+  appLink: (appId) => `${(botCfg().publicUrl || '').replace(/\/$/, '')}/?app=${appId}`,
+  // Only apps everyone can see: never hidden, testers-only or removed ones.
+  libraryApps: () => store.apps.filter((a) => a.published !== false && !a.testersOnly && !(a.remote && a.remote.missing)).map(appFeedItem),
+  release: async (repo) => {
+    if (!/^[\w.-]+\/[\w.-]+$/.test(repo || '')) return null;
+    const list = await githubApi(`/repos/${repo}/releases?per_page=10`);
+    // Real versions only (not drafts, or the iPhone app's "failed-N" error reports).
+    const r = (Array.isArray(list) ? list : []).filter((x) => !x.draft && /^v?\d/i.test(x.tag_name || ''))
+      .sort((a, b) => String(b.published_at || '').localeCompare(String(a.published_at || '')))[0];
+    if (!r) return null;
+    const ipa = (r.assets || []).find((x) => /\.ipa$/i.test(x.name));
+    return { tag: r.tag_name, name: r.name, body: r.body || '', url: r.html_url, ipaUrl: ipa ? ipa.browser_download_url : null };
+  },
+});
+// What a post about one app shows (nothing private: no links to the file, no storage details).
+function appFeedItem(a) {
+  const custom = a.customIcon ? path.join(dirs.apps, a.id + '-custom.png') : null;
+  const own = path.join(dirs.apps, a.id + '.png');
+  const cat = store.categories.find((c) => c.id === a.categoryId);
+  return {
+    id: a.id, name: a.name, version: a.versionOverride || a.version || '', size: fmtBytes(a.size),
+    category: cat ? cat.name : '', developer: a.developer || '',
+    notes: String(a.notes || '').trim(), description: String(a.description || '').trim(),
+    iconFile: custom && fs.existsSync(custom) ? custom : fs.existsSync(own) ? own : null,
+    iconUrl: !a.customIcon && a.iconURL ? a.iconURL : null,
+  };
+}
+function fmtBytes(b) {
+  if (!b) return '';
+  if (b < 1048576) return `${Math.max(1, Math.round(b / 1024))} KB`;
+  if (b < 1073741824) return `${(b / 1048576).toFixed(1)} MB`;
+  return `${(b / 1073741824).toFixed(2)} GB`;
+}
+function botView() {
+  const c = tgbot.cfg();
+  return {
+    connected: !!c.tokenEnc, running: tgbot.running, username: c.botUsername || null, lastError: tgbot.lastError,
+    chats: Object.values(c.chats || {}).sort((a, b) => String(a.title).localeCompare(String(b.title))),
+    updatesChat: c.updatesChat || '', appsChat: c.appsChat || '', groupChat: c.groupChat || '',
+    announce: c.announce, repos: c.repos, mod: c.mod, welcome: c.welcome, rules: c.rules, brand: c.brand,
+    publicUrl: c.publicUrl || '', queued: (c.appQueue || []).length, locked: Object.keys(c.locked || {}),
+  };
+}
+route('GET', /^\/api\/tgbot$/, (req, res) => json(res, { bot: botView() }), 'owner');
+route('POST', /^\/api\/tgbot\/token$/, async (req, res) => {
+  const { token } = await readJson(req);
+  const t = String(token || '').trim();
+  if (!/^\d{5,}:[\w-]{30,}$/.test(t)) return fail(res, 400, "That doesn't look like a bot token. It looks like 1234567890:AAH…, from @BotFather.");
+  let me;
+  try { me = await tgbot.check(t); } catch (e) { return fail(res, 400, e.code === 401 ? 'Telegram refused that token. Copy it again from @BotFather.' : e.message); }
+  const c = botCfg();
+  c.tokenEnc = encrypt(t);
+  c.botUsername = me.username;
+  c.botId = me.id;
+  c.publicUrl = c.publicUrl || baseUrl(req);
+  c.offset = 0;
+  store.save();
+  await tgbot.start();
+  json(res, { bot: botView() });
+}, 'owner');
+route('DELETE', /^\/api\/tgbot$/, (req, res) => {
+  tgbot.stop();
+  const c = botCfg();
+  delete c.tokenEnc;
+  c.botUsername = null;
+  store.save();
+  json(res, { bot: botView() });
+}, 'owner');
+route('PATCH', /^\/api\/tgbot$/, async (req, res) => {
+  const b = await readJson(req);
+  const c = tgbot.cfg();
+  const chatId = (v) => (v === '' || v === null ? '' : /^-?\d{5,}$/.test(String(v)) ? String(v) : /^@\w{4,}$/.test(String(v)) ? String(v) : undefined);
+  for (const k of ['updatesChat', 'appsChat', 'groupChat']) {
+    if (b[k] === undefined) continue;
+    const v = chatId(b[k]);
+    if (v === undefined) return fail(res, 400, 'Pick a chat from the list, or type its @username.');
+    if (k === 'appsChat' && v !== c.appsChat) c.seenApps = undefined; // start fresh: don't dump the whole library into a new channel
+    c[k] = v;
+  }
+  if (b.announce && typeof b.announce === 'object') for (const k of ['server', 'ios', 'apps']) if (typeof b.announce[k] === 'boolean') {
+    if (k === 'apps' && b.announce.apps && !c.announce.apps) c.seenApps = undefined;
+    c.announce[k] = b.announce[k];
+  }
+  if (b.repos && typeof b.repos === 'object') for (const k of ['server', 'ios']) if (typeof b.repos[k] === 'string') {
+    const r = b.repos[k].trim().replace(/^https?:\/\/github\.com\//i, '').replace(/\/+$/, '');
+    if (r && !/^[\w.-]+\/[\w.-]+$/.test(r)) return fail(res, 400, 'Repos look like owner/repo');
+    if (r !== c.repos[k]) delete c.lastTags[k];
+    c.repos[k] = r;
+  }
+  if (b.mod && typeof b.mod === 'object') {
+    for (const k of ['antispam', 'captcha', 'cleanJoins', 'flood']) if (typeof b.mod[k] === 'boolean') c.mod[k] = b.mod[k];
+    if (b.mod.newHours !== undefined) c.mod.newHours = Math.max(0, Math.min(720, Number(b.mod.newHours) || 0));
+    if (Array.isArray(b.mod.bannedWords)) c.mod.bannedWords = [...new Set(b.mod.bannedWords.map((w) => String(w).trim().toLowerCase()).filter(Boolean))].slice(0, 300).map((w) => w.slice(0, 60));
+  }
+  for (const k of ['welcome', 'rules']) if (typeof b[k] === 'string') c[k] = b[k].trim().slice(0, 1500);
+  if (typeof b.brand === 'string') c.brand = b.brand.trim().slice(0, 60) || tgbot.defaults.brand;
+  if (typeof b.publicUrl === 'string') {
+    try { const u = new URL(b.publicUrl.trim()); if (!/^https?:$/.test(u.protocol)) throw new Error(); c.publicUrl = u.origin; } catch { return fail(res, 400, 'Enter your Mango Signer link, like https://mango.example.com'); }
+  }
+  store.save();
+  json(res, { bot: botView() });
+}, 'owner');
+// Sends a test post, or the newest release / an app right now.
+route('POST', /^\/api\/tgbot\/post$/, async (req, res) => {
+  if (!tgbot.running) return fail(res, 400, 'Connect the bot first');
+  const { what, to, appId } = await readJson(req);
+  const c = tgbot.cfg();
+  const chat = { updates: c.updatesChat, apps: c.appsChat, group: c.groupChat }[to];
+  if (!chat) return fail(res, 400, 'Pick that chat first');
+  try {
+    if (what === 'test') await tgbot.api('sendMessage', { chat_id: chat, text: `✅ ${c.brand} bot is connected and can post here.` });
+    else if (what === 'server' || what === 'ios') { const r = await tgbot.announceRelease(what, { force: true, to: chat }); if (!r) return fail(res, 404, 'No release found on that repo'); }
+    else if (what === 'app') {
+      const a = (store.apps.find((x) => x.id === appId) || (() => { throw httpError(404, 'App not found'); })());
+      if (a.published === false || a.testersOnly) return fail(res, 400, 'Hidden and testers-only apps are never posted');
+      await tgbot.postApp(appFeedItem(a), 'new', chat);
+    } else return fail(res, 400, 'Unknown post');
+  } catch (e) {
+    return fail(res, 400, /not enough rights|chat not found|need administrator|CHAT_WRITE_FORBIDDEN|bot is not a member/i.test(e.message)
+      ? 'The bot can\'t post there. Add it to that channel or chat as an admin that can post messages.' : e.message);
+  }
+  json(res, { ok: true });
+}, 'owner');
+
 // Clean temp uploads older than a day.
 setInterval(async () => {
   for (const f of await fsp.readdir(dirs.tmp).catch(() => [])) {
@@ -4964,5 +5098,6 @@ setInterval(async () => {
 
 server.listen(PORT, () => {
   console.log(`Mango Signer ${VERSION} (build ${BUILD_ID}) running on port ${PORT} (data: ${DATA_DIR})`);
+  if (botCfg().tokenEnc) tgbot.start().catch(() => {});
   if (!APP_PASSWORD) console.log('WARNING: APP_PASSWORD is not set — anyone with the link has owner access.');
 });
