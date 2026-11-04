@@ -3,6 +3,35 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.13.5',
+    date: '2026-11-03',
+    title: 'New Look',
+    summary: 'Mango Signer has a brand-new logo.',
+    sections: [
+      {
+        title: '🥭 Design',
+        items: [
+          'A new Mango Signer logo for the website icon, the sign-in screen and "Add to Home Screen".',
+        ],
+      },
+    ],
+  },
+  {
+    version: '1.13.4',
+    date: '2026-11-03',
+    title: 'Sharper Pictures',
+    summary: 'App pictures on Telegram look much sharper.',
+    sections: [
+      {
+        title: '🤖 Telegram',
+        items: [
+          'App posts use a sharp, full-size icon, and apps without one get a picture instead of plain text.',
+          'Versions that are long build codes show short, like "build 76d3759".',
+        ],
+      },
+    ],
+  },
+  {
     version: '1.13.3',
     date: '2026-11-03',
     title: 'Tidier Settings',

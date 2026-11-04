@@ -1240,7 +1240,7 @@ async function addAppFromFile(file, fileName, source) {
   const meta = await inspectOrFail(file);
   const appId = id();
   await fsp.rename(file, path.join(dirs.apps, appId + '.ipa'));
-  if (meta.icon) await fsp.writeFile(path.join(dirs.apps, appId + '.png'), meta.icon);
+  await saveAppIcon(appId, meta);
   const now = new Date().toISOString();
   const rec = {
     id: appId, fileName: fileName || `${meta.name}.ipa`, source: source || 'upload', addedAt: now, updatedAt: now,
@@ -1259,7 +1259,7 @@ async function replaceAppFile(app, file) {
   const meta = await inspectOrFail(file);
   const oldVersion = app.version;
   await fsp.rename(file, path.join(dirs.apps, app.id + '.ipa'));
-  if (meta.icon) await fsp.writeFile(path.join(dirs.apps, app.id + '.png'), meta.icon);
+  await saveAppIcon(app.id, meta);
   const oldShown = app.versionOverride || oldVersion;
   Object.assign(app, metaFields(meta), { updatedAt: new Date().toISOString(), previousVersion: oldShown, versionOverride: null });
   if (!app.customIcon) app.hasIcon = !!meta.icon;
@@ -1412,7 +1412,7 @@ route('POST', /^\/api\/apps\/([a-f0-9]{16})\/replace$/, async (req, res, m, acc)
         const oldShown = app.versionOverride || app.version;
         Object.assign(app, metaFields(meta), { updatedAt: new Date().toISOString(), previousVersion: oldShown, versionOverride: null });
         notifyUpdate(app, oldShown);
-        if (meta.icon && !app.customIcon) await fsp.writeFile(path.join(dirs.apps, app.id + '.png'), meta.icon);
+        if (!app.customIcon) await saveAppIcon(app.id, meta);
         await rmQuiet(path.join(dirs.apps, app.id + '.ipa'));
         app.remote = { kind: 'link', url: u.toString() };
         store.save();
@@ -1523,7 +1523,7 @@ async function deleteApp(appId, { keepRemote = false, exclude = false } = {}) {
   }
   store.apps.splice(i, 1);
   for (const list of Object.values(store.data.myApps || {})) delete list[appId];
-  for (const suffix of ['.ipa', '.png', '-custom.png']) await rmQuiet(path.join(dirs.apps, appId + suffix));
+  for (const suffix of ['.ipa', '.png', '-hd.png', '-custom.png']) await rmQuiet(path.join(dirs.apps, appId + suffix));
   await rmQuiet(path.join(dirs.apps, appId + '-shots'));
   for (const c of store.collections) c.appIds = c.appIds.filter((x) => x !== appId);
   return true;
@@ -1784,6 +1784,14 @@ function checkVersionAllowed(app, acc, versionIndex) {
   if (v && /^(beta|alpha|pre)/i.test(String(v.channel || ''))) throw httpError(403, "That version isn't available to you");
 }
 
+// An app's icon (180px, for the library) plus a sharper copy (up to 512px) for big pictures like Telegram posts.
+async function saveAppIcon(appId, meta) {
+  if (!meta || !meta.icon) return;
+  await fsp.writeFile(path.join(dirs.apps, appId + '.png'), meta.icon);
+  if (meta.iconHd && meta.iconHd.length > meta.icon.length) await fsp.writeFile(path.join(dirs.apps, appId + '-hd.png'), meta.iconHd);
+  else await rmQuiet(path.join(dirs.apps, appId + '-hd.png'));
+}
+
 function newLibraryRecord(meta, extra = {}) {
   const now = new Date().toISOString();
   return {
@@ -1819,7 +1827,7 @@ route('POST', /^\/api\/apps\/link$/, async (req, res, m, acc) => {
       job.log.push(`Reading app info from ${u.hostname}…`);
       const meta = await inspectLink(u.toString(), null, job);
       const rec = newLibraryRecord(meta, { fileName: decodeURIComponent(path.basename(u.pathname)) || 'app.ipa', source: 'link', remote: { kind: 'link', url: u.toString() } });
-      if (meta.icon) await fsp.writeFile(path.join(dirs.apps, rec.id + '.png'), meta.icon);
+      await saveAppIcon(rec.id, meta);
       store.apps.unshift(rec);
       store.save();
       job.result = { app: appView(rec, acc) };
@@ -2279,7 +2287,7 @@ async function ghSync() {
       const dl = gh.download(asset.id);
       const meta = await inspectLink(dl.url, dl.headers);
       const rec = newLibraryRecord({ ...meta, size: asset.size }, { fileName: asset.name, source: 'github', remote: { kind: 'github', assetId: asset.id, name: asset.name } });
-      if (meta.icon) await fsp.writeFile(path.join(dirs.apps, rec.id + '.png'), meta.icon);
+      await saveAppIcon(rec.id, meta);
       store.apps.unshift(rec);
       added++;
     } catch (e) { failed.push(`${asset.name}: ${e.message}`); }
@@ -3285,7 +3293,12 @@ function tgCreds(extra = {}) {
   const t = tgSettings();
   return { apiId: decrypt(t.apiIdEnc), apiHash: decrypt(t.apiHashEnc), session: t.sessionEnc ? decrypt(t.sessionEnc) : '', ...extra };
 }
-if (tgReady()) tg.start(tgCreds()).catch((e) => console.error('Telegram:', e.message));
+// A saved login that can't be unlocked (the server's secret key changed) must never stop the server from starting.
+if (tgReady()) {
+  try { tg.start(tgCreds()).catch((e) => console.error('Telegram:', e.message)); } catch {
+    console.error("Telegram: the saved sign-in can't be read anymore (the server's secret key changed?). Connect Telegram again in Settings.");
+  }
+}
 
 const tgView = () => {
   const t = tgSettings();
@@ -3432,7 +3445,7 @@ async function tgImportPost(src, post, job, preMeta) {
       const cap = cleanCaption(String(post.text || '').split('\n').map((l) => l.trim()).filter(Boolean).slice(0, 12).join('\n')).slice(0, 600);
       if (cap) app.description = cap;
     }
-    if (meta.icon && !app.customIcon) await fsp.writeFile(path.join(dirs.apps, app.id + '.png'), meta.icon);
+    if (!app.customIcon) await saveAppIcon(app.id, meta);
     if (old && old.screenshots) remote.screenshots = old.screenshots;
     if ((!app.categoryId || !catExists(app.categoryId)) && !locked.has('categoryId') && (!src.categoryId || src.categoryId === '__auto')) {
       const r = await autoCategory(app, post.text);
@@ -3464,7 +3477,7 @@ async function tgImportPost(src, post, job, preMeta) {
     }
     if (r.categoryId) job.log.push(`  → ${catName(r.categoryId)} (${r.why})`);
   }
-  if (meta.icon) await fsp.writeFile(path.join(dirs.apps, rec.id + '.png'), meta.icon);
+  await saveAppIcon(rec.id, meta);
   store.apps.unshift(rec);
   job.log.push(`+ ${rec.name} ${rec.version}`);
   return 'added';
@@ -4871,13 +4884,13 @@ route('GET', /^\/i\/([\w-]{20,40})\/?$/, async (req, res, m) => {
   const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
   const fill = (vals) => tpl.replace(/{{(\w+)}}/g, (_, k) => esc(vals[k] ?? ''));
   if (!s || !signedReady(s)) {
-    return send(res, 404, fill({ title: 'Link expired', name: 'This link has expired', meta: 'Ask for a new install link.', icon: '/icon-180.png', install: '#', hidden: 'hidden' }), { 'Content-Type': 'text/html; charset=utf-8' });
+    return send(res, 404, fill({ title: 'Link expired', name: 'This link has expired', meta: 'Ask for a new install link.', icon: '/icon-180.png?v=2', install: '#', hidden: 'hidden' }), { 'Content-Type': 'text/html; charset=utf-8' });
   }
   const v = signedView(s, req);
   send(res, 200, fill({
     title: `Install ${s.name}`, name: s.name,
     meta: `Version ${s.version || '?'} · ${(s.size / 1048576).toFixed(1)} MB`,
-    icon: s.hasIcon ? `/i/${s.token}/icon.png` : '/icon-180.png',
+    icon: s.hasIcon ? `/i/${s.token}/icon.png` : '/icon-180.png?v=2',
     install: v.installUrl, hidden: '',
   }), { 'Content-Type': 'text/html; charset=utf-8' });
 }, 'open');
@@ -4895,7 +4908,12 @@ route('GET', /^\/api\/qr$/, (req, res) => {
 const iconCache = {};
 route('GET', /^\/(?:apple-touch-icon(?:-precomposed)?|icon-(\d+))\.png$/, (req, res, m) => {
   const size = Math.min(1024, Math.max(32, Number(m[1]) || 180));
-  iconCache[size] = iconCache[size] || drawAppIcon(size);
+  if (!iconCache[size]) {
+    // Your logo (public/logo.png, 1024×1024) shrunk to the size asked for. The drawn mango is only a fallback.
+    let logo = null;
+    try { logo = fs.readFileSync(path.join(PUBLIC_DIR, 'logo.png')); } catch {}
+    iconCache[size] = (logo && shrinkPng(logo, size)) || drawAppIcon(size);
+  }
   send(res, 200, iconCache[size], { 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=604800' });
 }, 'open');
 
@@ -4983,13 +5001,21 @@ const tgbot = tgbotLib.createBot({
 function appFeedItem(a) {
   const custom = a.customIcon ? path.join(dirs.apps, a.id + '-custom.png') : null;
   const own = path.join(dirs.apps, a.id + '.png');
+  const hd = path.join(dirs.apps, a.id + '-hd.png');
   const cat = store.categories.find((c) => c.id === a.categoryId);
   return {
     id: a.id, name: a.name, version: a.versionOverride || a.version || '', size: fmtBytes(a.size),
     category: cat ? cat.name : '', developer: a.developer || '',
     notes: String(a.notes || '').trim(), description: String(a.description || '').trim(),
-    iconFile: custom && fs.existsSync(custom) ? custom : fs.existsSync(own) ? own : null,
+    // Sharpest first: your custom icon, the big copy from the app, the source's picture, then the small one.
+    iconFile: custom && fs.existsSync(custom) ? custom : fs.existsSync(hd) ? hd : !a.iconURL && fs.existsSync(own) ? own : null,
     iconUrl: !a.customIcon && a.iconURL ? a.iconURL : null,
+    iconSmall: fs.existsSync(own) ? own : null,
+    // No icon at all? An app from a GitHub repo can show the repo owner's GitHub picture instead.
+    iconFallbackUrl: (() => {
+      const src = a.remote && a.remote.sourceId && store.sources.find((x) => x.id === a.remote.sourceId);
+      return src && src.repo && /^[\w.-]+$/.test(src.repo.owner) ? `https://github.com/${src.repo.owner}.png?size=512` : null;
+    })(),
   };
 }
 function fmtBytes(b) {
