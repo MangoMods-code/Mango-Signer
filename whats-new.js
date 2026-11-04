@@ -3,6 +3,20 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.14.1',
+    date: '2026-11-03',
+    title: 'Faster Checks',
+    summary: 'Checking for new and updated apps is much quicker.',
+    sections: [
+      {
+        title: '⚡ Speed',
+        items: [
+          'Update checks on big app channels finish much faster, so new apps show up sooner.',
+        ],
+      },
+    ],
+  },
+  {
     version: '1.14.0',
     date: '2026-11-03',
     title: 'Sign Your Own Apps',

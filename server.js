@@ -3387,8 +3387,10 @@ const tg = telegram.createHelper();
 // Checks which of a channel's apps still have their post, 200 at a time (Telegram's limit per call).
 // Apps whose post is gone get marked removed; apps whose post is back get unmarked.
 // A batch that fails to check is left alone, so a hiccup never marks apps as removed.
-async function tgMarkRemoved(src, job = null) {
-  const linked = store.apps.filter((a) => a.remote && a.remote.kind === 'telegram' && a.remote.sourceId === src.id && !a.remote.ghAssetId);
+// limit = only the newest that many posts (regular checks); no limit = every app (a weekly sweep, and before "Delete removed apps").
+async function tgMarkRemoved(src, job = null, limit = 0) {
+  let linked = store.apps.filter((a) => a.remote && a.remote.kind === 'telegram' && a.remote.sourceId === src.id && !a.remote.ghAssetId);
+  if (limit) linked = linked.sort((a, b) => b.remote.msgId - a.remote.msgId).slice(0, limit);
   let newlyGone = 0;
   for (let i = 0; i < linked.length; i += 200) {
     const batch = linked.slice(i, i + 200);
@@ -3414,6 +3416,8 @@ const tgReady = () => !!(tgSettings() && tgSettings().sessionEnc);
 const tgRef = (src) => (src && src.peerKey ? `peer:${src.peerKey}` : src && src.ref);
 // 1.9.0 saved rounded keys (field "peer"), which Telegram rejects as "private". Drop them; they're looked up again.
 { let fixed = 0; for (const src of store.sources) if (src.peer !== undefined) { delete src.peer; fixed++; } if (fixed) store.save(); }
+// 1.14.1: the full "still posted?" check went weekly. Count the last one as a full one, so it doesn't all run right after updating.
+for (const src of store.sources) if (src.kind === 'telegram' && !src.removedFullAt && src.removedCheckAt) src.removedFullAt = src.removedCheckAt;
 const tgRefFor = (remote) => { const src = store.sources.find((x) => x.id === remote.sourceId); return src ? tgRef(src) : remote.ref; };
 async function ensurePeer(src, job) {
   if (src.peerKey) return;
@@ -3780,12 +3784,16 @@ function tgSync(src, acc) {
       }
       const newest = posts.length ? Math.max(...posts.map((p) => p.id)) : 0;
       src.lastMsgId = blocked ? maxDone : Math.max(src.lastMsgId || 0, newest);
-      // Posts deleted from the channel: hide those apps (unless they were copied to GitHub). Checking
-      // every app's post takes a while on big channels, so it's done every 6 hours, not on every check.
+      // Posts deleted from the channel: hide those apps (unless they were copied to GitHub). Channels mostly
+      // delete recent posts, so each check only looks at the newest 100 apps. Every app is checked once a week
+      // (and again right before "Delete removed apps"), since that takes a while on channels with thousands.
       const linkedCount = store.apps.filter((a) => a.remote && a.remote.kind === 'telegram' && a.remote.sourceId === src.id && !a.remote.ghAssetId).length;
-      if (!job.cancelled && linkedCount && (!src.removedCheckAt || Date.now() - new Date(src.removedCheckAt) > 6 * 3600_000)) {
-        job.log.push(`Checking your ${linkedCount.toLocaleString()} apps from ${src.name} are still posted…`);
-        result.removed += await tgMarkRemoved(src, job);
+      if (!job.cancelled && linkedCount) {
+        const full = !src.removedFullAt || Date.now() - new Date(src.removedFullAt) > 7 * 864e5;
+        const n = full ? linkedCount : Math.min(linkedCount, 100);
+        job.log.push(full && linkedCount > 100 ? `Weekly check: making sure all ${linkedCount.toLocaleString()} apps from ${src.name} are still posted…` : `Checking the newest ${n} apps from ${src.name} are still posted…`);
+        result.removed += await tgMarkRemoved(src, job, full ? 0 : 100);
+        if (full) src.removedFullAt = new Date().toISOString();
         src.removedCheckAt = new Date().toISOString();
         job.counter = null;
       }
