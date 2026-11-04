@@ -3,7 +3,7 @@ const $ = (s, el = document) => el.querySelector(s);
 const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 
 const state = {
-  tab: 'library', account: null, apps: [], categories: [], certs: [], signed: [], users: [], invites: [], settings: {}, server: {},
+  tab: 'imports', account: null, imports: [], apps: [], categories: [], certs: [], signed: [], users: [], invites: [], settings: {}, server: {},
   sources: [], github: { connected: false }, tweaks: [], presets: [], substrate: { installed: false },
   alerts: [], favorites: [], mySignins: [], securityLog: [],
   udidState: null,
@@ -145,7 +145,7 @@ function uploadStreams() {
 
 // Uploads a file in numbered pieces, several at once. If the connection drops it waits,
 // asks which pieces are missing, and sends only those.
-async function uploadFile(file, onProgress, onStatus) {
+async function uploadFile(file, onProgress, onStatus, purpose) {
   const CHUNK = 8 * 1024 * 1024;
   uploadFile.active = (uploadFile.active || 0) + 1;
   keepAwake(true);
@@ -155,7 +155,7 @@ async function uploadFile(file, onProgress, onStatus) {
       onProgress && onProgress(1);
       return data;
     }
-    const { uploadId, chunkSize, count } = await api('POST', '/api/upload/start', { size: file.size, chunkSize: CHUNK });
+    const { uploadId, chunkSize, count } = await api('POST', '/api/upload/start', { size: file.size, chunkSize: CHUNK, purpose });
     const done = new Set();
     const inFlight = new Map(); // piece -> bytes sent so far
     let doneBytes = 0;
@@ -327,7 +327,7 @@ function iconHtml(src, name, big = false) {
   if (!src) return `<div class="${cls}">${letter}</div>`;
   return `<img class="${cls} fade-img" src="${esc(src)}" alt="" loading="lazy" onload="this.classList.add('loaded')" onerror="this.outerHTML='<div class=&quot;${cls}&quot;>${letter}</div>'">`;
 }
-const appIcon = (a, big) => iconHtml(a.hasIcon || a.customIcon ? `/api/apps/${a.id}/icon?v=${a.iconVersion || 0}` : null, a.name, big);
+const appIcon = (a, big) => iconHtml(a.isImport ? a.iconSrc : a.hasIcon || a.customIcon ? `/api/apps/${a.id}/icon?v=${a.iconVersion || 0}` : null, a.name, big);
 const signedIcon = (s, big) => iconHtml(s.hasIcon ? `/i/${s.token}/icon.png` : null, s.name, big);
 
 async function copy(text, msg = 'Copied') {
@@ -350,6 +350,7 @@ const ICONS = {
   search: '<svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>',
 };
 const TAB_ICONS = {
+  imports: '<svg viewBox="0 0 24 24"><path d="M12 3v11"/><path d="m7.5 9.5 4.5 4.5 4.5-4.5"/><path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>',
   library: '<svg viewBox="0 0 24 24"><rect x="3" y="3" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="2"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="2"/></svg>',
   signed: ICONS.down,
   certs: '<svg viewBox="0 0 24 24"><path d="M12 3 4.5 6v5.5c0 4.5 3.2 8.2 7.5 9.5 4.3-1.3 7.5-5 7.5-9.5V6z"/><path d="m8.8 12 2.2 2.2 4.4-4.4"/></svg>',
@@ -605,8 +606,8 @@ function defaultsSummary(d = {}) {
 // ---------- render ----------
 function tabsFor() {
   return isStaff()
-    ? [['library', 'Library'], ['signed', 'Signed'], ['certs', 'Certificates'], ['users', 'Users'], ['settings', isOwner() ? 'Settings' : 'Account']]
-    : [['library', 'Apps'], ['signed', 'Signed'], ['certs', 'Certificates'], ['settings', 'Account']];
+    ? [['imports', 'Apps'], ['library', 'Library'], ['signed', 'Signed'], ['certs', 'Certs'], ['users', 'Users'], ['settings', isOwner() ? 'Settings' : 'Account']]
+    : [['imports', 'Apps'], ['library', 'Library'], ['signed', 'Signed'], ['certs', 'Certificates'], ['settings', 'Account']];
 }
 
 function renderTabs() {
@@ -624,12 +625,12 @@ function renderTabs() {
 }
 
 function render() {
-  if (!tabsFor().some(([k]) => k === state.tab)) state.tab = 'library';
+  if (!tabsFor().some(([k]) => k === state.tab)) state.tab = 'imports';
   const title = Object.fromEntries(tabsFor())[state.tab];
-  $('#pageTitle').textContent = state.tab === 'library' && !isStaff() ? 'App Library' : title;
+  $('#pageTitle').textContent = state.tab === 'library' && !isStaff() ? 'App Library' : state.tab === 'imports' ? 'Your Apps' : title;
   renderTabs();
   const top = $('#topAction');
-  const actions = { library: isStaff() ? addAppSheet : null, certs: addCertSheet, users: newInviteSheet };
+  const actions = { imports: importIpa, library: isStaff() ? addAppSheet : null, certs: addCertSheet, users: newInviteSheet };
   top.innerHTML = actions[state.tab] ? ICONS.plus : '';
   top.onclick = actions[state.tab] || null;
   top.classList.toggle('hidden', !actions[state.tab]);
@@ -639,9 +640,113 @@ function render() {
   $('#bellDot').textContent = unread > 9 ? '9+' : unread || '';
   $('#bellBtn').onclick = alertsSheet;
   const view = $('#view');
-  view.innerHTML = announcementHtml() + { library: renderLibrary, signed: renderSigned, certs: renderCerts, users: renderUsers, settings: renderSettings }[state.tab]();
+  view.innerHTML = announcementHtml() + { imports: renderImports, library: renderLibrary, signed: renderSigned, certs: renderCerts, users: renderUsers, settings: renderSettings }[state.tab]();
   bindView(view);
   if (state.tab === 'library') bindLibrary(view);
+}
+
+// ---------- your own apps (imported .ipa files) ----------
+function renderImports() {
+  const list = state.imports || [];
+  const onGh = !!state.importsOnGithub;
+  const keepNote = onGh ? 'Apps you import stay here until you delete them.' : 'Apps you import are kept for 3 days. Sign them before then.';
+  const pick = `<button class="file-btn" data-act="import-ipa">${ICONS.plus}<div class="row-main"><div class="row-title">Import an .ipa</div><div class="row-sub">From Files, iCloud Drive or your Downloads. Only you can see apps you import.</div></div></button>`;
+  if (!list.length) {
+    return `${pick}
+      <div class="empty" style="margin-top:18px">${TAB_ICONS.imports}<h3>Sign your own apps</h3><p>Import an .ipa from your iPhone, then sign and install it with your certificate. ${esc(keepNote)}</p>
+      <button class="btn" data-act="go-library">Or browse the App Library</button></div>`;
+  }
+  const row = (a) => {
+    const signed = state.signed.find((x) => x.appId === a.id);
+    const left = a.expires ? Math.max(0, Math.ceil((new Date(a.expires) - Date.now()) / DAY)) : null;
+    const badges = [
+      a.onGithub ? '<span class="badge">☁ Saved</span>' : a.savingToGithub ? '<span class="badge">☁ Saving…</span>' : '',
+      left !== null ? `<span class="badge ${left <= 1 ? 'warn' : ''}">${left ? `Kept ${left}d` : 'Removed soon'}</span>` : '',
+      signed ? '<span class="badge good">Signed</span>' : '',
+      !a.available ? '<span class="badge bad">File gone</span>' : '',
+    ].join('');
+    return `
+    <div class="row" data-act="import" data-id="${a.id}">
+      ${appIcon(a)}
+      <div class="row-main">
+        <div class="row-title">${esc(a.name)}</div>
+        ${badges ? `<div class="row-badges">${badges}</div>` : ''}
+        <div class="row-sub">${esc(a.version || '—')} · ${fmtSize(a.size)}${a.lastSigned ? ` · signed ${ago(a.lastSigned)}` : ` · added ${ago(a.addedAt)}`}</div>
+      </div>
+      <button class="pill${a.available ? '' : ' dim'}" data-act="sign-import" data-id="${a.id}">Sign</button>
+    </div>`;
+  };
+  return `${pick}
+    <p class="hint" style="margin:10px 4px 6px">${esc(keepNote)}</p>
+    <div class="section-title">Imported <span class="count">${list.length}</span></div>
+    <div class="list">${list.map(row).join('')}</div>`;
+}
+
+const findImportApp = (id) => (state.imports || []).find((x) => x.id === id);
+
+async function importIpa() {
+  const file = await pickFile('');
+  if (!file) return;
+  if (!/\.ipa$/i.test(file.name)) return toast('Pick an .ipa file', true);
+  openSheet(`
+    <div class="progress-wrap">
+      <h2 style="margin:0 0 4px">Importing ${esc(file.name)}</h2>
+      <p class="muted small">${fmtSize(file.size)}</p>
+      <div id="addProgress"></div>
+    </div>`);
+  const el = $('#sheetBody');
+  const box = $('#addProgress', el);
+  closeSheet.locked = true;
+  $('#sheet').classList.add('locked');
+  box.innerHTML = uploadProgressHtml();
+  const setProgress = (p, msg) => {
+    if (p != null) $('.bar > div', box).style.width = `${Math.round(p * 100)}%`;
+    if (msg) $('#addMsg', box).textContent = msg;
+  };
+  const unlock = () => { closeSheet.locked = false; $('#sheet').classList.remove('locked'); };
+  try {
+    const up = await uploadFile(file, (p) => setProgress(p, `Uploading ${Math.round(p * 100)}%`), (t) => { $('#addSub', box).textContent = t || ''; }, 'ipa');
+    setProgress(1, 'Reading app info…');
+    $('#addSub', box).textContent = '';
+    const { import: imp } = await api('POST', '/api/imports', { uploadId: up.uploadId, fileName: file.name });
+    unlock();
+    await refresh().catch(() => {});
+    if (state.tab === 'imports') render();
+    toast(`Imported ${imp.name}`);
+    signSheet(imp.id);
+  } catch (e) {
+    unlock();
+    closeSheet();
+    toast(e.cancelled ? 'Cancelled' : e.message, !e.cancelled);
+  }
+}
+
+function importSheet(id) {
+  const a = findImportApp(id);
+  if (!a) return toast('That app was deleted', true);
+  const signed = state.signed.find((x) => x.appId === a.id);
+  const where = a.onGithub ? 'Saved until you delete it' : a.savingToGithub ? 'Saving to storage…' : a.expires ? `Removed ${new Date(a.expires).toLocaleDateString()}` : 'On the server';
+  openSheet(`
+    <div class="sheet-head">${appIcon(a, true)}<div class="row-main"><h2>${esc(a.name)}</h2><div class="row-sub">${esc(a.version || '—')} · ${fmtSize(a.size)}</div></div></div>
+    <dl class="kv">
+      <dt>Bundle ID</dt><dd>${esc(a.bundleId || '—')}</dd>
+      ${a.minOS ? `<dt>Needs iOS</dt><dd>${esc(a.minOS)}+</dd>` : ''}
+      <dt>File</dt><dd>${esc(a.fileName || '')}</dd>
+      <dt>Imported</dt><dd>${esc(ago(a.addedAt))}</dd>
+      <dt>Kept</dt><dd>${esc(where)}</dd>
+    </dl>
+    <div class="actions" style="margin-top:14px">
+      ${a.available ? '<button class="btn primary big block" id="iSign">Sign App</button>' : '<p class="warning bad">This file is gone. Import it again to sign it.</p>'}
+      ${signed && signed.fileAvailable ? '<button class="btn block" id="iGet">Install the signed copy</button>' : ''}
+      <button class="btn danger block" id="iDel">Delete</button>
+    </div>`, (el) => {
+    if ($('#iSign', el)) $('#iSign', el).onclick = () => signSheet(a.id);
+    if ($('#iGet', el)) $('#iGet', el).onclick = () => { closeSheet(); signedSheet(signed.id); };
+    $('#iDel', el).onclick = async () => {
+      if (!confirm(`Delete ${a.name}? Your signed copy stays in the Signed tab.`)) return;
+      try { await api('DELETE', `/api/imports/${a.importId}`); await refresh(); closeSheet(); render(); toast('Deleted'); } catch (e) { toast(e.message, true); }
+    };
+  });
 }
 
 // ---------- library ----------
@@ -1354,6 +1459,9 @@ function bindView(view) {
         'add-app': addAppSheet,
         'add-cert': addCertSheet,
         'go-library': () => switchTab('library'),
+        'import-ipa': importIpa,
+        import: () => importSheet(idv),
+        'sign-import': () => (findImportApp(idv) && findImportApp(idv).available ? signSheet(idv) : importSheet(idv)),
         'go-certs': () => switchTab('certs'),
         app: () => appSheet(idv),
         sign: () => signSheet(idv),
@@ -3695,8 +3803,8 @@ function catRulesSheet(back) {
 
 // ---------- signing ----------
 function signSheet(appId, overrides) {
-  const a = state.apps.find((x) => x.id === appId);
-  if (!a) return toast('That app is no longer in the library', true);
+  const a = state.apps.find((x) => x.id === appId) || findImportApp(appId);
+  if (!a) return toast(String(appId).startsWith('imp_') ? 'That app was deleted from your Apps tab' : 'That app is no longer in the library', true);
   if (!state.certs.length) {
     closeSheet();
     toast('Add a certificate first', true);
@@ -3704,7 +3812,7 @@ function signSheet(appId, overrides) {
   }
   const def = state.certs.find((c) => c.isDefault) || state.certs[0];
   const extra = { icon: null, dylibs: [] };
-  const defaults = overrides || a.signDefaults || {};
+  const defaults = overrides || (a.isImport ? {} : a.signDefaults) || {};
   const summary = defaultsSummary(defaults);
 
   openSheet(`
@@ -3864,7 +3972,7 @@ function signSheet(appId, overrides) {
 function resignFromSigned(sid) {
   const s = state.signed.find((x) => x.id === sid);
   if (!s) return;
-  if (!state.apps.find((a) => a.id === s.appId)) return toast('That app is no longer in the library', true);
+  if (!state.apps.find((a) => a.id === s.appId) && !findImportApp(s.appId)) return toast(String(s.appId).startsWith('imp_') ? 'That app was deleted from your Apps tab. Import it again.' : 'That app is no longer in the library', true);
   signSheet(s.appId);
 }
 
