@@ -51,6 +51,7 @@ const dirs = {
   work: path.join(DATA_DIR, 'work'),
   tweaks: path.join(DATA_DIR, 'tweaks'),
   cache: path.join(DATA_DIR, 'cache'),
+  imports: path.join(DATA_DIR, 'imports'),
 };
 for (const d of Object.values(dirs)) fs.mkdirSync(d, { recursive: true });
 fs.rmSync(dirs.work, { recursive: true, force: true });
@@ -63,6 +64,7 @@ for (const c of store.certs) if (!c.ownerId) c.ownerId = 'owner';
 for (const s of store.signed) if (!s.ownerId) s.ownerId = 'owner';
 for (const a of store.apps) if (a.published === undefined) a.published = true;
 if (store.settings.maxSignedPerUser === undefined) store.settings.maxSignedPerUser = 10;
+store.data.imports = store.data.imports || [];
 if (store.settings.udidLogin === undefined) store.settings.udidLogin = true;
 if (store.settings.signedRetentionDays === undefined) store.settings.signedRetentionDays = 7;
 if (store.settings.deleteAfterInstall === undefined) store.settings.deleteAfterInstall = true;
@@ -526,6 +528,117 @@ async function dedupeSigned() {
   if (removed) { store.save(); console.log(`Removed ${removed} duplicate signed cop${removed === 1 ? 'y' : 'ies'}`); }
 }
 dedupeSigned().catch((e) => console.error('dedupe:', e));
+
+// ----- your own .ipa files (the Apps tab) -----
+// Anyone can import an .ipa and sign it. Only the person who imported it can see it.
+// With GitHub storage connected (private repo) it's kept in a "Mango Imports" release until they delete it,
+// and the copy on this server is removed. Without it, it stays on this server for IMPORT_KEEP_DAYS.
+const IMPORTS_TAG = 'mango-imports';
+const IMPORT_KEEP_DAYS = 3;
+const IMPORTS_PER_USER = 30;
+const importsToGithubOn = () => { const g = ghSettings(); return !!(g && g.private && ghClient()); };
+const importFile = (imp) => path.join(dirs.imports, imp.id + '.ipa');
+const importIconFile = (imp) => path.join(dirs.imports, imp.id + '.png');
+const myImports = (acc) => store.data.imports.filter((x) => x.ownerId === acc.id);
+const findImport = (acc, appId) => {
+  const m = /^imp_([a-f0-9]{16})$/.exec(String(appId || ''));
+  return m ? store.data.imports.find((x) => x.id === m[1] && x.ownerId === acc.id) || null : null;
+};
+function importView(imp) {
+  const local = fs.existsSync(importFile(imp));
+  return {
+    id: 'imp_' + imp.id, importId: imp.id, isImport: true, name: imp.name, bundleId: imp.bundleId, version: imp.version, build: imp.build,
+    minOS: imp.minOS, size: imp.size, extensions: imp.extensions, hasWatch: imp.hasWatch, hasIcon: imp.hasIcon,
+    iconSrc: imp.hasIcon ? `/api/imports/${imp.id}/icon` : null, fileName: imp.fileName, addedAt: imp.addedAt, lastSigned: imp.lastSigned || null,
+    onGithub: !!imp.gh, savingToGithub: !imp.gh && local && importsToGithubOn() && (imp.ghTries || 0) < 5,
+    expires: imp.gh || (local && importsToGithubOn() && (imp.ghTries || 0) < 5) ? null : new Date(new Date(imp.addedAt).getTime() + IMPORT_KEEP_DAYS * 864e5).toISOString(),
+    available: local || !!imp.gh,
+  };
+}
+// Looks like a library app to the signing code.
+function importAsApp(imp) {
+  const local = fs.existsSync(importFile(imp));
+  return {
+    id: 'imp_' + imp.id, isImport: true, importRec: imp, name: imp.name, bundleId: imp.bundleId, version: imp.version, size: imp.size,
+    minOS: imp.minOS, hasIcon: imp.hasIcon, updatedAt: imp.addedAt, localFile: local ? importFile(imp) : null, iconFile: importIconFile(imp),
+    remote: !local && imp.gh ? { kind: 'github', assetId: imp.gh.assetId } : null,
+  };
+}
+async function importsRelease(gh) {
+  const g = ghSettings();
+  let r = g.importsRelease;
+  if (!r || r.count >= 950) {
+    const n = r ? (r.n || 1) + 1 : 1;
+    const tag = n === 1 ? IMPORTS_TAG : `${IMPORTS_TAG}-${n}`;
+    const rel = await gh.ensureRelease(tag, { name: n === 1 ? 'Mango Imports' : `Mango Imports ${n}`, body: 'Apps people imported into Mango Signer to sign. Managed automatically: deleting an app from the Apps tab deletes it here.' });
+    const count = n === 1 && !r ? (await gh.listAssets(rel.id).catch(() => [])).length : 0;
+    r = g.importsRelease = { id: rel.id, tag, n, count };
+    store.save();
+    if (count >= 950) return importsRelease(gh);
+  }
+  return r;
+}
+let savingImports = false;
+async function archiveImports() {
+  if (savingImports || !importsToGithubOn()) return;
+  savingImports = true;
+  try {
+    for (;;) {
+      const imp = store.data.imports.find((x) => !x.gh && (x.ghTries || 0) < 5 && (!x.ghAfter || Date.now() > x.ghAfter) && fs.existsSync(importFile(x)));
+      if (!imp || !importsToGithubOn()) break;
+      const gh = ghClient();
+      try {
+        const st = await fsp.stat(importFile(imp));
+        const rel = await importsRelease(gh);
+        const name = `import-${normName(imp.name).slice(0, 40) || 'app'}-${(imp.version || 'v').replace(/[^\w.]/g, '')}-${imp.id}.ipa`;
+        const asset = await gh.uploadStream(rel.id, name, Readable.toWeb(fs.createReadStream(importFile(imp))), st.size, null);
+        ghSettings().importsRelease.count++;
+        if (!store.data.imports.includes(imp)) { await gh.deleteAsset(asset.id).catch(() => {}); continue; } // deleted while uploading
+        imp.gh = { assetId: asset.id, releaseId: rel.id };
+        delete imp.ghTries; delete imp.ghAfter;
+        store.save();
+        // Not while it's being signed (the signing reads the file); the hourly tidy-up removes it later.
+        if (![...signingNow.keys()].some((k) => k.endsWith(':imp_' + imp.id))) await rmQuiet(importFile(imp));
+      } catch (e) {
+        imp.ghTries = (imp.ghTries || 0) + 1;
+        imp.ghAfter = Date.now() + 5 * 60_000 * imp.ghTries;
+        store.save();
+        console.error(`Saving ${imp.name} to GitHub failed:`, e.message);
+        break;
+      }
+    }
+  } finally { savingImports = false; }
+}
+async function removeImport(imp) {
+  const i = store.data.imports.indexOf(imp);
+  if (i >= 0) store.data.imports.splice(i, 1);
+  await rmQuiet(importFile(imp));
+  await rmQuiet(importIconFile(imp));
+  if (imp.gh) {
+    const gh = ghClient();
+    if (gh) await gh.deleteAsset(imp.gh.assetId).catch(() => {});
+    const r = ghSettings() && ghSettings().importsRelease;
+    if (r && r.count > 0) r.count--;
+  }
+  store.save();
+}
+// Hourly: save new imports to GitHub, drop server copies already saved there, and remove old ones kept only here.
+async function tidyImports() {
+  for (const imp of [...store.data.imports]) {
+    const local = fs.existsSync(importFile(imp));
+    const busy = [...signingNow.keys()].some((k) => k.endsWith(':imp_' + imp.id));
+    if (busy) continue;
+    if (imp.gh && local) await rmQuiet(importFile(imp));
+    else if (!imp.gh && !local) await removeImport(imp); // file is gone everywhere
+    else if (!imp.gh && (!importsToGithubOn() || (imp.ghTries || 0) >= 5) && Date.now() - new Date(imp.addedAt) > IMPORT_KEEP_DAYS * 864e5) await removeImport(imp); // couldn't be saved to GitHub either
+  }
+  // Files left behind by a crash.
+  const known = new Set(store.data.imports.map((x) => x.id));
+  for (const f of await fsp.readdir(dirs.imports).catch(() => [])) if (!known.has(f.slice(0, 16))) await rmQuiet(path.join(dirs.imports, f));
+  archiveImports().catch(() => {});
+}
+setInterval(() => tidyImports().catch(() => {}), 3600_000).unref();
+setTimeout(() => tidyImports().catch(() => {}), 90_000).unref();
 
 // ---------- jobs (with a small signing queue) ----------
 const jobs = new Map();
@@ -991,7 +1104,7 @@ function storageTotals() {
       library: (await dirSize(dirs.apps)) + (await dirSize(dirs.tweaks)),
       signed: await dirSize(dirs.signed),
       certs: await dirSize(dirs.certs),
-      temp: (await dirSize(dirs.tmp)) + (await dirSize(dirs.work)) + (await dirSize(dirs.cache)),
+      temp: (await dirSize(dirs.tmp)) + (await dirSize(dirs.work)) + (await dirSize(dirs.cache)) + (await dirSize(dirs.imports)),
     };
     return { used: await dirSize(DATA_DIR), breakdown: b };
   })();
@@ -1097,6 +1210,8 @@ route('GET', /^\/api\/state$/, async (req, res, m, acc) => {
     favorites: store.favorites[acc.id] || [],
     mySignins: store.securityLog.filter((e) => e.user === acc.username && /^login|signout/.test(e.type)).slice(-8).reverse(),
     presets: store.presets.filter((p) => p.ownerId === acc.id).map(({ ownerId, ...p }) => p),
+    imports: myImports(acc).map(importView),
+    importsOnGithub: importsToGithubOn(),
     substrate: substrateView(),
     announcement: store.settings.announcement && store.settings.announcement.text ? store.settings.announcement : null,
     server: { baseUrl: base, https: base.startsWith('https://'), version: displayVersion(), codeVersion: VERSION },
@@ -1154,9 +1269,9 @@ route('POST', /^\/api\/upload$/, async (req, res, m, acc) => {
 // Resumable, parallel uploads: the file is split into numbered pieces that can arrive in any order,
 // several at once. If the connection drops, the phone asks which pieces are missing and sends just those.
 route('POST', /^\/api\/upload\/start$/, async (req, res, m, acc) => {
-  const { size, chunkSize } = await readJson(req);
+  const { size, chunkSize, purpose } = await readJson(req);
   const total = Number(size);
-  const limit = isStaff(acc) ? MAX_UPLOAD : MAX_USER_UPLOAD;
+  const limit = isStaff(acc) || purpose === 'ipa' ? MAX_UPLOAD : MAX_USER_UPLOAD; // anyone can import an .ipa to sign
   if (!Number.isFinite(total) || total <= 0) return fail(res, 400, 'Empty file');
   if (total > limit) return fail(res, 413, 'File is too large');
   const disk = diskInfo();
@@ -1217,6 +1332,49 @@ route('PUT', /^\/api\/upload\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
     u.active.delete(index);
   }
   json(res, { received: u.received, done: u.received === u.size });
+});
+
+// ----- your imported .ipa files -----
+route('POST', /^\/api\/imports$/, async (req, res, m, acc) => {
+  const { uploadId, fileName } = await readJson(req);
+  const file = tmpPath(uploadId, acc);
+  if (myImports(acc).length >= IMPORTS_PER_USER) { await rmQuiet(file); return fail(res, 400, `You can keep ${IMPORTS_PER_USER} imported apps. Delete one you don't need first.`); }
+  const meta = await inspectOrFail(file);
+  const imp = {
+    id: id(), ownerId: acc.id, name: meta.name || 'App', fileName: String(fileName || `${meta.name}.ipa`).slice(0, 200),
+    bundleId: meta.bundleId || '', version: meta.version || '', build: meta.build || '', minOS: meta.minOS || '',
+    extensions: meta.extensions, hasWatch: meta.hasWatch, size: meta.size, hasIcon: !!meta.icon, addedAt: new Date().toISOString(),
+  };
+  try {
+    await fsp.rename(file, importFile(imp));
+    if (meta.icon) await fsp.writeFile(importIconFile(imp), shrinkPng(meta.iconHd || meta.icon, 180));
+  } catch (e) { await rmQuiet(file); await rmQuiet(importFile(imp)); throw e; }
+  // Importing the same app and version again replaces the older copy.
+  for (const old of myImports(acc).filter((x) => x.bundleId && x.bundleId === imp.bundleId && x.version === imp.version)) await removeImport(old);
+  store.data.imports.unshift(imp);
+  store.save();
+  setTimeout(() => archiveImports().catch(() => {}), 5_000);
+  json(res, { import: importView(imp) });
+});
+route('DELETE', /^\/api\/imports\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
+  const imp = findImport(acc, 'imp_' + m[1]);
+  if (!imp) return fail(res, 404, 'Already deleted');
+  await removeImport(imp);
+  json(res, { ok: true });
+});
+// The original file, for "Sign on this iPhone" in the iPhone app.
+route('GET', /^\/api\/imports\/([a-f0-9]{16})\/file$/, async (req, res, m, acc) => {
+  const imp = findImport(acc, 'imp_' + m[1]);
+  if (!imp) return fail(res, 404, 'That app was deleted from your Apps tab');
+  const name = `${imp.name}.ipa`;
+  if (fs.existsSync(importFile(imp))) return serveFile(req, res, importFile(imp), { download: name });
+  if (!imp.gh || !ghClient()) return fail(res, 410, 'That file is gone. Import it again.');
+  return serveSignedFromGithub(req, res, { gh: imp.gh, name: imp.name });
+});
+route('GET', /^\/api\/imports\/([a-f0-9]{16})\/icon$/, (req, res, m, acc) => {
+  const imp = findImport(acc, 'imp_' + m[1]);
+  if (!imp || !imp.hasIcon) return fail(res, 404, 'No icon');
+  return serveFile(req, res, importIconFile(imp), { type: 'image/png', cache: 'private, max-age=86400' });
 });
 
 // ----- app library (owner manages, everyone browses) -----
@@ -2399,9 +2557,9 @@ route('POST', /^\/api\/github\/move$/, async (req, res, m, acc) => {
 // ----- daily sign limits -----
 const today = () => new Date().toISOString().slice(0, 10);
 function signsToday(uid) { const c = store.data.signCounts[uid]; return c && c.day === today() ? c.n : 0; }
-function countSign(uid, appId) {
+function countSign(uid, appId, name) {
   store.data.signLog = store.data.signLog || [];
-  store.data.signLog.push({ at: new Date().toISOString(), uid, appId });
+  store.data.signLog.push({ at: new Date().toISOString(), uid, appId, ...(String(appId).startsWith('imp_') ? { name } : {}) });
   if (store.data.signLog.length > 6000) store.data.signLog.splice(0, store.data.signLog.length - 6000);
   const c = store.data.signCounts[uid];
   store.data.signCounts[uid] = c && c.day === today() ? { day: c.day, n: c.n + 1 } : { day: today(), n: 1 };
@@ -2567,7 +2725,7 @@ route('GET', /^\/api\/stats$/, (req, res) => {
   active.delete('owner');
   const activity = [
     ...installs.slice(-60).map((l) => ({ at: l.at, kind: 'install', text: `${nameOf(l.ownerId)} installed ${l.name || appName(l.appId)}${l.shownVersion || l.version ? ' ' + (l.shownVersion || l.version) : ''}` })),
-    ...signs.slice(-60).map((x) => ({ at: x.at, kind: 'sign', text: `${nameOf(x.uid)} signed ${appName(x.appId)}` })),
+    ...signs.slice(-60).map((x) => ({ at: x.at, kind: 'sign', text: `${nameOf(x.uid)} signed ${x.name ? `${x.name} (own file)` : appName(x.appId)}` })),
     ...signups.slice(-20).map((e) => ({ at: e.at, kind: 'user', text: `${e.user} joined` })),
     ...store.requests.slice(-20).map((r) => ({ at: r.createdAt, kind: 'request', text: `${r.username} asked for ${r.name}` })),
   ].sort((a, b) => String(b.at).localeCompare(String(a.at))).slice(0, 60);
@@ -4290,8 +4448,12 @@ route('GET', /^\/api\/apps\/([a-f0-9]{16})\/ipa$/, async (req, res, m, acc) => {
 
 route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
   const b = await readJson(req);
-  const app = visibleApps(acc).find((a) => a.id === b.appId);
+  const imported = findImport(acc, b.appId);
+  if (/^imp_/.test(String(b.appId || '')) && !imported) return fail(res, 404, 'That app was deleted from your Apps tab. Import it again.');
+  const app = imported ? importAsApp(imported) : visibleApps(acc).find((a) => a.id === b.appId);
   if (!app) return fail(res, 404, 'App not found');
+  if (imported && !app.localFile && !app.remote) return fail(res, 410, 'That file is gone. Import it again.');
+  if (imported && app.remote && !ghClient()) return fail(res, 400, 'This app is saved in GitHub storage, which is not connected right now. Ask the owner to reconnect it.');
   const cert = ownCert(acc, b.certId || defaultCertId(acc));
   if (!cert) return fail(res, 400, 'Add a certificate first');
   if (!zsignVersion) return fail(res, 500, 'The signing engine is not installed on the server');
@@ -4332,7 +4494,7 @@ route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
   const job = newJob(acc);
   job.cancellable = true;
   job.title = `Signing ${app.name}`;
-  countSign(acc.id, app.id);
+  countSign(acc.id, app.id, app.name);
   job.countedFor = acc.id;
   signingNow.set(runKey, job.id);
   json(res, { jobId: job.id });
@@ -4401,7 +4563,7 @@ route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
       if (b.removeUISD) args.push('-U');
       if (b.enableDocs) args.push('-S');
 
-      let input = path.join(dirs.apps, app.id + '.ipa');
+      let input = app.localFile || path.join(dirs.apps, app.id + '.ipa');
       if (dl) {
         // App stored elsewhere: use a recent download if there is one, otherwise download it for this signing.
         const key = downloadCacheKey(app, versionIndex, dl);
@@ -4433,7 +4595,7 @@ route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
       job.log.push('Reading signed app…');
       const meta = await ipa.inspect(out);
       if (meta.icon) await fsp.writeFile(path.join(dirs.signed, signedId + '.png'), meta.icon);
-      else if (app.hasIcon) await fsp.copyFile(path.join(dirs.apps, app.id + '.png'), path.join(dirs.signed, signedId + '.png')).catch(() => {});
+      else if (app.hasIcon) await fsp.copyFile(app.iconFile || path.join(dirs.apps, app.id + '.png'), path.join(dirs.signed, signedId + '.png')).catch(() => {});
 
       const rec = {
         id: signedId, ownerId: acc.id, token: token(), appId: app.id, certId: cert.id, certLabel: cert.label,
@@ -4446,6 +4608,7 @@ route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
         },
       };
       store.signed.unshift(rec);
+      if (app.importRec) app.importRec.lastSigned = rec.signedAt;
       // Replace any older signed copy of this app (only one copy per app per person).
       for (const old of previous().filter((x) => x.id !== rec.id)) await removeSigned(old);
       trimSigned(acc);
@@ -4455,6 +4618,7 @@ route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
       job.log.push('Done!');
       if (job.notify) { addAlert(acc.id, 'signed', `✅ ${rec.name} is signed and ready`, 'Tap to install it.', { signedId: rec.id, appId: app.id }); store.save(); }
       if (signedToGithubOn()) setTimeout(() => archiveSigned().catch(() => {}), 20_000); // after the first install has a head start
+      if (app.importRec && app.importRec.gh) await rmQuiet(importFile(app.importRec)); // already safe on GitHub
     } catch (e) {
       await rmQuiet(out);
       const full = isNoSpace(e) || job.log.some((l) => /no space left|ENOSPC/i.test(l));
@@ -4732,6 +4896,7 @@ route('DELETE', /^\/api\/users\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
   if (!u) return fail(res, 404, 'User not found');
   for (const c of store.certs.filter((x) => x.ownerId === u.id)) await deleteCertRecord(c);
   for (const s of store.signed.filter((x) => x.ownerId === u.id)) await removeSigned(s);
+  for (const imp of store.data.imports.filter((x) => x.ownerId === u.id)) await removeImport(imp);
   store.users.splice(store.users.indexOf(u), 1);
   delete store.data.myApps[u.id];
   for (const a of store.apps) if (a.votes) delete a.votes[u.id];
@@ -4822,7 +4987,7 @@ function recordInstall(s, st = {}) {
     shownVersion: shown, certLabel: s.certLabel, at: new Date().toISOString(), via: viaApp ? 'app' : 'link',
   });
   // Only installs started from the app count as "on your phone". A shared link could be anyone's phone.
-  if (viaApp && s.appId) {
+  if (viaApp && s.appId && !String(s.appId).startsWith('imp_')) {
     const list = myAppsOf(s.ownerId);
     // A phone holds one app per bundle ID, so installing this replaced any other app with the same one.
     if (s.bundleId) for (const [aid, e] of Object.entries(list)) if (aid !== s.appId && e.bundleId && e.bundleId === s.bundleId) delete list[aid];

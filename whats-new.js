@@ -3,6 +3,31 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.14.0',
+    date: '2026-11-03',
+    title: 'Sign Your Own Apps',
+    summary: 'A new Apps tab: import any .ipa and sign it, just like ESign.',
+    sections: [
+      {
+        title: '📥 Apps tab',
+        items: [
+          'Import your own .ipa from Files, iCloud Drive or Downloads, then sign and install it with your certificate.',
+          'Only you can see the apps you import.',
+          'Imported apps stay in your Apps tab, so you can sign them again any time (or for 3 days if the server has no extra storage set up).',
+          'Big apps upload in pieces and pick up where they left off if your connection drops.',
+        ],
+      },
+      {
+        title: '📱 iPhone app',
+        items: [
+          'The Apps tab is the first tab. Apps you import are saved on your iPhone, and "Open in Mango Signer" from other apps puts them here, ready to sign.',
+          'Sign them on your iPhone, or on the server with all the options.',
+          'Turn off "Keep imported apps on this iPhone" in Account to have them removed after signing.',
+        ],
+      },
+    ],
+  },
+  {
     version: '1.13.5',
     date: '2026-11-03',
     title: 'New Look',
