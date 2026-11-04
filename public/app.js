@@ -1659,9 +1659,9 @@ async function tgBotSheet() {
       <button class="btn block" data-post="test:apps">Send a test post to the apps channel</button>
     </div>
     <div class="field" style="margin-top:12px"><label>Name at the bottom of app posts</label><input type="text" id="tbBrand" value="${esc(bot.brand || '')}" placeholder="🥭 Mango Signer"></div>
-    <div class="field"><label>Your Telegram username (for "Need a certificate? DM me" on build posts)</label><input type="text" id="tbContact" value="${esc(bot.contact ? '@' + bot.contact : '')}" placeholder="@MangoOwnah" autocapitalize="off" autocorrect="off">
+    <div class="field"><label>Your Telegram username (for "Need a certificate? DM me" on posts)</label><input type="text" id="tbContact" value="${esc(bot.contact ? '@' + bot.contact : '')}" placeholder="@MangoOwnah" autocapitalize="off" autocorrect="off">
       <div class="hint">Leave it empty to leave that line off.</div></div>
-    <div class="field"><label>Your Mango Signer link (for "Get it" buttons)</label><input type="url" id="tbUrl" value="${esc(bot.publicUrl || '')}" autocapitalize="off" autocorrect="off"></div>
+    <div class="field"><label>Your Mango Signer link (for "Sign with Mango Signer" buttons)</label><input type="url" id="tbUrl" value="${esc(bot.publicUrl || '')}" autocapitalize="off" autocorrect="off"></div>
 
     <div class="section-title">Chat moderation</div>
     <div class="group">
