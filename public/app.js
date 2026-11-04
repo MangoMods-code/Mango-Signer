@@ -1659,6 +1659,8 @@ async function tgBotSheet() {
       <button class="btn block" data-post="test:apps">Send a test post to the apps channel</button>
     </div>
     <div class="field" style="margin-top:12px"><label>Name at the bottom of app posts</label><input type="text" id="tbBrand" value="${esc(bot.brand || '')}" placeholder="🥭 Mango Signer"></div>
+    <div class="field"><label>Your Telegram username (for "Need a certificate? DM me" on build posts)</label><input type="text" id="tbContact" value="${esc(bot.contact ? '@' + bot.contact : '')}" placeholder="@MangoOwnah" autocapitalize="off" autocorrect="off">
+      <div class="hint">Leave it empty to leave that line off.</div></div>
     <div class="field"><label>Your Mango Signer link (for "Get it" buttons)</label><input type="url" id="tbUrl" value="${esc(bot.publicUrl || '')}" autocapitalize="off" autocorrect="off"></div>
 
     <div class="section-title">Chat moderation</div>
@@ -1688,7 +1690,7 @@ async function tgBotSheet() {
       repos: { server: $('#tbRServer', el).value, ios: $('#tbRIos', el).value },
       mod: { captcha: $('#tbCaptcha', el).checked, antispam: $('#tbSpam', el).checked, flood: $('#tbFlood', el).checked, cleanJoins: $('#tbJoins', el).checked,
         newHours: Number($('#tbHours', el).value), bannedWords: $('#tbWords', el).value.split(/[\n,]/) },
-      welcome: $('#tbWelcome', el).value, rules: $('#tbRules', el).value, brand: $('#tbBrand', el).value, publicUrl: $('#tbUrl', el).value,
+      welcome: $('#tbWelcome', el).value, rules: $('#tbRules', el).value, brand: $('#tbBrand', el).value, publicUrl: $('#tbUrl', el).value, contact: $('#tbContact', el).value,
     });
     const save = async (quietly) => { await api('PATCH', '/api/tgbot', body()); if (!quietly) toast('Saved'); };
     $('#tbSave', el).onclick = async () => { try { await save(); } catch (e) { toast(e.message, true); } };
