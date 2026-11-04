@@ -3,6 +3,20 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.13.3',
+    date: '2026-11-03',
+    title: 'Tidier Settings',
+    summary: 'Small cleanups behind the scenes.',
+    sections: [
+      {
+        title: '🔧 Fixes',
+        items: [
+          'Behind-the-scenes cleanups to keep things quick.',
+        ],
+      },
+    ],
+  },
+  {
     version: '1.13.2',
     date: '2026-11-03',
     title: 'Sign with Mango Signer',

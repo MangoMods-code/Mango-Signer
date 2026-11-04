@@ -2208,6 +2208,7 @@ route('PATCH', /^\/api\/sources\/([a-f0-9]{16})$/, async (req, res, m) => {
   }
   if (typeof b.name === 'string' && b.name.trim()) { src.customName = b.name.trim().slice(0, 60); src.name = src.customName; }
   if (typeof b.skipHave === 'boolean' && src.kind !== 'telegram') src.skipHave = b.skipHave;
+  if (typeof b.pinned === 'boolean') src.pinned = b.pinned; // kept at the top of Settings
   if (src.kind === 'telegram') {
     if (b.options) src.options = cleanTgOptions(b.options, src.options);
     if (b.categoryId !== undefined) src.categoryId = ['__auto', '__none'].includes(b.categoryId) ? b.categoryId : b.categoryId && catExists(b.categoryId) ? b.categoryId : '__auto';
