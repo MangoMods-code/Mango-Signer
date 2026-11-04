@@ -744,3 +744,7 @@ html[data-accent="red"] { --mango: #ff5c5c; --mango-2: #ff9b9b; --accent-2: #f03
 .qs-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
 .qs-grid .btn { padding: 12px 8px; font-size: 15px; }
 .btn .qs-why { display: block; font-size: 12px; font-weight: 500; opacity: .8; margin-top: 2px; }
+
+/* Numbered how-to steps */
+.howto { margin: 4px 0 14px; padding-left: 22px; color: var(--soft-text); font-size: 15px; line-height: 1.5; }
+.howto li { margin-bottom: 6px; }

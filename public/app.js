@@ -1377,6 +1377,7 @@ function bindView(view) {
         source: () => sourceSheet(idv),
         github: githubSheet,
         telegram: telegramSheet,
+        tgbot: () => tgBotSheet(),
         announce: announcementSheet,
         appearance: appearanceSheet,
         tour: () => tourSheet(true),
@@ -1469,6 +1470,11 @@ function cloudSettingsHtml() {
         <span class="row-main"><span class="row-title">GitHub storage</span>
           <span class="row-sub">${g.connected ? `${esc(g.owner)}/${esc(g.repo)} · ${g.apps} app${g.apps === 1 ? '' : 's'}${g.lastError ? ' · ⚠ ' + esc(g.lastError) : ''}` : 'Keep your own IPAs in a private repo instead of here'}</span></span>
         <span class="value ${g.connected ? '' : 'muted'}">${g.connected ? '<span class="badge good">On</span>' : 'Off ›'}</span>
+      </button>` : ''}
+      ${isOwner() ? `<button class="row" data-act="tgbot">
+        <span class="row-main"><span class="row-title">🤖 Telegram bot</span>
+          <span class="row-sub">Announces updates in your channels and looks after your chat</span></span>
+        <span class="value muted">›</span>
       </button>` : ''}
     </div>
     <p class="hint" style="margin:8px 4px 0">Cloud apps only keep their info and icon here. The file is downloaded while signing and deleted right after, so your Railway volume stays empty.</p>`;
@@ -1601,6 +1607,106 @@ function sourceSheet(sid) {
 }
 
 // ---------- Telegram channels ----------
+// ---------- Telegram bot ----------
+async function tgBotSheet() {
+  let bot;
+  try { ({ bot } = await api('GET', '/api/tgbot')); } catch (e) { return toast(e.message, true); }
+  if (!bot.connected) {
+    openSheet(`
+      <h2>🤖 Telegram bot</h2>
+      <p class="hint" style="margin-top:-6px">A bot posts new Mango Signer versions, iPhone app builds and library apps in your channels, and keeps your chat clean. It's a separate bot account, not your own Telegram.</p>
+      <ol class="howto">
+        <li>In Telegram, open <b>@BotFather</b> and send <code>/newbot</code>.</li>
+        <li>Pick a name (like <i>Mango Signer</i>) and a username ending in <i>bot</i> (like <i>MangoSignerBot</i>).</li>
+        <li>BotFather sends a token like <code>1234567890:AAH…</code>. Copy it and paste it here.</li>
+      </ol>
+      <div class="field"><label>Bot token</label><input type="password" id="tbToken" placeholder="1234567890:AAH…" autocapitalize="off" autocorrect="off" autocomplete="off"></div>
+      <button class="btn primary big block" id="tbConnect">Connect bot</button>
+      <p class="hint" style="margin-top:10px">The token is saved encrypted on your server and never shown again.</p>`, (el) => {
+      $('#tbConnect', el).onclick = async () => {
+        const btn = $('#tbConnect', el);
+        btn.disabled = true; btn.textContent = 'Connecting…';
+        try { await api('POST', '/api/tgbot/token', { token: $('#tbToken', el).value }); toast('Bot connected 🤖'); tgBotSheet(); } catch (e) { btn.disabled = false; btn.textContent = 'Connect bot'; toast(e.message, true); }
+      };
+    });
+    return;
+  }
+  const chats = bot.chats || [];
+  const pick = (id, cur, kinds, none) => `<select id="${id}"><option value="">${none}</option>${chats.filter((c) => kinds.includes(c.type)).map((c) => `<option value="${esc(String(c.id))}" ${String(c.id) === String(cur) ? 'selected' : ''}>${c.type === 'channel' ? '📢' : '💬'} ${esc(c.title)}${c.admin === false ? ' (not admin)' : ''}</option>`).join('')}${cur && !chats.some((c) => String(c.id) === String(cur)) ? `<option value="${esc(cur)}" selected>${esc(cur)}</option>` : ''}</select>`;
+  const m = bot.mod || {};
+  openSheet(`
+    <h2>🤖 Telegram bot</h2>
+    <p class="hint" style="margin-top:-6px">@${esc(bot.username || 'bot')} · ${bot.running ? '<span class="badge good">Running</span>' : '<span class="badge bad">Stopped</span>'}${bot.queued ? ` · ${bot.queued} app post${bot.queued === 1 ? '' : 's'} waiting` : ''}</p>
+    ${bot.lastError ? `<p class="warning">⚠ ${esc(bot.lastError)}</p>` : ''}
+    <div class="hint-card"><span>Add <b>@${esc(bot.username || 'your bot')}</b> to your channels and chat as an <b>admin</b> (post, delete and ban/restrict rights), then send any message there so it shows up below.</span><button class="btn small-btn" id="tbReload">Refresh</button></div>
+
+    <div class="section-title">Where it posts</div>
+    <div class="field"><label>📢 Updates channel: new Mango Signer versions &amp; iPhone builds</label>${pick('tbUpdates', bot.updatesChat, ['channel', 'supergroup', 'group'], 'Off')}</div>
+    <div class="field"><label>📦 Apps channel: new and updated library apps</label>${pick('tbApps', bot.appsChat, ['channel', 'supergroup', 'group'], 'Off')}
+      <div class="hint">Only apps everyone can see. Hidden and testers-only apps are never posted. Turning it on starts from now, so it won't post your whole library.</div></div>
+    <div class="field"><label>💬 Chat it looks after</label>${pick('tbGroup', bot.groupChat, ['supergroup', 'group'], 'None')}</div>
+
+    <div class="section-title">Announce</div>
+    <div class="group">
+      ${toggle('tbAServer', 'New Mango Signer versions', 'When you publish a release on ' + esc(bot.repos.server), bot.announce.server)}
+      ${toggle('tbAIos', 'New iPhone app builds', 'When a build is published on ' + esc(bot.repos.ios), bot.announce.ios)}
+      ${toggle('tbAApps', 'Library apps', 'New apps and updates, a few a minute so Telegram doesn\'t slow it down', bot.announce.apps)}
+    </div>
+    <div class="actions" style="margin-top:10px">
+      <button class="btn block" data-post="test:updates">Send a test post to the updates channel</button>
+      <button class="btn block" data-post="server:updates">Post the newest Mango Signer version now</button>
+      <button class="btn block" data-post="ios:updates">Post the newest iPhone build now</button>
+      <button class="btn block" data-post="test:apps">Send a test post to the apps channel</button>
+    </div>
+    <div class="field" style="margin-top:12px"><label>Name at the bottom of app posts</label><input type="text" id="tbBrand" value="${esc(bot.brand || '')}" placeholder="🥭 Mango Signer"></div>
+    <div class="field"><label>Your Mango Signer link (for "Get it" buttons)</label><input type="url" id="tbUrl" value="${esc(bot.publicUrl || '')}" autocapitalize="off" autocorrect="off"></div>
+
+    <div class="section-title">Chat moderation</div>
+    <div class="group">
+      ${toggle('tbCaptcha', 'Human check for newcomers', 'New members can\'t talk until they tap "I\'m human" (removed after 5 minutes). Stops most spam bots.', m.captcha)}
+      ${toggle('tbSpam', 'Anti-spam', 'Deletes links to other groups from anyone, and links or forwards from new members', m.antispam)}
+      ${toggle('tbFlood', 'Flood control', '6 messages in 8 seconds = muted for 10 minutes', m.flood)}
+      ${toggle('tbJoins', 'Hide "joined" and "left" messages', '', m.cleanJoins)}
+    </div>
+    <div class="field" style="margin-top:12px"><label>New members can't send links for (hours)</label><input type="number" id="tbHours" min="0" max="720" value="${Number(m.newHours) || 0}"></div>
+    <div class="field"><label>Banned words (one per line)</label><textarea id="tbWords" rows="3" placeholder="scam&#10;free money">${esc((m.bannedWords || []).join('\n'))}</textarea>
+      <div class="hint">Single words only match whole words, so "scam" doesn't catch "scampi".</div></div>
+    <div class="field"><label>Welcome message ({name} = their name)</label><textarea id="tbWelcome" rows="2">${esc(bot.welcome || '')}</textarea></div>
+    <div class="field"><label>Rules (shown with /rules)</label><textarea id="tbRules" rows="4">${esc(bot.rules || '')}</textarea></div>
+    <button class="btn primary big block" id="tbSave">Save</button>
+
+    <div class="section-title">Admin commands in the chat</div>
+    <p class="hint" style="margin:0 4px 6px">Reply to someone's message with: /warn [reason] (3 = muted for a day) · /unwarn · /mute [10m, 2h, 1d] · /unmute · /kick · /ban · /del · /pin. Anywhere: <b>/lock</b> (only admins can talk) · <b>/unlock</b> · /unban [user id] · /rules · /help.${(bot.locked || []).length ? ' <b>Your chat is locked right now.</b>' : ''}</p>
+    <div class="section-title">Advanced</div>
+    <div class="field"><label>Mango Signer repo</label><input type="text" id="tbRServer" value="${esc(bot.repos.server)}" autocapitalize="off" autocorrect="off"></div>
+    <div class="field"><label>iPhone app repo</label><input type="text" id="tbRIos" value="${esc(bot.repos.ios)}" autocapitalize="off" autocorrect="off"></div>
+    <button class="btn block danger" id="tbOff">Disconnect bot</button>`, (el) => {
+    $('#tbReload', el).onclick = () => tgBotSheet();
+    const body = () => ({
+      updatesChat: $('#tbUpdates', el).value, appsChat: $('#tbApps', el).value, groupChat: $('#tbGroup', el).value,
+      announce: { server: $('#tbAServer', el).checked, ios: $('#tbAIos', el).checked, apps: $('#tbAApps', el).checked },
+      repos: { server: $('#tbRServer', el).value, ios: $('#tbRIos', el).value },
+      mod: { captcha: $('#tbCaptcha', el).checked, antispam: $('#tbSpam', el).checked, flood: $('#tbFlood', el).checked, cleanJoins: $('#tbJoins', el).checked,
+        newHours: Number($('#tbHours', el).value), bannedWords: $('#tbWords', el).value.split(/[\n,]/) },
+      welcome: $('#tbWelcome', el).value, rules: $('#tbRules', el).value, brand: $('#tbBrand', el).value, publicUrl: $('#tbUrl', el).value,
+    });
+    const save = async (quietly) => { await api('PATCH', '/api/tgbot', body()); if (!quietly) toast('Saved'); };
+    $('#tbSave', el).onclick = async () => { try { await save(); } catch (e) { toast(e.message, true); } };
+    el.querySelectorAll('[data-post]').forEach((b) => {
+      b.onclick = async () => {
+        const [what, to] = b.dataset.post.split(':');
+        b.disabled = true;
+        try { await save(true); await api('POST', '/api/tgbot/post', { what, to }); toast('Posted ✓'); } catch (e) { toast(e.message, true); }
+        b.disabled = false;
+      };
+    });
+    $('#tbOff', el).onclick = async () => {
+      if (!confirm('Disconnect the bot? It stops posting and moderating until you connect it again.')) return;
+      try { await api('DELETE', '/api/tgbot'); toast('Bot disconnected'); closeSheet(); } catch (e) { toast(e.message, true); }
+    };
+  });
+}
+
 function telegramSheet(step) {
   const t = state.telegram || {};
   if (!t.connected) {
@@ -4520,7 +4626,10 @@ async function handleUrlParams() {
   const q = new URLSearchParams(location.search);
   const udid = q.get('udid');
   const invite = q.get('invite');
-  if (udid || invite || q.has('r')) history.replaceState(null, '', '/');
+  // Links from the Telegram bot (…/?app=<id>) open that app's page, after signing in if needed.
+  const appLink = q.get('app');
+  if (appLink && /^[a-f0-9]{16}$/.test(appLink)) { try { sessionStorage.setItem('mango.openApp', appLink); } catch { /* */ } }
+  if (udid || invite || appLink || q.has('r')) history.replaceState(null, '', '/');
   if (invite) { $('#suInvite').value = invite; return 'signup'; }
   if (!udid) return null;
   const msgs = {
@@ -4560,6 +4669,10 @@ async function boot() {
   $('#app').classList.remove('hidden');
   $('#app').classList.add('app-in');
   await refresh();
+  let linked = null;
+  try { linked = sessionStorage.getItem('mango.openApp'); sessionStorage.removeItem('mango.openApp'); } catch { /* */ }
+  if (linked && state.apps.some((a) => a.id === linked)) return appSheet(linked);
+  if (linked) toast("That app isn't in your library (it may be hidden or removed)", true);
   if (!maybeShowTour()) maybeShowWhatsNew();
 }
 
