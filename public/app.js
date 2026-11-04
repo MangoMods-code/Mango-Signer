@@ -1378,6 +1378,7 @@ function bindView(view) {
         github: githubSheet,
         telegram: telegramSheet,
         tgbot: () => tgBotSheet(),
+        'all-sources': () => allSourcesSheet(),
         announce: announcementSheet,
         appearance: appearanceSheet,
         tour: () => tourSheet(true),
@@ -1452,14 +1453,18 @@ function cloudSettingsHtml() {
   const srcs = (state.sources || []).filter((x) => x.kind !== 'telegram');
   const tgc = (state.sources || []).filter((x) => x.kind === 'telegram');
   const t = state.telegram || {};
+  // Only pinned sources and ones with a problem show here; the rest are one tap away in "All sources".
+  const shown = srcs.filter((x) => isPinnedSource(x) || x.lastError);
+  const rest = srcs.length - shown.length;
+  const totalApps = srcs.reduce((n, x) => n + (x.apps || 0), 0);
   return `<div class="list">
-      ${srcs.map((src) => `
-        <button class="row" data-act="source" data-id="${src.id}">
-          ${iconHtml(src.iconURL || null, src.name)}
-          <span class="row-main"><span class="row-title">${esc(src.name)}</span>
-            <span class="row-sub">${src.lastError ? `<span style="color:var(--red)">⚠ ${esc(src.lastError)}</span>` : `${src.apps} app${src.apps === 1 ? '' : 's'} · synced ${ago(src.lastSync)}${src.showInLibrary === false ? ' · hidden' : ''}`}</span></span>
-          <span class="value muted">›</span>
-        </button>`).join('')}
+      ${shown.map(sourceRowHtml).join('')}
+      ${srcs.length ? `<button class="row" data-act="all-sources">
+        <span class="app-icon" style="display:grid;place-items:center;font-size:22px">☁</span>
+        <span class="row-main"><span class="row-title">All sources</span>
+          <span class="row-sub">${srcs.length} source${srcs.length === 1 ? '' : 's'} · ${totalApps} app${totalApps === 1 ? '' : 's'}${rest && shown.length ? ` · ${rest} more` : ''}</span></span>
+        <span class="value muted">›</span>
+      </button>` : ''}
       <button class="row" data-act="add-source"><span class="row-main" style="font-weight:600;color:var(--accent)">＋ Add a source</span><span class="value muted">AltStore / ESign repos</span></button>
       ${isOwner() || t.connected ? `<button class="row" data-act="telegram">
         <span class="row-main"><span class="row-title">✈️ Telegram channels</span>
@@ -1568,7 +1573,8 @@ function sourceSheet(sid) {
     </dl>
     <p class="hint" style="margin:8px 4px 0">Refreshes by itself every hour${src.kind === 'ghrepo' ? ': each new GitHub release with an .ipa becomes the new version, and older ones stay downloadable' : src.kind === 'webpage' ? ': any new .ipa link on the page becomes the new version, and links it saw before stay as older versions' : ''}. New versions show as UPDATED in the library. Anything you edit on an app (name, category, description…) is kept when it refreshes.</p>
     <div class="group" style="margin-top:12px">${toggle('srcShow', 'Show its apps to everyone', 'Off = only you can see them', src.showInLibrary !== false)}
-      ${toggle('srcSkip', 'Skip apps I already have', 'Don\'t add an app that\'s already in your library from somewhere else', src.skipHave === undefined ? src.kind !== 'ghrepo' : !!src.skipHave)}</div>
+      ${toggle('srcSkip', 'Skip apps I already have', 'Don\'t add an app that\'s already in your library from somewhere else', src.skipHave === undefined ? src.kind !== 'ghrepo' : !!src.skipHave)}
+      ${toggle('srcPin', '📌 Pin to Settings', 'Always shown in Settings instead of only under All sources', isPinnedSource(src))}</div>
     <div class="field" style="margin-top:12px"><label>Name in your library</label><input type="text" id="srcName" value="${esc(src.name)}" maxlength="60"></div>
     <div class="actions">
       <button class="btn primary block" id="srcSync">Refresh now</button>
@@ -1582,6 +1588,9 @@ function sourceSheet(sid) {
     if ($('#srcDelMissing', el)) $('#srcDelMissing', el).onclick = () => deleteRemovedApps(sid, missing);
     $('#srcSkip', el).onchange = async (e) => {
       try { await api('PATCH', `/api/sources/${sid}`, { skipHave: e.target.checked }); await refresh(); toast(e.target.checked ? 'Apps you already have are skipped' : 'It adds every app, even ones you have'); } catch (err) { toast(err.message, true); }
+    };
+    $('#srcPin', el).onchange = async (e) => {
+      try { await api('PATCH', `/api/sources/${sid}`, { pinned: e.target.checked }); await refresh(); toast(e.target.checked ? '📌 Pinned to Settings' : 'Moved to All sources'); } catch (err) { toast(err.message, true); }
     };
     $('#srcShow', el).onchange = async (e) => {
       try { await api('PATCH', `/api/sources/${sid}`, { showInLibrary: e.target.checked }); await refresh(); toast(e.target.checked ? 'Shown to everyone' : 'Only you can see these apps now'); } catch (err) { toast(err.message, true); }
@@ -1607,6 +1616,38 @@ function sourceSheet(sid) {
 }
 
 // ---------- Telegram channels ----------
+// ---------- sources list ----------
+// Sources with "Mango" in the name start out pinned; anyone can pin or unpin any source.
+const isPinnedSource = (src) => (src.pinned === undefined ? /mango/i.test(src.name || '') : !!src.pinned);
+function sourceRowHtml(src) {
+  return `
+        <button class="row" data-act="source" data-id="${src.id}">
+          ${iconHtml(src.iconURL || null, src.name)}
+          <span class="row-main"><span class="row-title">${isPinnedSource(src) ? '📌 ' : ''}${esc(src.name)}</span>
+            <span class="row-sub">${src.lastError ? `<span style="color:var(--red)">⚠ ${esc(src.lastError)}</span>` : `${src.apps} app${src.apps === 1 ? '' : 's'} · synced ${ago(src.lastSync)}${src.showInLibrary === false ? ' · hidden' : ''}`}</span></span>
+          <span class="value muted">›</span>
+        </button>`;
+}
+function allSourcesSheet(q = '') {
+  const srcs = (state.sources || []).filter((x) => x.kind !== 'telegram');
+  const list = () => {
+    const needle = q.trim().toLowerCase();
+    const hit = srcs.filter((x) => !needle || [x.name, x.url, x.subtitle].some((f) => String(f || '').toLowerCase().includes(needle)))
+      .sort((a, b) => (isPinnedSource(b) - isPinnedSource(a)) || (!!b.lastError - !!a.lastError) || (b.apps || 0) - (a.apps || 0) || String(a.name).localeCompare(String(b.name)));
+    return hit.length ? `<div class="list">${hit.map(sourceRowHtml).join('')}</div>` : '<p class="hint center">No sources match.</p>';
+  };
+  openSheet(`
+    <h2>All sources</h2>
+    <p class="hint" style="margin-top:-6px">${srcs.length} sources · 📌 pinned ones show in Settings. Open a source to pin or unpin it.</p>
+    <div class="searchbar" style="margin-bottom:10px">${ICONS.search}<input type="search" id="asQ" placeholder="Search sources" value="${esc(q)}" autocapitalize="off" autocorrect="off"></div>
+    <div id="asList">${list()}</div>
+    <button class="btn block" data-act="add-source" style="margin-top:12px">＋ Add a source</button>`, (el) => {
+    bindView(el);
+    const box = $('#asQ', el);
+    box.oninput = () => { q = box.value; $('#asList', el).innerHTML = list(); bindView($('#asList', el)); };
+  });
+}
+
 // ---------- Telegram bot ----------
 async function tgBotSheet() {
   let bot;
