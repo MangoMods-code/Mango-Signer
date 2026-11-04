@@ -4968,7 +4968,8 @@ const tgbot = tgbotLib.createBot({
   libraryApps: () => store.apps.filter((a) => a.published !== false && !a.testersOnly && !(a.remote && a.remote.missing)).map(appFeedItem),
   release: async (repo) => {
     if (!/^[\w.-]+\/[\w.-]+$/.test(repo || '')) return null;
-    const list = await githubApi(`/repos/${repo}/releases?per_page=10`);
+    // GitHub doesn't list releases newest-first reliably, so read plenty and sort them ourselves.
+    const list = await githubApi(`/repos/${repo}/releases?per_page=100`);
     // Real versions only (not drafts, or the iPhone app's "failed-N" error reports).
     const r = (Array.isArray(list) ? list : []).filter((x) => !x.draft && /^v?\d/i.test(x.tag_name || ''))
       .sort((a, b) => String(b.published_at || '').localeCompare(String(a.published_at || '')))[0];
@@ -5002,7 +5003,7 @@ function botView() {
     connected: !!c.tokenEnc, running: tgbot.running, username: c.botUsername || null, lastError: tgbot.lastError,
     chats: Object.values(c.chats || {}).sort((a, b) => String(a.title).localeCompare(String(b.title))),
     updatesChat: c.updatesChat || '', appsChat: c.appsChat || '', groupChat: c.groupChat || '',
-    announce: c.announce, repos: c.repos, mod: c.mod, welcome: c.welcome, rules: c.rules, brand: c.brand,
+    announce: c.announce, repos: c.repos, mod: c.mod, welcome: c.welcome, rules: c.rules, brand: c.brand, contact: c.contact || '',
     publicUrl: c.publicUrl || '', queued: (c.appQueue || []).length, locked: Object.keys(c.locked || {}),
   };
 }
@@ -5059,6 +5060,11 @@ route('PATCH', /^\/api\/tgbot$/, async (req, res) => {
   }
   for (const k of ['welcome', 'rules']) if (typeof b[k] === 'string') c[k] = b[k].trim().slice(0, 1500);
   if (typeof b.brand === 'string') c.brand = b.brand.trim().slice(0, 60) || tgbot.defaults.brand;
+  if (typeof b.contact === 'string') {
+    const u = b.contact.trim().replace(/^@/, '').replace(/^https?:\/\/t\.me\//i, '');
+    if (u && !/^\w{4,32}$/.test(u)) return fail(res, 400, 'Your Telegram username is 4–32 letters, numbers or underscores');
+    c.contact = u;
+  }
   if (typeof b.publicUrl === 'string') {
     try { const u = new URL(b.publicUrl.trim()); if (!/^https?:$/.test(u.protocol)) throw new Error(); c.publicUrl = u.origin; } catch { return fail(res, 400, 'Enter your Mango Signer link, like https://mango.example.com'); }
   }
