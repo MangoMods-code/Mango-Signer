@@ -1416,6 +1416,7 @@ function renderSettings() {
       <div class="setting"><span>Apps</span><span class="value">${state.apps.length} (${state.apps.filter((a) => a.published).length} shown)</span></div>
       <button class="row" data-act="manage-cats"><span class="row-main" style="font-weight:600">Categories</span><span class="value muted">${state.categories.length} ›</span></button>
       <button class="row" data-act="manage-cols"><span class="row-main" style="font-weight:600">Collections</span><span class="value muted">${state.collections.length} ›</span></button>
+      <button class="row" data-act="translate"><span class="row-main" style="font-weight:600">🌐 Translate descriptions</span><span class="value muted">${state.settings && state.settings.translateOn ? 'On' : 'Off'} ›</span></button>
       <button class="row" data-act="tweaks"><span class="row-main" style="font-weight:600">🧩 Tweaks</span><span class="value muted">${state.tweaks.length}${state.tweaks.length && !state.substrate.installed && state.tweaks.some((t) => t.files.some((f) => f.needsSubstrate)) ? ' · ⚠️ needs Substrate' : ''} ›</span></button>
       ${duplicateGroups().length ? `<button class="row" data-act="dupes"><span class="row-main" style="font-weight:600">🔁 Duplicates</span><span class="value" style="color:var(--mango)">${duplicateGroups().length} ›</span></button>` : ''}
       <button class="row" data-act="announce"><span class="row-main" style="font-weight:600">📣 Announcement</span><span class="value muted">${state.announcement ? 'On' : 'Off'} ›</span></button>
@@ -1460,6 +1461,7 @@ function bindView(view) {
         'add-cert': addCertSheet,
         'go-library': () => switchTab('library'),
         'import-ipa': importIpa,
+        translate: translateSheet,
         import: () => importSheet(idv),
         'sign-import': () => (findImportApp(idv) && findImportApp(idv).available ? signSheet(idv) : importSheet(idv)),
         'go-certs': () => switchTab('certs'),
@@ -2568,6 +2570,68 @@ function srcTaskHtml(srcId) {
 }
 
 // ---------- tweaks library ----------
+// ---------- translating descriptions ----------
+async function translateSheet() {
+  let t;
+  try { ({ translate: t } = await api('GET', '/api/translate')); } catch (e) { return toast(e.message, true); }
+  const deepl = t.provider === 'deepl';
+  const status = [
+    `${t.translated.toLocaleString()} translated`,
+    t.pending ? `${t.pending.toLocaleString()} waiting` : 'nothing waiting',
+    t.dailyLimit ? `${t.usedToday.toLocaleString()} of ${t.dailyLimit.toLocaleString()} characters used today` : '',
+  ].filter(Boolean).join(' · ');
+  openSheet(`
+    <h2>🌐 Translate descriptions</h2>
+    <p class="muted small">App descriptions and "what's new" notes that aren't in English are translated to English, so the library reads the same everywhere. App names aren't changed. Everyone sees the translation, with a "Show original" link, and anything you write yourself is never touched.</p>
+    <div class="list" style="margin:12px 0">${toggle('trOn', 'Translate descriptions', 'Checks every app, then each new one as sources and channels add them', t.on)}</div>
+    <div class="field"><label>Translator</label>
+      <select id="trProv">
+        <option value="mymemory" ${deepl ? '' : 'selected'}>MyMemory — free, no sign-up, slower</option>
+        <option value="deepl" ${deepl ? 'selected' : ''}>DeepL — free account, best quality</option>
+      </select></div>
+    <div id="trMM" class="${deepl ? 'hidden' : ''}">
+      <p class="hint">5,000 characters a day, roughly 10–20 descriptions, so a big channel takes a while. Add an email to get 50,000 a day (it's only sent to MyMemory, to count your allowance).</p>
+      <div class="field"><label>Email (optional)</label><input id="trEmail" type="text" inputmode="email" autocapitalize="off" placeholder="you@example.com" value="${esc(t.email)}" autocomplete="off"></div>
+    </div>
+    <div id="trDL" class="${deepl ? '' : 'hidden'}">
+      <ol class="howto">
+        <li>Make a free account at <b>deepl.com/pro-api</b> and pick <b>DeepL API Free</b> (it asks for a card to check you're a real person, but the free plan never charges).</li>
+        <li>Open <b>Account › API Keys</b> and copy your key (it ends in <code>:fx</code>).</li>
+        <li>Paste it below. You get 500,000 characters a month, plenty for thousands of apps.</li>
+      </ol>
+      <div class="field"><label>DeepL API key</label><input id="trKey" type="password" placeholder="${t.hasKey ? 'Saved — paste a new one to replace it' : 'xxxxxxxx-xxxx-…:fx'}" autocomplete="off"></div>
+    </div>
+    <div class="card" style="margin-top:6px">
+      <div class="small">${esc(status)}</div>
+      ${t.running ? '<div class="small muted" style="margin-top:4px">Translating right now…</div>' : ''}
+      ${t.pausedUntil ? `<div class="small muted" style="margin-top:4px">Paused until ${esc(new Date(t.pausedUntil).toLocaleString())} (daily allowance).</div>` : ''}
+      ${t.lastError ? `<p class="warning bad" style="margin-top:8px">⚠️ ${esc(t.lastError)}</p>` : ''}
+    </div>
+    <div class="actions" style="margin-top:12px">
+      <button class="btn primary block" id="trSave">Save</button>
+      ${t.on && t.pending ? '<button class="btn block" id="trRun">Translate now</button>' : ''}
+    </div>`, (el) => {
+    $('#trProv', el).onchange = (e) => {
+      $('#trMM', el).classList.toggle('hidden', e.target.value === 'deepl');
+      $('#trDL', el).classList.toggle('hidden', e.target.value !== 'deepl');
+    };
+    $('#trSave', el).onclick = async (e) => {
+      const btn = e.currentTarget;
+      btn.disabled = true;
+      const body = { on: $('#trOn', el).checked, provider: $('#trProv', el).value, email: $('#trEmail', el).value };
+      const key = $('#trKey', el).value.trim();
+      if (key) body.key = key;
+      try {
+        const r = await api('PATCH', '/api/translate', body);
+        await refresh().catch(() => {});
+        toast(r.usage ? `DeepL key works · ${r.usage.used.toLocaleString()} of ${r.usage.limit.toLocaleString()} used this month` : body.on ? 'Translating in the background' : 'Saved');
+        translateSheet();
+      } catch (err) { btn.disabled = false; toast(err.message, true); }
+    };
+    if ($('#trRun', el)) $('#trRun', el).onclick = async () => { try { await api('POST', '/api/translate/run'); toast('Translating in the background'); translateSheet(); } catch (err) { toast(err.message, true); } };
+  });
+}
+
 function tweaksSheet() {
   const sub = state.substrate || {};
   const needSub = state.tweaks.some((t) => t.files.some((f) => f.needsSubstrate));
@@ -3010,7 +3074,8 @@ function appSheet(appId) {
     </div>
 
     ${(a.tags || []).length ? `<div class="tag-row">${a.tags.map((t) => `<button class="tag" data-tag="${esc(t)}"># ${esc(t)}</button>`).join('')}</div>` : ''}
-    ${a.description ? `<div class="section-title">About</div><p class="desc">${esc(a.description)}</p>` : ''}
+    ${a.description ? `<div class="section-title">About</div><p class="desc" id="aDesc">${esc(a.description)}</p>` : ''}
+    ${a.translatedFrom ? `<p class="hint" style="margin:6px 4px 0">🌐 Translated from ${esc(a.translatedFrom)} · <button class="link-btn inline" id="aOrig" type="button">Show original</button></p>` : ''}
     ${a.notes ? `<div class="section-title">What's changed / notes</div><p class="desc">${esc(cleanNotes(a.notes))}</p>` : ''}
     ${owner && versions[0] && versions[0].manualId ? `<p class="hint" style="margin:10px 4px 0">⬆ ${esc(versions[0].version)} was added by you${versions.length > 1 ? `. ${esc(a.sourceName || 'The source')}'s versions are under Other versions.` : '.'} <button class="link-btn inline" data-delver="${versions[0].manualId}" type="button">Remove it</button></p>` : ''}
     ${!a.notes && versions[0] && versions[0].notes ? `<div class="section-title">What's new in ${esc(versions[0].version || 'this version')}</div><p class="desc">${esc(cleanNotes(versions[0].notes))}</p>` : ''}
@@ -3056,6 +3121,18 @@ function appSheet(appId) {
       <button class="btn block danger" id="aDelete">Delete</button>
     </div>` : ''}`, (el) => {
     $('#aGet', el).onclick = () => quickGet(a.id);
+    if ($('#aOrig', el)) {
+      let orig = null, showing = false;
+      $('#aOrig', el).onclick = async (e) => {
+        const btn = e.currentTarget;
+        try {
+          if (!orig) orig = await api('GET', `/api/apps/${a.id}/original`);
+          showing = !showing;
+          if ($('#aDesc', el)) $('#aDesc', el).textContent = showing ? orig.description : a.description;
+          btn.textContent = showing ? 'Show translation' : 'Show original';
+        } catch (err) { toast(err.message, true); }
+      };
+    }
     // Long version notes show 3 lines; tap to read all of it.
     el.querySelectorAll('.ver-notes').forEach((n) => { n.onclick = () => n.classList.toggle('open'); });
     bindInstalledNote(el, a, () => appSheet(a.id));
