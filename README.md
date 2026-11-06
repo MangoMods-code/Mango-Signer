@@ -6,6 +6,7 @@ Upload an `.ipa`, add a `.p12` + `.mobileprovision`, tap **Sign**, then **Instal
 **[⬇️ Download the latest release](https://github.com/MangoMods-code/Mango-Signer/releases)** · each release lists everything that changed.
 
 ## Features
+- **Translated descriptions** – descriptions and notes that aren't in English are translated with MyMemory (free, no sign-up) or DeepL (free API key). Owner: Settings › Library › Translate descriptions. Everyone gets a "Show original" link
 - **Apps tab (sign your own apps)** – everyone can import their own `.ipa` and sign and install it, like ESign. Only the person who imported it sees it. With GitHub storage on a private repo, imported apps are kept in a "Mango Imports" release until they're deleted (otherwise they're kept on the server for 3 days). In the iPhone app, imported apps are saved on the iPhone and can be signed right there or on the server
 - **App Library** – the owner uploads apps (or imports from a link); invited users browse, search, sign and install them
 - **Organization** – categories with emoji, featured apps, search, sorting, bulk select, full app editing, Update IPA, and default sign settings per app
@@ -101,3 +102,11 @@ Only sign and share apps you have the right to use.
 
 ## License
 © 2026 MangoMods. **All rights reserved.** The code is public so you can see how it works and run it on your own server for personal use. You may not copy, reupload, rebrand, sell, or present it as your own. See [LICENSE](LICENSE) for the full terms.
+
+## Using your own domain
+
+1. In Railway open the service › **Settings › Networking › Custom Domain**, type your domain and add the DNS record it shows at your domain company. Wait for the green tick.
+2. In **Variables**, add `PUBLIC_URL` = `https://yourdomain.com` (no slash at the end) and let it redeploy.
+3. Install links, invite links and the Telegram bot's buttons then use your domain, and anyone opening the old `.up.railway.app` address in a browser is sent to it. The old address keeps working for the iPhone app and links already shared.
+4. People sign in once more on the new address (logins belong to an address). In the iPhone app: Account › Sign out, then type the new address.
+5. In the Telegram bot settings, change "Your Mango Signer link" to the new address.

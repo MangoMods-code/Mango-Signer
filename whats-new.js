@@ -3,6 +3,25 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.15.0',
+    date: '2026-11-05',
+    title: 'Everything in English',
+    summary: 'App descriptions in other languages are translated to English.',
+    sections: [
+      {
+        title: '🌐 Translations',
+        items: [
+          'App descriptions and "what\'s new" notes written in other languages now show in English.',
+          'Tap "Show original" on an app to see what the developer wrote.',
+        ],
+      },
+      {
+        title: '🔧 Fixes',
+        items: ['Links and install buttons work the same on every address the site is reached at.'],
+      },
+    ],
+  },
+  {
     version: '1.14.1',
     date: '2026-11-03',
     title: 'Faster Checks',

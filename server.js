@@ -24,6 +24,7 @@ const zipLib = require('./lib/zip');
 const telegram = require('./lib/telegram');
 const appstore = require('./lib/appstore');
 const tgbotLib = require('./lib/tgbot');
+const translator = require('./lib/translate');
 
 // whats-new.js lives in the main folder (older versions kept it in lib/).
 const WHATS_NEW = (() => { try { return require('./whats-new'); } catch (e) { if (e.code !== 'MODULE_NOT_FOUND') throw e; return require('./lib/whats-new'); } })();
@@ -65,6 +66,7 @@ for (const s of store.signed) if (!s.ownerId) s.ownerId = 'owner';
 for (const a of store.apps) if (a.published === undefined) a.published = true;
 if (store.settings.maxSignedPerUser === undefined) store.settings.maxSignedPerUser = 10;
 store.data.imports = store.data.imports || [];
+store.data.translations = store.data.translations || {};
 if (store.settings.udidLogin === undefined) store.settings.udidLogin = true;
 if (store.settings.signedRetentionDays === undefined) store.settings.signedRetentionDays = 7;
 if (store.settings.deleteAfterInstall === undefined) store.settings.deleteAfterInstall = true;
@@ -253,12 +255,17 @@ function notifyUpdate(app, oldVersion) {
 }
 
 // ---------- helpers ----------
+// The address links point to (install links, invite links, the bot's buttons). Set PUBLIC_URL on Railway to your
+// own domain; otherwise it's whichever address the request came in on, so a custom domain works without it too.
 function baseUrl(req) {
   if (process.env.PUBLIC_URL) return process.env.PUBLIC_URL.replace(/\/$/, '');
+  const host = String((req && (req.headers['x-forwarded-host'] || req.headers.host)) || '').split(',')[0].trim();
+  if (host && !/^(localhost|127\.|\[::1\]|0\.0\.0\.0)/.test(host)) {
+    const proto = String(req.headers['x-forwarded-proto'] || 'http').split(',')[0].trim();
+    return `${proto}://${host}`;
+  }
   if (process.env.RAILWAY_PUBLIC_DOMAIN) return `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`;
-  const proto = (req.headers['x-forwarded-proto'] || 'http').split(',')[0].trim();
-  const host = req.headers['x-forwarded-host'] || req.headers.host;
-  return `${proto}://${host}`;
+  return `http://${host || 'localhost'}`;
 }
 
 function send(res, status, body, headers = {}) {
@@ -758,6 +765,99 @@ function installedView(a, acc) {
   };
 }
 
+// ----- translating descriptions that aren't in English -----
+// Translations are kept by the original text, so a source refreshing every hour doesn't translate it again,
+// and the original stays as it is (an owner edit always wins, and "Show original" can show it).
+const TR = store.data.translations;
+const trHashes = new Map();
+function thash(t) {
+  let h = trHashes.get(t);
+  if (!h) {
+    if (trHashes.size > 40000) trHashes.clear();
+    h = crypto.createHash('sha1').update(t).digest('hex').slice(0, 16);
+    trHashes.set(t, h);
+  }
+  return h;
+}
+const trCfg = () => store.settings.translate || {};
+const trOn = () => !!trCfg().on;
+const trText = (s) => {
+  if (!s || typeof s !== 'string') return null;
+  const e = TR[thash(s)];
+  return e && e.t ? e : null;
+};
+const trShown = (s) => (trOn() && trText(s) ? trText(s).t : s);
+const appTexts = (a) => [a.description, a.notes, a.subtitle, ...((a.remote && a.remote.versions) || []).slice(0, 3).map((v) => v.notes)]
+  .filter((t) => typeof t === 'string' && t.trim().length > 20);
+const trState = { lastError: null, pausedUntil: 0, running: false, done: 0, checked: new Map() }; // checked: hash -> language or null
+function trUsage() {
+  const day = new Date().toISOString().slice(0, 10);
+  if (!store.data.trUsage || store.data.trUsage.day !== day) store.data.trUsage = { day, chars: 0 };
+  return store.data.trUsage;
+}
+function trPending() {
+  const todo = new Map();
+  for (const a of store.apps) {
+    for (const text of appTexts(a)) {
+      const h = thash(text);
+      if (TR[h] || todo.has(h)) continue;
+      let from = trState.checked.get(h);
+      if (from === undefined) { from = translator.detect(text); trState.checked.set(h, from); }
+      if (from) todo.set(h, { h, text, from });
+    }
+  }
+  return [...todo.values()];
+}
+async function translateTick() {
+  const cfg = trCfg();
+  if (!cfg.on || trState.running || Date.now() < trState.pausedUntil) return;
+  trState.running = true;
+  try {
+    const todo = trPending();
+    if (!todo.length) return;
+    const key = cfg.provider === 'deepl' && cfg.keyEnc ? decrypt(cfg.keyEnc) : null;
+    if (cfg.provider === 'deepl' && !key) { trState.lastError = 'Add your DeepL key, or switch to MyMemory'; return; }
+    const save = (it, t, from) => { TR[it.h] = { t: t.slice(0, 3000), from: from || it.from, at: new Date().toISOString() }; trState.done++; };
+    if (key) {
+      // Up to 25 at a time, at most 2,000 per run.
+      for (let i = 0; i < Math.min(todo.length, 2000); i += 25) {
+        if (!trOn()) break;
+        const batch = todo.slice(i, i + 25);
+        const out = await translator.deepl(batch.map((x) => x.text), key);
+        batch.forEach((it, k) => { if (out[k] && out[k].text) save(it, out[k].text, out[k].from); });
+        trUsage().chars += batch.reduce((n, x) => n + x.text.length, 0);
+        store.save();
+      }
+    } else {
+      const limit = cfg.email ? 48000 : 4800; // MyMemory's daily allowance (a bit under, to be safe)
+      for (const it of todo) {
+        if (!trOn() || trCfg().provider === 'deepl') break;
+        const u = trUsage();
+        if (u.chars + it.text.length > limit) { trState.pausedUntil = new Date(u.day + 'T23:59:59Z').getTime() + 60_000; trState.lastError = null; break; }
+        const t = await translator.myMemory(it.text, it.from, cfg.email || '');
+        u.chars += it.text.length;
+        save(it, t);
+        store.save();
+        await new Promise((r) => setTimeout(r, 1200));
+      }
+    }
+    trState.lastError = null;
+    // Keep the saved translations to ones still in use.
+    if (Object.keys(TR).length > 30000) {
+      const used = new Set(store.apps.flatMap((a) => appTexts(a).map(thash)));
+      for (const h of Object.keys(TR)) if (!used.has(h)) delete TR[h];
+      store.save();
+    }
+  } catch (e) {
+    trState.lastError = e.message;
+    if (e instanceof translator.QuotaError) trState.pausedUntil = Date.now() + (trCfg().provider === 'deepl' ? 6 * 3600_000 : 3 * 3600_000);
+    else trState.pausedUntil = Date.now() + 10 * 60_000;
+    console.error('Translating:', e.message);
+  } finally { trState.running = false; }
+}
+setInterval(() => translateTick().catch(() => {}), 5 * 60_000).unref();
+setTimeout(() => translateTick().catch(() => {}), 60_000).unref();
+
 function appView(a, acc) {
   const votes = Object.values(a.votes || {});
   const extra = {
@@ -773,11 +873,22 @@ function appView(a, acc) {
     extra.sourceName = src ? src.name : null;
     extra.missing = !!remote.missing;
     // vi is the version's real number for signing, so lists that skip some still sign the right one.
-    extra.versions = (remote.kind === 'source' ? mergedVersions(a) : remote.versions || []).map((v, vi) => ({ vi, version: v.version, date: v.date, size: v.size, notes: (v.notes || '').slice(0, 400), channel: v.channel, manualId: v.manualId || undefined }));
+    extra.versions = (remote.kind === 'source' ? mergedVersions(a) : remote.versions || []).map((v, vi) => {
+      const e = trOn() ? trText(v.notes) : null;
+      return { vi, version: v.version, date: v.date, size: v.size, notes: ((e ? e.t : v.notes) || '').slice(0, 400), channel: v.channel, manualId: v.manualId || undefined };
+    });
     // Beta versions are for you and admins only; everyone else (testers included) gets the rest.
     if (!isStaff(acc)) extra.versions = extra.versions.filter((v, i) => i === 0 || !/^(beta|alpha|pre)/i.test(String(v.channel || '')));
     extra.remoteScreens = remote.screenshots || [];
     if (isStaff(acc)) extra.remoteUrl = remote.kind === 'github' ? null : remote.url;
+  }
+  if (trOn()) {
+    let from = null;
+    for (const k of ['description', 'notes', 'subtitle']) {
+      const e = trText(base[k]);
+      if (e) { base[k] = e.t; from = from || e.from; }
+    }
+    if (from) extra.translatedFrom = translator.LANG_NAMES[from] || from.toUpperCase();
   }
   if (isStaff(acc)) return { ...base, ...extra };
   // Everyone else only gets what the library shows: no file names, storage details or owner bookkeeping.
@@ -1217,8 +1328,8 @@ route('GET', /^\/api\/state$/, async (req, res, m, acc) => {
     server: { baseUrl: base, https: base.startsWith('https://'), version: displayVersion(), codeVersion: VERSION },
   };
   if (isOwner(acc)) {
-    const { github: _gh, telegram: _tg, ...ownerSettings } = store.settings; // GitHub token and Telegram login never leave the server, even encrypted
-    out.settings = ownerSettings;
+    const { github: _gh, telegram: _tg, translate: _tr, ...ownerSettings } = store.settings; // GitHub token and Telegram login never leave the server, even encrypted
+    out.settings = { ...ownerSettings, translateOn: trOn() };
     out.users = store.users.map(userView);
     out.invites = store.invites;
     out.sources = store.sources.map(sourceView);
@@ -1332,6 +1443,58 @@ route('PUT', /^\/api\/upload\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
     u.active.delete(index);
   }
   json(res, { received: u.received, done: u.received === u.size });
+});
+
+// ----- translations -----
+function translateView() {
+  const c = trCfg();
+  const pending = trPending().length;
+  return {
+    on: !!c.on, provider: c.provider || 'mymemory', email: c.email || '', hasKey: !!c.keyEnc,
+    translated: Object.keys(TR).length, pending, usedToday: trUsage().chars,
+    dailyLimit: c.provider === 'deepl' ? null : c.email ? 50000 : 5000,
+    running: trState.running, lastError: trState.lastError,
+    pausedUntil: trState.pausedUntil > Date.now() ? new Date(trState.pausedUntil).toISOString() : null,
+  };
+}
+route('GET', /^\/api\/translate$/, (req, res) => json(res, { translate: translateView() }), 'owner');
+route('PATCH', /^\/api\/translate$/, async (req, res) => {
+  const b = await readJson(req);
+  const c = store.settings.translate = { ...trCfg() };
+  if (b.provider !== undefined) c.provider = b.provider === 'deepl' ? 'deepl' : 'mymemory';
+  if (typeof b.email === 'string') {
+    const e = b.email.trim();
+    if (e && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) return fail(res, 400, "That email doesn't look right");
+    c.email = e.slice(0, 120);
+  }
+  let usage = null;
+  if (typeof b.key === 'string') {
+    const k = b.key.trim();
+    if (!k) delete c.keyEnc;
+    else {
+      try { usage = await translator.deeplUsage(k); } catch (e) { return fail(res, 400, e.message === 'fetch failed' ? "Couldn't reach DeepL. Try again in a minute." : e.message); }
+      c.keyEnc = encrypt(k);
+      c.provider = 'deepl';
+    }
+  }
+  if (b.on !== undefined) c.on = !!b.on;
+  if (c.on && c.provider === 'deepl' && !c.keyEnc) return fail(res, 400, 'Add your DeepL key first, or pick MyMemory');
+  store.save();
+  trState.pausedUntil = 0;
+  trState.lastError = null;
+  if (c.on) setTimeout(() => translateTick().catch(() => {}), 500);
+  json(res, { translate: translateView(), usage });
+}, 'owner');
+route('POST', /^\/api\/translate\/run$/, (req, res) => {
+  trState.pausedUntil = 0;
+  translateTick().catch(() => {});
+  json(res, { translate: translateView() });
+}, 'owner');
+// The original (untranslated) text of an app, for "Show original".
+route('GET', /^\/api\/apps\/([a-f0-9]{16})\/original$/, (req, res, m, acc) => {
+  const a = visibleApps(acc).find((x) => x.id === m[1]);
+  if (!a) return fail(res, 404, 'App not found');
+  json(res, { description: a.description || '', notes: a.notes || '', subtitle: a.subtitle || '' });
 });
 
 // ----- your imported .ipa files -----
@@ -5103,6 +5266,18 @@ const server = http.createServer(async (req, res) => {
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Content-Security-Policy', "frame-ancestors 'none'");
   if (String(req.headers['x-forwarded-proto'] || '').startsWith('https')) res.setHeader('Strict-Transport-Security', 'max-age=31536000');
+  // With PUBLIC_URL set to your own domain, people opening the old Railway address in a browser are sent there.
+  // Only pages: the iPhone app, install links and anything already shared keep working on the old address.
+  if (process.env.PUBLIC_URL && (req.method === 'GET' || req.method === 'HEAD') && !pathname.startsWith('/api/') && /text\/html/.test(req.headers.accept || '')) {
+    try {
+      const want = new URL(process.env.PUBLIC_URL);
+      const host = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim().toLowerCase();
+      if (host.endsWith('.up.railway.app') && want.host.toLowerCase() !== host) {
+        res.writeHead(301, { Location: want.origin + req.url });
+        return res.end();
+      }
+    } catch {}
+  }
 
   try {
     for (const r of routes) {
@@ -5179,7 +5354,7 @@ function appFeedItem(a) {
   return {
     id: a.id, name: a.name, version: a.versionOverride || a.version || '', size: fmtBytes(a.size),
     category: cat ? cat.name : '', developer: a.developer || '',
-    notes: String(a.notes || '').trim(), description: String(a.description || '').trim(),
+    notes: String(trShown(a.notes) || '').trim(), description: String(trShown(a.description) || '').trim(),
     // Sharpest first: your custom icon, the big copy from the app, the source's picture, then the small one.
     iconFile: custom && fs.existsSync(custom) ? custom : fs.existsSync(hd) ? hd : !a.iconURL && fs.existsSync(own) ? own : null,
     iconUrl: !a.customIcon && a.iconURL ? a.iconURL : null,
