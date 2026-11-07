@@ -986,7 +986,10 @@ function libraryListHtml() {
     if (recent.length > shown.length) html += `<button class="btn block see-all" data-act="lib-more">Show more (${recent.length - shown.length} left)</button>`;
     return html;
   }
-  return `<div class="section-title" style="margin-top:6px">${apps.length} app${apps.length === 1 ? '' : 's'}</div>${state.lib.select ? `<div class="list">${apps.map((a) => appRow(a)).join('')}</div>` : appsBlock(apps)}`;
+  // Only the first batch is drawn (thousands of rows at once made scrolling lag); "Show more" adds the next.
+  const shown = apps.slice(0, state.lib.limit);
+  const more = apps.length > shown.length ? `<button class="btn block see-all" data-act="lib-more">Show more (${apps.length - shown.length} left)</button>` : '';
+  return `<div class="section-title" style="margin-top:6px">${apps.length} app${apps.length === 1 ? '' : 's'}</div>${state.lib.select ? `<div class="list">${shown.map((a) => appRow(a)).join('')}</div>` : appsBlock(shown)}${more}`;
 }
 
 // How many apps a filter key matches.
@@ -1110,7 +1113,7 @@ function bindLibrary(view) {
     b.onclick = () => { state.lib.cat = b.dataset.cat; state.lib.limit = 40; saveLibPrefs(); render(); };
   });
   const sort = $('#libSort', view);
-  if (sort) sort.onchange = () => { state.lib.sort = sort.value; saveLibPrefs(); render(); };
+  if (sort) sort.onchange = () => { state.lib.sort = sort.value; state.lib.limit = 40; saveLibPrefs(); window.scrollTo(0, 0); render(); };
   view.querySelectorAll('[data-bulk]').forEach((b) => { b.onclick = () => bulkAction(b.dataset.bulk); });
   view.querySelectorAll('.seg [data-view]').forEach((b) => {
     b.onclick = () => { try { localStorage.setItem('mango.libView', b.dataset.view); } catch { /* */ } render(); };
