@@ -3,6 +3,13 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.15.2',
+    date: '2026-11-06',
+    title: 'Smoother Scrolling',
+    summary: 'The library scrolls smoothly with every sort, not just Recently updated.',
+    sections: [{ title: '⚡ Speed', items: ['Sorting the library by name, size or anything else no longer makes scrolling lag. Apps load 40 at a time with a "Show more" button.'] }],
+  },
+  {
     version: '1.15.1',
     date: '2026-11-06',
     title: 'Cleaner Library',
