@@ -3,6 +3,13 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.16.1',
+    date: '2026-11-07',
+    title: 'Fresh Sort',
+    summary: 'Auto-sort looks at every app again with the smarter sorter.',
+    sections: [{ title: '🗂 Categories', items: ['New apps from channels always get a category too.'] }],
+  },
+  {
     version: '1.16.0',
     date: '2026-11-07',
     title: 'Tidier Library',

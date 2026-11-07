@@ -3392,12 +3392,15 @@ async function autoCategory(app, extraText = '', opts = {}) {
   return { categoryId: null, info, how: null };
 }
 
+const AUTO_SORT_V = 2; // bump when auto-sort gets smarter, so it looks at everything it placed before again
 route('POST', /^\/api\/apps\/auto-categorize$/, async (req, res, m, acc) => {
   const b = await readJson(req);
   // "all": re-sort every app (except ones you put in a category yourself).
-  // Otherwise every app without a category, including ones you had moved to Uncategorized.
+  // Otherwise: every app without a category, plus every app an older version of auto-sort placed (or skipped).
+  // Apps this version places are marked, so later runs leave them alone.
+  const mine = (a) => (a.locked || []).includes('categoryId');
   const list = store.apps.filter((a) => (Array.isArray(b.ids) ? b.ids.includes(a.id) : true)
-    && (b.all ? !(a.locked || []).includes('categoryId') : (!a.categoryId || !catExists(a.categoryId))));
+    && (b.all ? !mine(a) : (!a.categoryId || !catExists(a.categoryId) || (!mine(a) && a.autoSortV !== AUTO_SORT_V))));
   const job = newJob(acc);
   job.title = `Sorting ${list.length} app${list.length === 1 ? '' : 's'}`;
   job.cancellable = true;
@@ -3419,6 +3422,7 @@ route('POST', /^\/api\/apps\/auto-categorize$/, async (req, res, m, acc) => {
         }
       }
       if (!r) break;
+      if (r.categoryId) app.autoSortV = AUTO_SORT_V;
       if (r.categoryId && r.categoryId !== app.categoryId) {
         app.categoryId = r.categoryId;
         result.sorted++;
@@ -3831,8 +3835,8 @@ async function tgImportPost(src, post, job, preMeta) {
     if (!app.customIcon) await saveAppIcon(app.id, meta);
     if (old && old.screenshots) remote.screenshots = old.screenshots;
     if ((!app.categoryId || !catExists(app.categoryId)) && !locked.has('categoryId') && (!src.categoryId || src.categoryId === '__auto')) {
-      const r = await autoCategory(app, post.text);
-      if (r.categoryId) app.categoryId = r.categoryId;
+      const r = await autoCategory(app, post.text, { mustPlace: true });
+      if (r.categoryId) { app.categoryId = r.categoryId; app.autoSortV = AUTO_SORT_V; }
     }
     Object.assign(app, { remote, previousVersion: oldShown, updatedAt: new Date().toISOString(), versionOverride: locked.has('versionOverride') ? app.versionOverride : null });
     // The old copy isn't needed anymore.
@@ -3851,8 +3855,9 @@ async function tgImportPost(src, post, job, preMeta) {
     descFromCaption: true,
   });
   if (!src.categoryId || src.categoryId === '__auto') {
-    const r = await autoCategory(rec, post.text);
+    const r = await autoCategory(rec, post.text, { mustPlace: true });
     rec.categoryId = r.categoryId;
+    if (r.categoryId) rec.autoSortV = AUTO_SORT_V;
     if (r.info) {
       rec.developer = r.info.developer.slice(0, 80);
       if (r.info.description) { rec.description = r.info.description; rec.descFromCaption = false; }
