@@ -3,6 +3,15 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.15.1',
+    date: '2026-11-06',
+    title: 'Cleaner Library',
+    summary: 'Apps from some sources no longer show up as "Untitled", once for every version.',
+    sections: [
+      { title: '🔧 Fixes', items: ['Apps from sources that leave out app names get their real names, and all their versions are grouped into one app instead of dozens of "Untitled" copies.'] },
+    ],
+  },
+  {
     version: '1.15.0',
     date: '2026-11-05',
     title: 'Everything in English',

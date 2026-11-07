@@ -2374,7 +2374,13 @@ async function syncSource(src) {
     }
   }
   let removed = 0;
-  for (const a of mine) {
+  for (const a of [...mine]) {
+    // Leftovers from sources that didn't name their apps (they showed as "Untitled", once per version).
+    // The same apps now come in under their real names, so these copies go.
+    if (!seen.has(a.remote.key) && /^name:untitled(#\d+)?$/.test(a.remote.key || '') && !(a.manualVersions || []).length) {
+      await deleteApp(a.id).catch(() => {});
+      continue;
+    }
     if (!seen.has(a.remote.key) && !(a.manualVersions || []).length) { if (!a.remote.missing) removed++; a.remote.missing = true; } else delete a.remote.missing;
   }
   Object.assign(src, {
