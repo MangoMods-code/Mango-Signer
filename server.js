@@ -1485,6 +1485,14 @@ route('PATCH', /^\/api\/translate$/, async (req, res) => {
   if (c.on) setTimeout(() => translateTick().catch(() => {}), 500);
   json(res, { translate: translateView(), usage });
 }, 'owner');
+// Looks at every app again (after new apps, or apps it decided were already English).
+route('POST', /^\/api\/translate\/recheck$/, (req, res) => {
+  trState.checked.clear();
+  trState.pausedUntil = 0;
+  trState.lastError = null;
+  translateTick().catch(() => {});
+  json(res, { translate: translateView() });
+}, 'owner');
 route('POST', /^\/api\/translate\/run$/, (req, res) => {
   trState.pausedUntil = 0;
   translateTick().catch(() => {});
@@ -3239,6 +3247,46 @@ const CATEGORY_WORDS = [
   ['Games', /\b(games?|minecraft|roblox|pubg|fortnite|brawl ?stars|clash|subway ?surfers|geometry ?dash|gta|grand theft|call of duty|among us|free ?fire|pokemon|pok[eé]mon|genshin|candy ?crush|8 ?ball|chess|solitaire|sudoku|racing|shooter|rpg)\b/i],
   ['Utilities', /\b(vpn|proxy|adblock\w*|ad ?blocker|dns|ssh|terminal|torrent|downloader|file ?manager|filza|browser|keyboard|scanner|calculator|clipboard|shortcuts?|stikdebug|stik|jit|sidestore|altstore|esign|feather|ksign|gbox|scarlet|trollstore|appdb|livecontainer)\b/i],
 ];
+// Reading what an app is about (its name, subtitle and description, in English when translated) when nothing
+// else knows. Each word found scores points for a kind of app; the best kind you have a category for wins.
+const CONTENT_KINDS = [
+  { names: ['Emulators', 'Emulator', 'Retro'], words: /\b(emulat\w*|rom|roms|retro ?games?|console|bios|nintendo|playstation|sega|arcade|game ?boy|ds|psp|n64)\b/gi, w: 3 },
+  { names: ['Games', 'Game', 'Gaming'], words: /\b(games?|gameplay|play(ers?|ing)?|levels?|puzzles?|racing|shooter|multiplayer|battle|quests?|rpg|mmo|arcade|casual|strategy|adventure|zombies?|coins|gems|unlimited (money|coins|gems)|mod menu|god mode|aimbot|esp)\b/gi, w: 1 },
+  { names: ['Music & Video', 'Music', 'Video', 'Streaming', 'Entertainment', 'Movies & TV', 'TV'], words: /\b(music|songs?|playlists?|albums?|artists?|audio|radio|podcasts?|videos?|movies?|films?|series|episodes?|tv|stream(ing|s)?|watch|anime|player|lyrics|karaoke|offline playback|background play)\b/gi, w: 1 },
+  { names: ['Social', 'Social Networking', 'Chat', 'Messaging'], words: /\b(social|chat(s|ting)?|messag(e|es|ing)|friends?|followers?|posts?|stories|reels|feed|profile|dating|match(es)?|community|comments?|likes?|share photos)\b/gi, w: 1 },
+  { names: ['Photo & Video', 'Photography', 'Photos', 'Camera', 'Editing'], words: /\b(photos?|pictures?|camera|selfies?|filters?|edit(or|ing)?|collage|retouch|beauty|stickers?|wallpapers?|video editor|presets?|ai art|face ?swap)\b/gi, w: 1 },
+  { names: ['Utilities', 'Tools', 'Utility'], words: /\b(utility|utilities|tools?|vpn|proxy|cleaner|battery|scanner|qr|files?|file manager|downloader|clipboard|widgets?|keyboard|browser|ad ?block\w*|backup|transfer|speed test|tweak(s|ed)?|jailbreak|sideload\w*|sign(ing|er)|certificate)\b/gi, w: 1 },
+  { names: ['Productivity', 'Business', 'Work'], words: /\b(productivity|notes?|tasks?|to-?do|calendar|reminders?|documents?|pdf|office|spreadsheet|email|mail|scan documents|business|meetings?|focus|planner)\b/gi, w: 1 },
+  { names: ['Education', 'Learning', 'Reference'], words: /\b(learn(ing)?|education|study|students?|courses?|lessons?|language|translate|dictionary|math|quiz|school|exam|flashcards?)\b/gi, w: 1 },
+  { names: ['Health & Fitness', 'Health', 'Fitness', 'Sports'], words: /\b(workouts?|fitness|gym|exercise|health|steps?|calories|diet|meditation|sleep|yoga|running|training|sports?|football|soccer|nba|nfl|scores)\b/gi, w: 1 },
+  { names: ['Shopping', 'Food & Drink', 'Lifestyle'], words: /\b(shop(ping)?|store|deals?|coupons?|orders?|delivery|food|restaurants?|recipes?|fashion|home|lifestyle)\b/gi, w: 1 },
+  { names: ['Finance', 'Crypto'], words: /\b(finance|bank(ing)?|money|budget|crypto|bitcoin|wallet|stocks?|trading|invest\w*|payments?)\b/gi, w: 1 },
+  { names: ['Books', 'Reading', 'News', 'Comics'], words: /\b(books?|read(er|ing)?|novels?|manga|comics?|webtoons?|ebooks?|news|articles?|magazines?)\b/gi, w: 1 },
+  { names: ['Navigation', 'Travel', 'Maps'], words: /\b(maps?|navigation|gps|directions|travel|trips?|flights?|hotels?|location)\b/gi, w: 1 },
+];
+function contentCategory(app) {
+  const desc = trShown(app.description) || '';
+  const text = `${app.name} ${app.name} ${app.name} ${app.subtitle || ''} ${app.subtitle || ''} ${desc.slice(0, 1500)} ${(trShown(app.notes) || '').slice(0, 300)}`;
+  const scored = CONTENT_KINDS.map((k) => {
+    const hits = text.match(k.words) || [];
+    return { k, score: hits.length * k.w, hit: hits[0] };
+  }).filter((x) => x.score > 0).sort((a, b) => b.score - a.score);
+  // Only categories you have (no new ones from this): the best-scoring kind with a matching category.
+  for (const x of scored) {
+    for (const n of x.k.names) {
+      const mine = existingCategoryNamed(n);
+      if (mine) return { categoryId: mine.id, hit: String(x.hit).toLowerCase(), kind: n };
+    }
+  }
+  return null;
+}
+// The last resort, so nothing stays uncategorized: your "Other" category (made if you don't have one).
+function otherCategory(localOnly) {
+  const mine = ['Other', 'Others', 'Misc', 'Miscellaneous', 'More'].map(existingCategoryNamed).find(Boolean);
+  if (mine) return mine.id;
+  return localOnly ? 'new:Other' : categoryIdFor('Other');
+}
+
 // Your category for one of the names above: one you already have with that name, or a new one.
 function existingCategoryNamed(name) {
   const want = name.toLowerCase();
@@ -3316,7 +3364,7 @@ function categoryGuessFor(genre) {
   return mine ? mine.id : `new:${c.name}`;
 }
 const catName = (cid) => (store.categories.find((c) => c.id === cid) || {}).name || '?';
-const HOW_LABEL = { rule: 'your rule', appstore: 'App Store', similar: 'like', keyword: 'name', source: 'same source' };
+const HOW_LABEL = { rule: 'your rule', appstore: 'App Store', similar: 'like', keyword: 'name', content: 'description', source: 'same source', other: 'Other' };
 
 // opts.localOnly: no App Store lookups (instant guesses). opts.fresh: ask Apple again about "not found" apps.
 // opts.throwBusy: let "Apple says slow down" through so a batch can wait and retry.
@@ -3336,8 +3384,11 @@ async function autoCategory(app, extraText = '', opts = {}) {
     try { info = await appStoreInfo(app, { fresh: opts.fresh }); } catch (e) { if (opts.throwBusy) throw e; info = null; }
   }
   if (info && info.genre) return { categoryId: fromGenre(info.genre), info, how: 'appstore', why: `App Store: ${info.genre}` };
+  const byText = contentCategory(app);
+  if (byText) return { categoryId: byText.categoryId, info, how: 'content', why: `description mentions "${byText.hit}"` };
   const src = sourceCategory(app);
   if (src) return { categoryId: src.categoryId, info, how: 'source', why: `${src.share}% of its source` };
+  if (opts.mustPlace) return { categoryId: otherCategory(opts.localOnly), info, how: 'other', why: 'nothing else matched' };
   return { categoryId: null, info, how: null };
 }
 
@@ -3352,14 +3403,15 @@ route('POST', /^\/api\/apps\/auto-categorize$/, async (req, res, m, acc) => {
   job.cancellable = true;
   json(res, { jobId: job.id, count: list.length });
   (async () => {
-    const result = { sorted: 0, byRule: 0, byAppStore: 0, bySimilar: 0, byKeyword: 0, bySource: 0, unknown: 0, filled: 0 };
+    const result = { sorted: 0, byRule: 0, byAppStore: 0, bySimilar: 0, byKeyword: 0, byContent: 0, bySource: 0, toOther: 0, unknown: 0, filled: 0 };
     const started = Date.now();
     for (const [i, app] of list.entries()) {
       if (job.cancelled) break;
       job.progress = list.length ? i / list.length : 1;
       let r;
       for (let tries = 0; ; tries++) {
-        try { r = await autoCategory(app, app.notes || '', { fresh: b.fresh !== false, throwBusy: tries < 4 }); break; } catch (e) {
+        // Every app ends up somewhere: "Other" when nothing fits (unless you turned that off).
+        try { r = await autoCategory(app, app.notes || '', { fresh: b.fresh !== false, throwBusy: tries < 4, mustPlace: b.leaveUnsure !== true }); break; } catch (e) {
           if (!e.busy) throw e;
           job.log.push(`⏳ The App Store asked Mango to slow down. Waiting a minute, then carrying on… (${i} of ${list.length} done)`);
           await new Promise((x) => setTimeout(x, Number(process.env.ITUNES_BUSY_WAIT_MS || 60000)));
@@ -3370,7 +3422,7 @@ route('POST', /^\/api\/apps\/auto-categorize$/, async (req, res, m, acc) => {
       if (r.categoryId && r.categoryId !== app.categoryId) {
         app.categoryId = r.categoryId;
         result.sorted++;
-        result[{ rule: 'byRule', appstore: 'byAppStore', similar: 'bySimilar', keyword: 'byKeyword', source: 'bySource' }[r.how]]++;
+        result[{ rule: 'byRule', appstore: 'byAppStore', similar: 'bySimilar', keyword: 'byKeyword', content: 'byContent', source: 'bySource', other: 'toOther' }[r.how]]++;
         job.log.push(`${app.name} → ${catName(r.categoryId)} (${r.why})`);
       } else if (!r.categoryId) { result.unknown++; job.log.push(`${app.name}: no idea`); }
       // Fill in blanks from the App Store while we're at it.

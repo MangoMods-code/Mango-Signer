@@ -3,6 +3,16 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.16.0',
+    date: '2026-11-07',
+    title: 'Tidier Library',
+    summary: 'Every app has a category now, and more descriptions get translated.',
+    sections: [
+      { title: '🗂 Categories', items: ['Apps are sorted by what their description says, too, and anything that fits nowhere goes in "Other", so no app is left uncategorized.'] },
+      { title: '🌐 Translations', items: ['Short descriptions in other languages are caught and translated as well.'] },
+    ],
+  },
+  {
     version: '1.15.3',
     date: '2026-11-06',
     title: 'Faster News',
