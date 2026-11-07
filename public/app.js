@@ -2613,6 +2613,7 @@ async function translateSheet() {
     <div class="actions" style="margin-top:12px">
       <button class="btn primary block" id="trSave">Save</button>
       ${t.on && t.pending ? '<button class="btn block" id="trRun">Translate now</button>' : ''}
+      ${t.on ? '<button class="btn block" id="trRecheck">Check every app again</button>' : ''}
     </div>`, (el) => {
     $('#trProv', el).onchange = (e) => {
       $('#trMM', el).classList.toggle('hidden', e.target.value === 'deepl');
@@ -2631,6 +2632,7 @@ async function translateSheet() {
         translateSheet();
       } catch (err) { btn.disabled = false; toast(err.message, true); }
     };
+    if ($('#trRecheck', el)) $('#trRecheck', el).onclick = async () => { try { await api('POST', '/api/translate/recheck'); toast('Checking every app again'); setTimeout(translateSheet, 1500); } catch (err) { toast(err.message, true); } };
     if ($('#trRun', el)) $('#trRun', el).onclick = async () => { try { await api('POST', '/api/translate/run'); toast('Translating in the background'); translateSheet(); } catch (err) { toast(err.message, true); } };
   });
 }
@@ -3675,7 +3677,7 @@ async function autoSortRun(all, back) {
     closeSheet.locked = false; $('#sheet').classList.remove('locked');
     await refresh();
     if (bg) return toast(`Sorting finished: ${r.sorted} app${r.sorted === 1 ? '' : 's'} sorted`);
-    const how = [[r.byAppStore, 'App Store'], [r.bySimilar, 'like apps you sorted'], [r.byKeyword, 'by name'], [r.bySource, 'by source'], [r.byRule, 'your rules']].filter(([n]) => n).map(([n, l]) => `${n} ${l}`).join(', ');
+    const how = [[r.byAppStore, 'App Store'], [r.bySimilar, 'like apps you sorted'], [r.byKeyword, 'by name'], [r.byContent, 'by description'], [r.bySource, 'by source'], [r.byRule, 'your rules'], [r.toOther, 'to Other']].filter(([n]) => n).map(([n, l]) => `${n} ${l}`).join(', ');
     toast(`Sorted ${r.sorted}${how ? ` (${how})` : ''}${r.unknown ? ` · ${r.unknown} still need you` : ''}`);
     if (back) back(); else if (r.unknown) quickSortSheet(); else closeSheet();
   } catch (e) { closeSheet.locked = false; $('#sheet').classList.remove('locked'); await refresh().catch(() => {}); toast(e.cancelled ? 'Stopped. Apps sorted so far keep their category.' : e.message, !e.cancelled); if (e.cancelled) closeSheet(); }
