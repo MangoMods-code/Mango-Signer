@@ -3,6 +3,13 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.16.2',
+    date: '2026-11-08',
+    title: 'Real App IDs',
+    summary: 'Apps keep their own bundle ID with every certificate.',
+    sections: [{ title: '🔧 Fixes', items: ['Apps signed with a certificate made for one app ID no longer all get that same ID, so they install side by side and work properly.'] }],
+  },
+  {
     version: '1.16.1',
     date: '2026-11-07',
     title: 'Fresh Sort',
