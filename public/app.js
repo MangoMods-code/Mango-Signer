@@ -3964,8 +3964,7 @@ function signSheet(appId, overrides) {
       else if (left !== null) bits.push(`Expires in ${left} days.`);
       if (c.deviceIncluded === false) bits.push('⚠️ Your iPhone isn\'t in this profile.');
       if (!c.profile.wildcard && c.profile.appId) {
-        bits.push(`This profile only signs ${c.profile.appId}.`);
-        if (!$('#sBundle', el).value) $('#sBundle', el).value = c.profile.appId;
+        bits.push(`This profile is made for ${c.profile.appId}. Apps keep their own bundle ID (like ESign). If one won't install, type ${c.profile.appId} as its bundle ID.`);
       }
       const blocked = updateEntWarnings();
       if (blocked.length) bits.push(`⚠️ This profile doesn't allow ${blocked.join(', ')} — open More options to turn it off, or the app may not install.`);
