@@ -295,6 +295,7 @@ function toast(msg, isError = false) {
 
 function fmtSize(b) {
   if (!b && b !== 0) return '';
+  if (b > 2e10) return ''; // no app is over 20 GB: a source sent a wrong number
   if (b < 1024 * 1024) return `${Math.max(1, Math.round(b / 1024))} KB`;
   if (b < 1024 ** 3) return `${(b / 1048576).toFixed(1)} MB`;
   return `${(b / 1024 ** 3).toFixed(2)} GB`;
@@ -317,7 +318,10 @@ function ago(iso) {
 }
 const fmtDate = (iso) => (iso ? new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' }) : '—');
 const shortUdid = (u) => (u ? `${u.slice(0, 8)}…${u.slice(-4)}` : '');
-const shownVersion = (a) => a.versionOverride || a.version || '';
+const shownVersion = (a) => {
+  const v = String(a.versionOverride || a.version || '');
+  return /^[0-9a-f]{12,}$/i.test(v) ? `build ${v.slice(0, 7)}` : v;
+};
 const catById = (cid) => state.categories.find((c) => c.id === cid);
 const catLabel = (cid) => { const c = catById(cid); return c ? `${c.emoji} ${c.name}` : 'Uncategorized'; };
 
