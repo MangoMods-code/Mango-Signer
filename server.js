@@ -858,6 +858,7 @@ async function translateTick() {
 setInterval(() => translateTick().catch(() => {}), 5 * 60_000).unref();
 setTimeout(() => translateTick().catch(() => {}), 60_000).unref();
 
+const realSize = (n) => (typeof n === 'number' && n > 0 && n < 2e10 ? n : null); // sources sometimes send nonsense sizes
 function appView(a, acc) {
   const votes = Object.values(a.votes || {});
   const extra = {
@@ -882,6 +883,8 @@ function appView(a, acc) {
     extra.remoteScreens = remote.screenshots || [];
     if (isStaff(acc)) extra.remoteUrl = remote.kind === 'github' ? null : remote.url;
   }
+  base.size = realSize(base.size);
+  if (extra.versions) extra.versions = extra.versions.map((v) => ({ ...v, size: realSize(v.size) }));
   if (trOn()) {
     let from = null;
     for (const k of ['description', 'notes', 'subtitle']) {

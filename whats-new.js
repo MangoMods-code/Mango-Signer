@@ -3,6 +3,13 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.16.3',
+    date: '2026-11-09',
+    title: 'Tidy Grid',
+    summary: 'The grid view lines up again, and apps no longer show impossible sizes.',
+    sections: [{ title: '🔧 Fixes', items: ['Long version numbers no longer push the grid view out of line.', 'Apps with a wrong size from their source (like 100 TB) don\'t show a size instead.'] }],
+  },
+  {
     version: '1.16.2',
     date: '2026-11-08',
     title: 'Real App IDs',
