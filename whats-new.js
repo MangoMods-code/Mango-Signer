@@ -3,6 +3,26 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.18.0',
+    date: '2026-11-10',
+    title: 'Every Screen, Redone',
+    summary: 'Each screen was redesigned, and you can now import an app from a link.',
+    sections: [
+      {
+        title: '🎨 Redesigned',
+        items: [
+          'Apps: two big tiles to import a file or a link.',
+          'Library: cleaner rows with the app\'s name, what it is, and one line of facts.',
+          'App pages: the icon, name and Get button sit together, with a strip of facts you can swipe.',
+          'Signed: how many apps are ready, how many are on your phone and when the first one expires, right at the top.',
+          'Certificates: a ring shows the days left, with the fine print under Details.',
+          'Settings: your profile at the top, and an icon on every row.',
+        ],
+      },
+      { title: '🔗 New', items: ['Import from a link: paste a direct .ipa link and Mango downloads it into your Apps tab.'] },
+    ],
+  },
+  {
     version: '1.17.0',
     date: '2026-11-09',
     title: 'A Fresh Look',

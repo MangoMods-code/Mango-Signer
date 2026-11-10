@@ -7,6 +7,8 @@ const path = require('path');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 const zlib = require('zlib');
+const net = require('net');
+const dns = require('dns');
 const { pipeline } = require('stream/promises');
 const { Readable, Transform } = require('stream');
 
@@ -1521,10 +1523,9 @@ route('GET', /^\/api\/apps\/([a-f0-9]{16})\/original$/, (req, res, m, acc) => {
 });
 
 // ----- your imported .ipa files -----
-route('POST', /^\/api\/imports$/, async (req, res, m, acc) => {
-  const { uploadId, fileName } = await readJson(req);
-  const file = tmpPath(uploadId, acc);
-  if (myImports(acc).length >= IMPORTS_PER_USER) { await rmQuiet(file); return fail(res, 400, `You can keep ${IMPORTS_PER_USER} imported apps. Delete one you don't need first.`); }
+// Turns an .ipa file on disk into one of this person's imported apps.
+async function createImport(acc, file, fileName) {
+  if (myImports(acc).length >= IMPORTS_PER_USER) { await rmQuiet(file); throw httpError(400, `You can keep ${IMPORTS_PER_USER} imported apps. Delete one you don't need first.`); }
   const meta = await inspectOrFail(file);
   const imp = {
     id: id(), ownerId: acc.id, name: meta.name || 'App', fileName: String(fileName || `${meta.name}.ipa`).slice(0, 200),
@@ -1540,7 +1541,37 @@ route('POST', /^\/api\/imports$/, async (req, res, m, acc) => {
   store.data.imports.unshift(imp);
   store.save();
   setTimeout(() => archiveImports().catch(() => {}), 5_000);
+  return imp;
+}
+route('POST', /^\/api\/imports$/, async (req, res, m, acc) => {
+  const { uploadId, fileName } = await readJson(req);
+  const imp = await createImport(acc, tmpPath(uploadId, acc), fileName);
   json(res, { import: importView(imp) });
+});
+// Import straight from a download link (one at a time per person).
+const linkImporting = new Set();
+route('POST', /^\/api\/imports\/link$/, async (req, res, m, acc) => {
+  const { url } = await readJson(req);
+  const u = parseLink(url);
+  if (linkImporting.has(acc.id)) return fail(res, 429, 'One download at a time. Wait for the first one to finish.');
+  if (myImports(acc).length >= IMPORTS_PER_USER) return fail(res, 400, `You can keep ${IMPORTS_PER_USER} imported apps. Delete one you don't need first.`);
+  const job = newJob(acc);
+  job.title = `Importing from ${u.hostname}`;
+  linkImporting.add(acc.id);
+  json(res, { jobId: job.id });
+  (async () => {
+    try {
+      const dest = await downloadToTmp(u, job);
+      job.log.push('Reading app info…');
+      const name = decodeURIComponent(path.basename(u.pathname)) || 'download.ipa';
+      const imp = await createImport(acc, dest, name);
+      job.result = { import: importView(imp) };
+      job.status = 'done';
+    } catch (e) {
+      job.error = isNoSpace(e) ? storageFullMessage() : e.message;
+      job.status = 'error';
+    } finally { linkImporting.delete(acc.id); }
+  })();
 });
 route('DELETE', /^\/api\/imports\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
   const imp = findImport(acc, 'imp_' + m[1]);
@@ -1618,7 +1649,20 @@ async function downloadToTmp(u, job) {
   job.cancellable = true;
   const idle = idleSignal(job.signal);
   let r;
-  try { r = await fetch(u, { redirect: 'follow', signal: idle.signal }); } catch (e) { idle.done(); throw idle.stalled() ? idle.signal.reason : e; }
+  try {
+    // Redirects are followed by hand, so every hop is checked: a public link can't bounce the download
+    // to something inside the server's own network.
+    let next = u;
+    for (let hop = 0; ; hop++) {
+      await assertPublicHost(next);
+      r = await fetch(next, { redirect: 'manual', signal: idle.signal });
+      if (r.status < 300 || r.status >= 400 || !r.headers.get('location')) break;
+      if (hop >= 6) throw new Error('That link redirects too many times');
+      if (r.body) r.body.cancel().catch(() => {});
+      next = new URL(r.headers.get('location'), next);
+      if (!/^https?:$/.test(next.protocol)) throw new Error('That link leads somewhere that isn\'t a download');
+    }
+  } catch (e) { idle.done(); throw idle.stalled() ? idle.signal.reason : e; }
   if (!r.ok || !r.body) { idle.done(); throw new Error(`Download failed (HTTP ${r.status})`); }
   const type = r.headers.get('content-type') || '';
   if (/text\/html/i.test(type)) { idle.done(); r.body.cancel().catch(() => {}); throw new Error("That link opens a web page, not a file. Use a direct download link (for Dropbox, change dl=0 to dl=1)."); }
@@ -1673,6 +1717,16 @@ function isPrivateHost(hostname) {
 }
 function checkPublicUrl(u) {
   if (isPrivateHost(u.hostname)) throw httpError(400, "That link points inside your server's own network, which isn't allowed. Use a public link.");
+}
+
+// The same check, after looking the name up: a public-looking name that points at a private address is refused too.
+async function assertPublicHost(u) {
+  checkPublicUrl(u);
+  const host = u.hostname.replace(/^\[|\]$/g, '');
+  if (net.isIP(host)) return;
+  let addrs = [];
+  try { addrs = await dns.promises.lookup(host, { all: true }); } catch { throw httpError(400, `Couldn't find ${host}. Check the link.`); }
+  if (addrs.some((a) => isPrivateHost(a.address))) throw httpError(400, "That link points inside your server's own network, which isn't allowed. Use a public link.");
 }
 
 function parseLink(url) {
