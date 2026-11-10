@@ -350,6 +350,7 @@ function certExpiry(c) {
 
 const ICONS = {
   plus: '<svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>',
+  link: '<svg viewBox="0 0 24 24"><path d="M10 14a4.5 4.5 0 0 0 6.4 0l3-3a4.5 4.5 0 0 0-6.4-6.4l-1 1"/><path d="M14 10a4.5 4.5 0 0 0-6.4 0l-3 3a4.5 4.5 0 0 0 6.4 6.4l1-1"/></svg>',
   file: '<svg viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>',
   check: '<svg viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>',
   box: '<svg viewBox="0 0 24 24"><path d="M21 8 12 3 3 8v8l9 5 9-5z"/><path d="m3 8 9 5 9-5M12 13v8"/></svg>',
@@ -649,7 +650,7 @@ function render() {
   $('#bellDot').textContent = unread > 9 ? '9+' : unread || '';
   $('#bellBtn').onclick = alertsSheet;
   const view = $('#view');
-  view.innerHTML = announcementHtml() + { imports: renderImports, library: renderLibrary, signed: renderSigned, certs: renderCerts, users: renderUsers, settings: renderSettings }[state.tab]();
+  view.innerHTML = announcementHtml() + { imports: renderImports, library: renderLibrary, signed: renderSigned, certs: renderCerts, users: renderUsers, settings: settingsView }[state.tab]();
   bindView(view);
   if (state.tab === 'library') bindLibrary(view);
 }
@@ -659,7 +660,11 @@ function renderImports() {
   const list = state.imports || [];
   const onGh = !!state.importsOnGithub;
   const keepNote = onGh ? 'Apps you import stay here until you delete them.' : 'Apps you import are kept for 3 days. Sign them before then.';
-  const pick = `<button class="file-btn" data-act="import-ipa">${ICONS.plus}<div class="row-main"><div class="row-title">Import an .ipa</div><div class="row-sub">From Files, iCloud Drive or your Downloads. Only you can see apps you import.</div></div></button>`;
+  // Two ways in, side by side: a file on this iPhone, or a download link.
+  const pick = `<div class="import-pair">
+      <button class="import-tile" data-act="import-ipa">${ICONS.plus}<b>Import a file</b><span>An .ipa from Files, iCloud Drive or Downloads</span></button>
+      <button class="import-tile" data-act="import-link">${ICONS.link || ICONS.down}<b>Import from a link</b><span>Paste a direct .ipa download link</span></button>
+    </div>`;
   if (!list.length) {
     return `${pick}
       <div class="empty" style="margin-top:18px">${TAB_ICONS.imports}<h3>Sign your own apps</h3><p>Import an .ipa from your iPhone, then sign and install it with your certificate. ${esc(keepNote)}</p>
@@ -728,6 +733,45 @@ async function importIpa() {
     closeSheet();
     toast(e.cancelled ? 'Cancelled' : e.message, !e.cancelled);
   }
+}
+
+// Import an .ipa from a download link: the server fetches it, so nothing goes through your phone's data twice.
+function importLinkSheet() {
+  openSheet(`
+    <h2>Import from a link</h2>
+    <p class="muted small" style="margin:-6px 0 14px">Paste a direct link to an .ipa. Mango downloads it into your Apps tab, ready to sign. Only you can see it.</p>
+    <div class="field"><label>Link</label><input id="ilUrl" type="url" inputmode="url" placeholder="https://…/app.ipa" autocapitalize="off" autocorrect="off"></div>
+    <div id="ilProgress"></div>
+    <div class="actions"><button class="btn primary big block" id="ilGo">Download</button></div>`, (el) => {
+    const input = $('#ilUrl', el);
+    setTimeout(() => input.focus(), 350);
+    const go = async () => {
+      let url = input.value.trim();
+      if (!url) return toast('Paste a link first', true);
+      if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
+      const btn = $('#ilGo', el);
+      btn.disabled = true;
+      const box = $('#ilProgress', el);
+      box.innerHTML = `<div class="bar"><div></div></div><p class="muted small center" id="ilMsg">Starting…</p>${cancelBtnHtml()}`;
+      try {
+        const { jobId } = await api('POST', '/api/imports/link', { url });
+        const r = await waitJob(jobId, (j) => {
+          if (j.progress != null) $('.bar > div', box).style.width = `${Math.round(j.progress * 100)}%`;
+          const last = (j.log || [])[j.log.length - 1];
+          if ($('#ilMsg', box)) $('#ilMsg', box).textContent = j.progress != null && j.progress < 1 ? `Downloading ${Math.round(j.progress * 100)}%` : last || 'Working…';
+        });
+        await refresh().catch(() => {});
+        toast(`Imported ${r.import.name}`);
+        signSheet(r.import.id);
+      } catch (e) {
+        box.innerHTML = '';
+        btn.disabled = false;
+        toast(e.cancelled ? 'Cancelled' : e.message, !e.cancelled);
+      }
+    };
+    $('#ilGo', el).onclick = go;
+    input.onkeydown = (e) => { if (e.key === 'Enter') go(); };
+  });
 }
 
 function importSheet(id) {
@@ -883,7 +927,7 @@ function myAppsSheet() {
   });
 }
 
-function appBadges(a, { compact = false } = {}) {
+function appBadges(a, { compact = false, noCloud = false } = {}) {
   const b = [];
   if (hasUpdate(a)) b.push('<span class="badge mango">⬆ Update</span>');
   else if (isStopped(a)) b.push('<span class="badge bad">⚠ Won\'t open</span>');
@@ -893,7 +937,7 @@ function appBadges(a, { compact = false } = {}) {
   if (a.testersOnly && seesTesterApps()) b.push('<span class="badge tester">🧪 Testers</span>');
   if (!compact && isStaff() && !a.published && !a.testersOnly) b.push('<span class="badge">Hidden</span>');
   if (!compact && a.missing) b.push('<span class="badge bad">Removed from source</span>');
-  if (!compact) b.push(cloudBadge(a));
+  if (!compact && !noCloud) b.push(cloudBadge(a));
   return b.join('');
 }
 
@@ -920,16 +964,20 @@ function appRow(a, { age = false } = {}) {
   const checked = state.lib.selected.has(a.id);
   const rating = a.likes + a.dislikes ? `👍 ${Math.round((100 * a.likes) / (a.likes + a.dislikes))}%` : '';
   const when = age ? `${a.updatedAt && a.updatedAt !== a.addedAt ? 'Updated' : 'Added'} ${ago(a.updatedAt || a.addedAt)}` : '';
-  const sub2 = [when, fmtSize(a.size), a.developer, a.installCount ? `🔥 ${a.installCount}` : '', rating].filter(Boolean).join(' · ');
+  const from = isSrcApp(a) && a.sourceName ? `${a.cloud === 'telegram' ? '✈️' : '☁'} ${a.sourceName}` : '';
+  const what = a.description ? a.description.split('\n')[0] : a.developer || a.bundleId || '';
+  // One quiet line of facts: version, size, age, where it's from, how popular.
+  const facts = [shownVersion(a), fmtSize(a.size), when, from, a.installCount ? `🔥 ${a.installCount}` : '', rating].filter(Boolean).join(' · ');
+  const badges = appBadges(a, { noCloud: true });
   return `
-    <div class="row ${checked ? 'selected' : ''}" data-act="${sel ? 'toggle-select' : 'app'}" data-id="${a.id}">
+    <div class="row app-row ${checked ? 'selected' : ''}" data-act="${sel ? 'toggle-select' : 'app'}" data-id="${a.id}">
       ${sel ? `<span class="check ${checked ? 'on' : ''}">${checked ? ICONS.check : ''}</span>` : ''}
       ${appIcon(a)}
       <div class="row-main">
         <div class="row-title">${esc(a.name)}${a.featured ? '<span class="star">★</span>' : ''}</div>
-        <div class="row-sub">${esc(shownVersion(a) || '—')} · ${esc(a.description ? a.description.split('\n')[0] : a.bundleId)}</div>
-        <div class="row-sub">${esc(sub2)}</div>
-        ${appBadges(a) ? `<div class="row-badges">${appBadges(a)}</div>` : ''}
+        ${what ? `<div class="row-sub">${esc(what)}</div>` : ''}
+        <div class="row-meta">${esc(facts)}</div>
+        ${badges ? `<div class="row-badges">${badges}</div>` : ''}
       </div>
       ${sel ? '' : `<button class="pill" data-act="get" data-id="${a.id}">${getLabel(a)}</button>`}
     </div>`;
@@ -1218,9 +1266,17 @@ function renderSigned() {
       ${s.fileAvailable ? `<button class="pill" data-act="install" data-id="${s.id}">Get</button>` : `<button class="pill dim" data-act="resign" data-id="${s.id}">Re-sign</button>`}
     </div>`;
   };
-  return `${notes.length ? `<p class="hint" style="margin:0 4px 10px">${notes.join(' ')}</p>` : ''}
-    ${ready.length ? `<div class="section-title" style="margin-top:4px">Ready to install <span class="count">${ready.length}</span></div><div class="list">${ready.map(row).join('')}</div>` : ''}
+  const lefts = state.signed.map((x) => daysLeft(x.expires)).filter((n) => n !== null);
+  const soonest = lefts.length ? Math.min(...lefts) : null;
+  const summary = `<div class="summary">
+      <div><b>${ready.length}</b><span>ready to install</span></div>
+      <div><b>${state.signed.filter((x) => x.onPhone).length}</b><span>on your phone</span></div>
+      <div><b class="${soonest !== null && soonest < 7 ? 'low' : ''}">${soonest === null ? '—' : soonest < 0 ? 'Expired' : soonest + 'd'}</b><span>${soonest !== null && soonest < 0 ? 'certificate' : 'until one expires'}</span></div>
+    </div>`;
+  return `${summary}
+    ${ready.length ? `<div class="section-title" style="margin-top:18px">Ready to install <span class="count">${ready.length}</span></div><div class="list">${ready.map(row).join('')}</div>` : ''}
     ${old.length ? `<div class="section-title">File removed <span class="count">${old.length}</span></div><div class="list">${old.map(row).join('')}</div>` : ''}
+    ${notes.length ? `<p class="hint" style="margin:10px 4px 0">${notes.join(' ')}</p>` : ''}
     ${installHistoryHtml()}`;
 }
 
@@ -1251,21 +1307,33 @@ function renderCerts() {
     if (c.deviceIncluded === false) deviceNote = '<p class="warning bad">Your iPhone isn\'t in this profile, so apps signed with it won\'t install on it. Add your UDID to the profile in your Apple Developer account.</p>';
     else if (c.deviceIncluded === null && !state.account.udid && c.profile.type !== 'Enterprise') deviceNote = '<p class="hint" style="margin-top:8px">Link your iPhone in ' + (isOwner() ? 'Settings' : 'Account') + ' to check if it\'s in this profile.</p>';
     const caps = ENT_PRESETS.map((p) => `<span class="badge ${profileAllows(c, p.key) ? 'good' : ''}">${profileAllows(c, p.key) ? '✓' : '✕'} ${p.short}</span>`).join('');
-    return `<div class="card">
-      <div class="card-head"><h3>${esc(c.label)}</h3>${c.isDefault ? '<span class="badge mango">Default</span>' : ''}</div>
-      <div class="badges">${certStatusBadge(c)}<span class="badge">${esc(c.profile.type)}</span>${leftBadge}${c.deviceIncluded === true && c.profile.type !== 'Enterprise' ? '<span class="badge good">Your iPhone ✓</span>' : ''}</div>
-      <dl class="kv">
-        <dt>Certificate</dt><dd>${esc(c.p12.commonName)}</dd>
-        <dt>Team</dt><dd>${esc(c.profile.teamName || '—')} ${c.profile.teamId ? `(${esc(c.profile.teamId)})` : ''}</dd>
-        <dt>App ID</dt><dd>${esc(c.profile.appId || '—')}</dd>
-        <dt>Profile</dt><dd>${esc(c.profile.name || '—')}</dd>
-        ${c.profile.type === 'Enterprise' ? '' : `<dt>Devices</dt><dd>${c.profile.deviceCount}</dd>`}
-        <dt>Cert expires</dt><dd>${fmtDate(c.p12.validTo)}</dd>
-        <dt>Profile expires</dt><dd>${fmtDate(c.profile.expires)}</dd>
-        ${c.check && c.check.checkedAt ? `<dt>Last checked</dt><dd>${ago(c.check.checkedAt)}</dd>` : ''}
-      </dl>
-      <div class="section-title" style="margin:12px 0 6px">Profile allows</div>
-      <div class="badges" style="margin-top:0">${caps}</div>
+    const dead = left !== null && left < 0;
+    const ringColor = dead || (c.check && c.check.status === 'revoked') ? 'var(--red)' : left !== null && left < 14 ? 'var(--mango-2)' : 'var(--leaf)';
+    const ringPct = left === null ? 0 : dead ? 100 : Math.max(4, Math.min(100, Math.round((left / 365) * 100)));
+    return `<div class="card cert-card">
+      <div class="cert-top">
+        <div class="days-ring" style="--p:${ringPct};--c:${ringColor}"><div><b>${left === null ? '?' : dead ? '0' : left}</b><span>${left === 1 ? 'day' : 'days'}</span></div></div>
+        <div class="row-main">
+          <h3>${esc(c.label)}</h3>
+          <div class="row-sub">${esc(c.profile.type)}${c.profile.teamName ? ` · ${esc(c.profile.teamName)}` : ''}</div>
+          <div class="badges" style="margin:7px 0 0">${certStatusBadge(c)}${c.isDefault ? '<span class="badge mango">Default</span>' : ''}${c.deviceIncluded === true && c.profile.type !== 'Enterprise' ? '<span class="badge good">Your iPhone ✓</span>' : ''}${c.profile.appId && !/\*$/.test(c.profile.appId) ? '<span class="badge">One app ID</span>' : ''}</div>
+        </div>
+      </div>
+      <details class="cert-more">
+        <summary>Details</summary>
+        <dl class="kv">
+          <dt>Certificate</dt><dd>${esc(c.p12.commonName)}</dd>
+          <dt>Team</dt><dd>${esc(c.profile.teamName || '—')} ${c.profile.teamId ? `(${esc(c.profile.teamId)})` : ''}</dd>
+          <dt>App ID</dt><dd>${esc(c.profile.appId || '—')}</dd>
+          <dt>Profile</dt><dd>${esc(c.profile.name || '—')}</dd>
+          ${c.profile.type === 'Enterprise' ? '' : `<dt>Devices</dt><dd>${c.profile.deviceCount}</dd>`}
+          <dt>Cert expires</dt><dd>${fmtDate(c.p12.validTo)}</dd>
+          <dt>Profile expires</dt><dd>${fmtDate(c.profile.expires)}</dd>
+          ${c.check && c.check.checkedAt ? `<dt>Last checked</dt><dd>${ago(c.check.checkedAt)}</dd>` : ''}
+        </dl>
+        <div class="hint" style="margin:10px 0 6px">Profile allows</div>
+        <div class="badges" style="margin-top:0">${caps}</div>
+      </details>
       ${c.matches === false ? '<p class="warning bad">This .p12 isn\'t listed in the provisioning profile, so signed apps won\'t install. Use the profile made for this certificate.</p>' : ''}
       ${c.profile.type === 'App Store' ? '<p class="warning">App Store profiles can\'t install apps directly. Use a Development, Ad Hoc or Enterprise profile.</p>' : ''}
       ${deviceNote}
@@ -1277,6 +1345,13 @@ function renderCerts() {
       </div>
     </div>`;
   }).join('');
+}
+
+// A round initial in a color that's always the same for the same name.
+function avatarHtml(name, big = false) {
+  let h = 0;
+  for (const ch of String(name)) h = (h * 31 + ch.codePointAt(0)) % 360;
+  return `<div class="avatar${big ? ' big' : ''}" style="--h:${h}">${esc(String(name).charAt(0).toUpperCase())}</div>`;
 }
 
 function renderUsers() {
@@ -1293,7 +1368,7 @@ function renderUsers() {
   const users = state.users.length
     ? `<div class="list">${state.users.map((u) => `
         <div class="row" data-act="user" data-id="${u.id}">
-          <div class="app-icon" style="width:44px;height:44px;border-radius:50%;font-size:18px">${esc(u.username.charAt(0).toUpperCase())}</div>
+          ${avatarHtml(u.username)}
           <div class="row-main">
             <div class="row-title">${esc(u.username)}${u.rank ? `<span class="badge ${u.rank === 'tester' ? 'tester' : 'mango'}">${RANK_LABEL[u.rank]}</span>` : ''}${u.disabled ? '<span class="badge bad">Off</span>' : ''}</div>
             <div class="row-sub">${u.deviceName ? esc(u.deviceName) : 'No iPhone linked'} · ${u.certCount} cert${u.certCount === 1 ? '' : 's'} · ${u.signedCount} signed</div>
@@ -1342,6 +1417,33 @@ function accountSection() {
       ${(state.requests || []).length ? `<div class="list">${state.requests.map(requestRow).join('')}</div>` : ''}
       <button class="btn block" data-act="request-app" style="margin-top:${(state.requests || []).length ? 10 : 0}px">+ Request an App</button>` : ''}`;
 }
+
+const ROW_ICONS = { Categories: '🗂', Collections: '📚', 'Copy my UDID': '📋', 'Unlink iPhone': '📵', 'Link this iPhone': '📱', 'Change Password': '🔑', 'Log Out': '🚪', 'GitHub storage': '🐙', Announcement: '📣', 'Message everyone': '✉️', 'Backup': '💾' };
+// Gives every settings row a small icon tile: its own emoji if it starts with one, or one picked for its name.
+function withRowIcons(html) {
+  return html.replace(/(<(?:button|a) class="row"[^>]*>)\s*<span class="row-main" style="([^"]*)">([^<]+)<\/span>/g, (all, open, style, label) => {
+    const m = /^\s*((?:\p{Extended_Pictographic}|\p{Regional_Indicator})[\uFE0F\u200D\p{Extended_Pictographic}]*)\s*(.+)$/u.exec(label);
+    const text = (m ? m[2] : label).trim();
+    const key = Object.keys(ROW_ICONS).find((k) => text.replace(/&amp;/g, '&').startsWith(k));
+    const plus = /^[+＋]\s*/.test(text);
+    const icon = m ? m[1] : plus ? '＋' : key ? ROW_ICONS[key] : '•';
+    return `${open}<span class="row-ico">${icon}</span><span class="row-main" style="${style}">${text.replace(/^[+＋]\s*/, '')}</span>`;
+  });
+}
+function profileCard() {
+  const a = state.account;
+  const role = isOwner() ? '👑 Owner' : RANK_LABEL[a.rank] || 'Member';
+  const mine = state.signed.length;
+  return `<div class="profile-card">
+    ${avatarHtml(a.username || 'You', true)}
+    <div class="row-main">
+      <h3>${esc(a.username || 'You')}</h3>
+      <div class="row-sub">${esc(role)} · ${a.udid ? esc(a.deviceName || 'iPhone linked') : 'No iPhone linked'}</div>
+    </div>
+    <div class="profile-stats"><div><b>${state.certs.length}</b><span>cert${state.certs.length === 1 ? '' : 's'}</span></div><div><b>${mine}</b><span>signed</span></div></div>
+  </div>`;
+}
+function settingsView() { return profileCard() + withRowIcons(renderSettings()); }
 
 function renderSettings() {
   if (isAdmin()) {
@@ -1473,6 +1575,7 @@ function bindView(view) {
         'add-cert': addCertSheet,
         'go-library': () => switchTab('library'),
         'import-ipa': importIpa,
+        'import-link': importLinkSheet,
         translate: translateSheet,
         import: () => importSheet(idv),
         'sign-import': () => (findImportApp(idv) && findImportApp(idv).available ? signSheet(idv) : importSheet(idv)),
@@ -3058,24 +3161,30 @@ function appSheet(appId) {
   const versions = a.versions || [];
   const inCols = state.collections.filter((c) => c.appIds.includes(a.id));
   openSheet(`
-    <div class="sheet-head">${appIcon(a, true)}<div class="row-main"><h2>${esc(a.name)}</h2><div class="row-sub">${esc(a.developer || a.bundleId)}</div></div></div>
-    <div class="badges" style="margin-top:0">
-      ${appBadges(a)}
-      <span class="badge mango">${esc(catLabel(a.categoryId))}</span>
-      ${a.featured ? '<span class="badge warn">★ Featured</span>' : ''}
-      <span class="badge">v${esc(shownVersion(a) || '?')}</span>
-      <span class="badge">${fmtSize(a.size)}</span>
+    <div class="app-hero">
+      ${appIcon(a, true)}
+      <div class="row-main">
+        <h2>${esc(a.name)}</h2>
+        <div class="row-sub">${esc(a.developer || a.bundleId)}</div>
+        <div class="hero-actions">
+          <button class="btn primary" id="aGet">${hasUpdate(a) ? 'Update' : isStopped(a) ? 'Fix' : a.installed ? 'Get Again' : 'Get'}</button>
+          <button class="btn" id="aOptions" type="button">Options</button>
+        </div>
+      </div>
     </div>
-    <div class="stat-row">
-      <div><b>${a.installCount || 0}</b><span>installs</span></div>
-      <div><b>${pct === null ? '—' : pct + '%'}</b><span>${total ? `liked · ${total} vote${total === 1 ? '' : 's'}` : 'no votes yet'}</span></div>
-      <div><b>${esc(a.minOS || '—')}</b><span>min iOS</span></div>
+    ${appBadges(a) || a.featured ? `<div class="badges" style="margin:0 0 10px">${appBadges(a)}${a.featured ? '<span class="badge warn">★ Featured</span>' : ''}</div>` : ''}
+    <div class="stat-strip">
+      <div><span>Installs</span><b>${a.installCount || 0}</b></div>
+      <div><span>Liked</span><b>${pct === null ? '—' : pct + '%'}</b><i>${total ? `${total} vote${total === 1 ? '' : 's'}` : 'no votes'}</i></div>
+      <div><span>Version</span><b>${esc(shownVersion(a) || '—')}</b></div>
+      <div><span>Size</span><b>${fmtSize(a.size) || '—'}</b></div>
+      <div><span>Needs iOS</span><b>${esc(a.minOS || '—')}</b></div>
+      <div><span>Category</span><b>${esc(catLabel(a.categoryId))}</b></div>
     </div>
     ${a.missing ? `<p class="warning bad">${owner ? `This app was removed from ${esc(a.sourceName || 'its source')}, so it's hidden from everyone. You can still try signing it if the link works, or delete it.` : 'This app is no longer available.'}</p>` : ''}
-    <button class="btn primary big block" id="aGet">${hasUpdate(a) ? `Update to ${esc(shownVersion(a))}` : isStopped(a) ? 'Sign Again to Fix' : a.installed ? 'Get Again' : 'Get'}</button>
+    ${hasUpdate(a) ? `<p class="hint center" style="margin-top:8px">Updates you to ${esc(shownVersion(a))}.</p>` : isStopped(a) ? '<p class="hint center" style="margin-top:8px">Signs it again so it opens.</p>' : ''}
     ${a.installed ? installedNoteHtml(a) : ''}
     ${defaults.length ? `<p class="hint center" style="margin-top:${a.installed ? 2 : 8}px">Comes set up with: ${esc(defaults.join(' · '))}</p>` : ''}
-    <button class="link-btn block" id="aOptions" type="button">Sign with options…</button>
     ${seesTesterApps() && !isOwner() ? '<button class="link-btn block" id="aBug" type="button" style="margin-top:-8px">🐞 Report a bug in this app</button>' : ''}
 
     ${shotList.length ? `<div class="shots">${shotList.map((src, i) => `<button class="shot" data-shot="${i}"><img class="fade-img" loading="lazy" referrerpolicy="no-referrer" onload="this.classList.add('loaded')" onerror="this.closest('.shot').remove()" src="${esc(src)}" alt="Screenshot ${i + 1}"></button>`).join('')}</div>` : ''}

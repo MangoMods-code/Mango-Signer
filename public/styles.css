@@ -889,3 +889,83 @@ input:focus, select:focus, textarea:focus { box-shadow: 0 0 0 3.5px var(--tint);
 button:focus:not(:focus-visible), a:focus:not(:focus-visible) { outline: none; }
 
 @media (prefers-reduced-motion: reduce) { .login-icon { animation: none; } .success-mark svg * { stroke-dashoffset: 0; } }
+
+/* ---------- V1.18 screen by screen ---------- */
+/* Apps: two ways in, side by side */
+.import-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.import-tile {
+  border: 0; cursor: pointer; text-align: left; color: var(--text); border-radius: 20px; padding: 14px 14px 15px;
+  display: grid; gap: 3px; align-content: start;
+  background: linear-gradient(150deg, color-mix(in srgb, var(--mango) 14%, var(--card)), color-mix(in srgb, var(--mango) 3%, var(--card)));
+  box-shadow: inset 0 0 0 1px var(--tint-line);
+  transition: transform .18s var(--spring), filter .18s ease;
+}
+.import-tile:active { transform: scale(.96); filter: brightness(1.1); }
+.import-tile svg { width: 40px; height: 40px; padding: 10px; border-radius: 50%; background: var(--tint); stroke: var(--mango); fill: none; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; margin-bottom: 8px; }
+.import-tile b { font: 700 16px/1.2 var(--round); letter-spacing: -.2px; }
+.import-tile span { font-size: 12.5px; line-height: 1.35; color: var(--muted); }
+.import-tile + .import-tile { background: linear-gradient(150deg, color-mix(in srgb, var(--blue) 13%, var(--card)), color-mix(in srgb, var(--blue) 3%, var(--card))); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--blue) 26%, transparent); }
+.import-tile + .import-tile svg { stroke: var(--blue); background: color-mix(in srgb, var(--blue) 16%, transparent); }
+
+/* Library rows: name, what it is, then one quiet line of facts */
+.app-row { align-items: center; padding-top: 12px; padding-bottom: 12px; }
+.app-row .row-title { font-size: 16.5px; letter-spacing: -.2px; }
+.app-row .row-sub { color: var(--soft-text); opacity: .82; margin-top: 1px; }
+.row-meta { color: var(--muted); font-size: 12px; margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+.app-row .row-badges { margin-top: 6px; }
+.lib-tools { margin: 4px 0 8px; }
+.sort-card { border-radius: 16px; }
+
+/* App page: icon, name and the Get button together, then a strip of facts you can swipe */
+.app-hero { display: flex; gap: 16px; align-items: center; margin: 2px 0 14px; }
+.app-hero .app-icon.big { width: 104px; height: 104px; font-size: 40px; box-shadow: 0 10px 28px rgba(0, 0, 0, .35); }
+.app-hero h2 { margin: 0; font-size: 23px; line-height: 1.15; overflow-wrap: anywhere; }
+.app-hero .row-sub { margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.hero-actions { display: flex; gap: 8px; margin-top: 12px; }
+.hero-actions .btn { padding: 8px 16px; border-radius: 999px; font-size: 15px; }
+.hero-actions .btn.primary { padding: 8px 26px; min-width: 96px; }
+.stat-strip { display: flex; overflow-x: auto; margin: 0 -18px 4px; padding: 12px 18px; scrollbar-width: none; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.stat-strip::-webkit-scrollbar { display: none; }
+.stat-strip > div { flex: none; min-width: 84px; padding: 0 14px; display: grid; justify-items: center; gap: 3px; text-align: center; align-content: start; }
+.stat-strip > div + div { border-left: 1px solid var(--line); }
+.stat-strip > div:first-child { padding-left: 0; }
+.stat-strip span { font-size: 11px; color: var(--muted); }
+.stat-strip b { font: 800 18px/1.15 var(--round); letter-spacing: -.3px; color: var(--soft-text); white-space: nowrap; max-width: 150px; overflow: hidden; text-overflow: ellipsis; }
+.stat-strip i { font-style: normal; font-size: 10.5px; color: var(--muted); }
+
+/* Signed: the three numbers that matter, first */
+.summary { display: grid; grid-template-columns: repeat(3, 1fr); background: var(--card); border-radius: var(--radius); box-shadow: var(--edge); padding: 14px 4px; }
+.summary > div { display: grid; justify-items: center; gap: 2px; text-align: center; padding: 0 6px; }
+.summary > div + div { border-left: 1px solid var(--line); }
+.summary b { font: 800 24px/1.1 var(--round); letter-spacing: -.5px; }
+.summary b.low { color: var(--red); }
+.summary span { font-size: 11.5px; color: var(--muted); line-height: 1.25; }
+
+/* Certificates: days left at a glance, the fine print tucked away */
+.cert-top { display: flex; gap: 14px; align-items: center; }
+.cert-top h3 { margin: 0; font-size: 18px; overflow-wrap: anywhere; }
+.days-ring { flex: none; width: 68px; height: 68px; border-radius: 50%; display: grid; place-items: center; background: conic-gradient(var(--c) calc(var(--p) * 1%), var(--card-2) 0); }
+.days-ring > div { width: 56px; height: 56px; border-radius: 50%; background: var(--card); display: grid; place-content: center; justify-items: center; }
+.days-ring b { font: 800 18px/1 var(--round); letter-spacing: -.4px; }
+.days-ring span { font-size: 9.5px; color: var(--muted); margin-top: 1px; }
+.cert-more { margin-top: 12px; border-top: 1px solid var(--line); }
+.cert-more summary { list-style: none; cursor: pointer; padding: 11px 0 3px; font: 600 14px var(--round); color: var(--mango); display: flex; align-items: center; gap: 6px; }
+.cert-more summary::-webkit-details-marker { display: none; }
+.cert-more summary::after { content: "›"; transition: transform .25s var(--spring); font-size: 17px; line-height: 1; }
+.cert-more[open] summary::after { transform: rotate(90deg); }
+.cert-more[open] > *:not(summary) { animation: rowIn .3s var(--ease-out) both; }
+.cert-card .card-actions { margin-top: 12px; }
+
+/* People and your own profile */
+.avatar { flex: none; width: 44px; height: 44px; border-radius: 50%; display: grid; place-items: center; font: 800 18px var(--round); color: #fff; background: linear-gradient(140deg, hsl(var(--h) 72% 62%), hsl(calc(var(--h) + 40) 70% 46%)); box-shadow: inset 0 1px 0 rgba(255, 255, 255, .3); }
+.avatar.big { width: 58px; height: 58px; font-size: 24px; }
+.profile-card { display: flex; align-items: center; gap: 14px; padding: 14px 16px; margin-bottom: 4px; border-radius: var(--radius); background: linear-gradient(135deg, color-mix(in srgb, var(--mango) 11%, var(--card)), var(--card) 70%); box-shadow: var(--edge); }
+.profile-card h3 { margin: 0; font-size: 19px; overflow-wrap: anywhere; }
+.profile-stats { display: flex; gap: 14px; }
+.profile-stats div { display: grid; justify-items: center; }
+.profile-stats b { font: 800 19px/1.1 var(--round); }
+.profile-stats span { font-size: 11px; color: var(--muted); }
+
+/* Settings rows get a small icon tile, like the Settings app */
+.row-ico { flex: none; width: 32px; height: 32px; border-radius: 9px; display: grid; place-items: center; font-size: 17px; background: var(--card-2); box-shadow: inset 0 0 0 1px var(--line); }
+.row .value { font-size: 15px; }
