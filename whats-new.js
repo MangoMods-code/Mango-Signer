@@ -3,6 +3,30 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.17.0',
+    date: '2026-11-09',
+    title: 'A Fresh Look',
+    summary: 'A cleaner, smoother Mango Signer, and it uses much less data.',
+    sections: [
+      {
+        title: '🎨 New look',
+        items: [
+          'A floating tab bar, with the tab you\'re on resting in a soft bubble.',
+          'Rounder, friendlier type for names, numbers and buttons.',
+          'Panels and buttons have soft depth, and a warm glow sits behind each page title. It works with every theme and accent color.',
+          'When an app finishes signing, the tick draws itself.',
+        ],
+      },
+      {
+        title: '⚡ Faster',
+        items: [
+          'Mango only downloads the library again when something actually changed, so it uses far less data and never stutters while you scroll.',
+          'The server stays quick for everyone while big libraries load.',
+        ],
+      },
+    ],
+  },
+  {
     version: '1.16.3',
     date: '2026-11-09',
     title: 'Tidy Grid',

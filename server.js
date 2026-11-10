@@ -274,17 +274,29 @@ function send(res, status, body, headers = {}) {
   const extra = {};
   // Big JSON (a library with whole app sources in it) is gzipped — about 20x smaller over cell data.
   const req = res.req;
-  if (!isBuf && typeof body !== 'string' && data.length > 8192 && req && /\bgzip\b/.test(req.headers['accept-encoding'] || '')) {
-    data = zlib.gzipSync(data, { level: 6 });
-    extra['Content-Encoding'] = 'gzip';
-    extra.Vary = 'Accept-Encoding';
+  const type = isBuf ? 'application/octet-stream' : typeof body === 'string' ? 'text/plain; charset=utf-8' : 'application/json';
+  const big = !isBuf && typeof body !== 'string' && data.length > 8192 && req;
+  // Big answers to GETs (the library) carry a fingerprint. An app that already has this exact answer says so,
+  // and gets a tiny "nothing changed" back instead of downloading and redrawing everything.
+  if (big && status === 200 && req.method === 'GET') {
+    const tag = `"${crypto.createHash('sha1').update(data).digest('base64url').slice(0, 22)}"`;
+    extra.ETag = tag;
+    if (req.headers['if-none-match'] === tag) {
+      res.writeHead(304, { 'Cache-Control': 'no-store', ETag: tag });
+      return res.end();
+    }
   }
-  res.writeHead(status, {
-    'Content-Type': isBuf ? 'application/octet-stream' : typeof body === 'string' ? 'text/plain; charset=utf-8' : 'application/json',
-    'Cache-Control': 'no-store',
-    ...extra,
-    ...headers,
-  });
+  const head = (more) => ({ 'Content-Type': type, 'Cache-Control': 'no-store', ...extra, ...more, ...headers });
+  // Big JSON is gzipped (about 20x smaller over cell data), off the main thread so other requests aren't held up.
+  if (big && /\bgzip\b/.test(req.headers['accept-encoding'] || '')) {
+    return zlib.gzip(data, { level: 5 }, (err, zipped) => {
+      if (res.writableEnded || res.destroyed) return;
+      if (err) { res.writeHead(status, head({})); return res.end(data); }
+      res.writeHead(status, head({ 'Content-Encoding': 'gzip', Vary: 'Accept-Encoding' }));
+      res.end(zipped);
+    });
+  }
+  res.writeHead(status, head({}));
   res.end(data);
 }
 const json = (res, body, status = 200) => send(res, status, body);
