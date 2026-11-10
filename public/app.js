@@ -4233,7 +4233,7 @@ function runSign(a, opts, extra) {
       if (background) { render(); return; } // the alert tells them it's ready
       closeSheet.locked = false;
       $('#sheet').classList.remove('locked');
-      showSigned(result.signed, opts);
+      showSigned(result.signed, { ...opts, auto: true });
     } catch (e) {
       if (background) { refresh().catch(() => {}); return; } // the alert says it failed
       closeSheet.locked = false;
@@ -4280,6 +4280,15 @@ function showSigned(s, opts = {}) {
     $('#okQr', el).onclick = () => qrSheet(`Install ${s.name}`, s.shareUrl, () => showSigned(s, opts));
     $('#okDone', el).onclick = () => { closeSheet(); switchTab('signed'); };
   });
+  // They watched it sign, so bring up the iPhone's install pop-up for them. The Install button stays as the fallback.
+  const onIphone = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.maxTouchPoints > 1 && /Macintosh/.test(navigator.userAgent));
+  if (opts.auto && https && onIphone && s.installUrl && showSigned.autoFor !== s.id) {
+    showSigned.autoFor = s.id;
+    setTimeout(() => {
+      const btn = document.querySelector(`#sheetBody [data-install="${s.id}"]`);
+      if (btn && document.visibilityState === 'visible') startInstall(s, true);
+    }, 900);
+  }
 }
 
 function signedSheet(sid) {
@@ -4341,16 +4350,16 @@ document.addEventListener('click', (e) => {
 });
 
 // Starts the iPhone's install pop-up right away (it has to happen during the tap), then shows live progress.
-function startInstall(s) {
+function startInstall(s, auto) {
   if (!s) return;
   if (!state.server.https) toast('Install needs HTTPS — open Mango Signer from your Railway link', true);
   location.href = s.installUrl;
   api('POST', `/api/signed/${s.id}/install`).catch((e) => toast(e.message, true));
-  installSheet(s);
+  installSheet(s, auto);
 }
 
 const RING = 2 * Math.PI * 52;
-function installSheet(s) {
+function installSheet(s, auto) {
   installSheet.last = s;
   const token = Symbol('install');
   installSheet.token = token;
@@ -4377,7 +4386,7 @@ function installSheet(s) {
       </ol>
       <p class="warning hidden" id="iHint"></p>
       <div class="actions">
-        <button class="btn block" id="iRetry">Try again</button>
+        <button class="btn block" id="iRetry">${auto ? 'Install' : 'Try again'}</button>
         <button class="btn primary block" id="iDone">Done</button>
       </div>
     </div>`, (el) => {
@@ -4408,14 +4417,15 @@ function installSheet(s) {
       if (dt > 0.4) { const inst = (st.sent - lastSent) / dt; rate = rate ? rate * 0.6 + inst * 0.4 : inst; lastSent = st.sent; lastT = now; }
     }
     const pct = st.phase === 'done' ? 1 : st.phase === 'downloading' ? st.progress : st.phase === 'confirm' ? 0.04 : 0;
-    ring.style.strokeDashoffset = String(RING * (1 - pct));
-    setStep(st.phase);
+    const off = (RING * (1 - pct)).toFixed(1);
+    if (ring.style.strokeDashoffset !== off) ring.style.strokeDashoffset = off;
+    if (tick.phase !== st.phase) { tick.phase = st.phase; setStep(st.phase); }
     const title = $('#iTitle', body), sub = $('#iSub', body), pctEl = $('#iPct', body);
     if (st.phase === 'waiting' || st.phase === 'idle') {
       title.textContent = 'Waiting for your iPhone…';
       sub.innerHTML = 'A pop-up should appear — tap <b>Install</b>.';
       pctEl.textContent = '';
-      hint(now - opened > 15000 ? "Nothing popped up? Tap Try again. If it still doesn't, make sure you opened Mango Signer from your https link in Safari." : '');
+      hint(now - opened > (auto ? 6000 : 15000) ? `Nothing popped up? Tap ${auto ? 'Install' : 'Try again'}. If it still doesn't, make sure you opened Mango Signer from your https link in Safari.` : '');
     } else if (st.phase === 'confirm') {
       title.textContent = 'Tap Install on the pop-up';
       sub.textContent = `Your iPhone is asking to install ${s.name}.`;
@@ -4430,7 +4440,7 @@ function installSheet(s) {
       sub.textContent = stuck ? `Stuck at ${fmtSize(st.sent)} of ${fmtSize(st.size)}` : `${fmtSize(st.sent)} of ${fmtSize(st.size)}${rate > 1024 ? ` · ${fmtSize(rate)}/s · ${fmtTime((st.size - st.sent) / rate)} left` : ''}`;
       hint(stuck ? "Nothing's moved for 30 seconds. Check your iPhone has enough free space and a good connection, then tap Try again." : '');
     } else if (st.phase === 'done') {
-      if (!doneSeen) { doneSeen = now; confetti(); refresh().catch(() => {}); }
+      if (!doneSeen) { doneSeen = now; confetti(); setTimeout(() => refresh(true).catch(() => {}), 2200); }
       pctEl.textContent = '100%';
       title.textContent = 'Downloaded ✓';
       sub.textContent = 'Your iPhone is finishing the install — check your Home Screen.';
@@ -4586,36 +4596,38 @@ function maybeShowTour() {
 }
 
 // ---------- confetti ----------
+// Kept light so it stays smooth on a phone that's busy installing: a normal-resolution canvas, fewer pieces, one pass.
 function confetti() {
-  if (reducedMotion()) return;
+  if (reducedMotion() || document.querySelector('.confetti')) return;
   const c = document.createElement('canvas');
   c.className = 'confetti';
-  const dpr = window.devicePixelRatio || 1;
-  c.width = innerWidth * dpr;
-  c.height = innerHeight * dpr;
+  const W = c.width = innerWidth, H = c.height = innerHeight;
   document.body.appendChild(c);
   const ctx = c.getContext('2d');
-  ctx.scale(dpr, dpr);
   const colors = ['#ff9f1c', '#ffcf4a', '#5cc45c', '#ff5fa2', '#4c9dff', '#a87bff'];
-  const parts = Array.from({ length: 140 }, () => ({
-    x: innerWidth / 2 + (Math.random() - 0.5) * 80, y: innerHeight * 0.35,
+  const parts = Array.from({ length: 54 }, () => ({
+    x: W / 2 + (Math.random() - 0.5) * 80, y: H * 0.35,
     vx: (Math.random() - 0.5) * 13, vy: -Math.random() * 13 - 4,
     r: Math.random() * Math.PI, vr: (Math.random() - 0.5) * 0.4,
-    w: 6 + Math.random() * 6, h: 3 + Math.random() * 4, c: colors[(Math.random() * colors.length) | 0],
+    w: 7 + Math.random() * 6, h: 4 + Math.random() * 4, c: colors[(Math.random() * colors.length) | 0],
   }));
-  const start = performance.now();
+  const LIFE = 1700;
+  let start = 0, last = 0;
   const frame = (t) => {
-    const age = t - start;
-    ctx.clearRect(0, 0, innerWidth, innerHeight);
+    if (!start) start = last = t;
+    const age = t - start, k = Math.min(3, (t - last) / 16.7) || 1; // keeps the same speed if frames are skipped
+    last = t;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    ctx.globalAlpha = Math.max(0, Math.min(1, (LIFE - age) / 500));
     for (const p of parts) {
-      p.vy += 0.35; p.vx *= 0.99; p.x += p.vx; p.y += p.vy; p.r += p.vr;
-      ctx.save();
-      ctx.globalAlpha = Math.max(0, 1 - age / 2600);
-      ctx.translate(p.x, p.y); ctx.rotate(p.r);
+      p.vy += 0.35 * k; p.x += p.vx * k; p.y += p.vy * k; p.r += p.vr * k;
+      if (p.y > H + 20) continue;
+      const cos = Math.cos(p.r), sin = Math.sin(p.r);
+      ctx.setTransform(cos, sin, -sin, cos, p.x, p.y);
       ctx.fillStyle = p.c; ctx.fillRect(-p.w / 2, -p.h / 2, p.w, p.h);
-      ctx.restore();
     }
-    if (age < 2600) requestAnimationFrame(frame); else c.remove();
+    if (age < LIFE && document.visibilityState === 'visible') requestAnimationFrame(frame); else c.remove();
   };
   requestAnimationFrame(frame);
 }
