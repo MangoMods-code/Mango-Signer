@@ -1869,6 +1869,7 @@ route('PATCH', /^\/api\/apps\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
   if (typeof b.published === 'boolean') app.published = b.published;
   if (typeof b.featured === 'boolean') app.featured = b.featured;
   if (typeof b.testersOnly === 'boolean') app.testersOnly = b.testersOnly;
+  if (typeof b.madeByMango === 'boolean') app.madeByMango = b.madeByMango;
   if (typeof b.useIconWhenSigning === 'boolean') app.useIconWhenSigning = b.useIconWhenSigning;
   if (b.versionOverride !== undefined) {
     const v = String(b.versionOverride || '').trim();

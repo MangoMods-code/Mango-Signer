@@ -3,6 +3,22 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.19.0',
+    date: '2026-11-10',
+    title: 'Made by Mango',
+    summary: 'A new Made by Mango row in the library, and a tidier Featured row.',
+    sections: [
+      {
+        title: '✨ New',
+        items: [
+          '🥭 Made by Mango: a row at the top of the library with apps made by Mango.',
+          'Featured is now a row of slim cards with a Get button right on each one, so you can sign without opening the app page.',
+          'See all opens the full list when a row has more than two apps.',
+        ],
+      },
+    ],
+  },
+  {
     version: '1.18.1',
     date: '2026-11-10',
     title: 'Hands-Free Install',
