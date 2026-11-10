@@ -76,7 +76,7 @@ try { Object.assign(state.lib, JSON.parse(localStorage.getItem('mango.lib') || '
 const saveLibPrefs = () => { try { localStorage.setItem('mango.lib', JSON.stringify({ cat: state.lib.cat, sort: state.lib.sort })); } catch { /* */ } };
 
 // ---------- api ----------
-async function api(method, url, body) {
+async function api(method, url, body, opts) {
   // Never wait forever: if the server or the connection goes quiet, give up with a clear message.
   const slow = /\/(sync|delete-removed|auto-categorize|restore|bulk|scan|dedupe)\b/.test(url);
   const ctrl = new AbortController();
@@ -85,7 +85,7 @@ async function api(method, url, body) {
   try {
     r = await fetch(url, {
       method,
-      headers: body ? { 'Content-Type': 'application/json' } : {},
+      headers: { ...(body ? { 'Content-Type': 'application/json' } : {}), ...(opts && opts.etag ? { 'If-None-Match': opts.etag } : {}) },
       body: body ? JSON.stringify(body) : undefined,
       credentials: 'same-origin',
       signal: ctrl.signal,
@@ -95,6 +95,8 @@ async function api(method, url, body) {
   } finally {
     clearTimeout(timer);
   }
+  if (r.status === 304) return { __same: true };
+  if (opts && opts.keepEtag) api.etag = r.headers.get('ETag') || null;
   let data = {};
   try { data = await r.json(); } catch { /* empty */ }
   if (r.status === 401 && !['/api/login', '/api/signup'].includes(url)) { showLogin(); throw new Error('Please sign in'); }
@@ -258,8 +260,11 @@ document.addEventListener('click', async (e) => {
   try { await api('POST', `/api/jobs/${waitJob.active}/cancel`); } catch (err) { toast(err.message, true); }
 });
 
-async function refresh() {
-  const d = await api('GET', '/api/state');
+// quiet: a background check. When nothing changed on the server it does nothing at all (no download, no redraw),
+// so the page never stutters while you scroll.
+async function refresh(quiet) {
+  const d = await api('GET', '/api/state', undefined, { keepEtag: true, etag: quiet === true ? api.etag : null });
+  if (d.__same) return;
   Object.assign(state, d);
   render();
   if (!pollTasks.timer) pollTasks();
@@ -4913,12 +4918,12 @@ async function boot() {
 }
 
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && !$('#app').classList.contains('hidden') && $('#sheet').classList.contains('hidden') && !uploadFile.active) refresh().catch(() => {});
+  if (document.visibilityState === 'visible' && !$('#app').classList.contains('hidden') && $('#sheet').classList.contains('hidden') && !uploadFile.active) refresh(true).catch(() => {});
 });
 
 // Keep alerts and the library fresh while the app is open (skipped while a sheet or upload is open).
 setInterval(() => {
-  if (document.visibilityState === 'visible' && !$('#app').classList.contains('hidden') && $('#sheet').classList.contains('hidden') && !uploadFile.active) refresh().catch(() => {});
+  if (document.visibilityState === 'visible' && !$('#app').classList.contains('hidden') && $('#sheet').classList.contains('hidden') && !uploadFile.active) refresh(true).catch(() => {});
 }, 3 * 60_000);
 
 checkForUpdate();
