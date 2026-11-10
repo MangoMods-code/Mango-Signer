@@ -819,6 +819,7 @@ function filteredApps() {
     apps = apps.filter((a) => [a.name, a.bundleId, a.description, a.developer, a.notes, a.sourceName, shownVersion(a), catLabel(a.categoryId), ...(a.tags || [])].some((f) => (f || '').toLowerCase().includes(needle)));
   }
   if (cat === 'featured') apps = apps.filter((a) => a.featured);
+  else if (cat === 'mango') apps = apps.filter((a) => a.madeByMango);
   else if (cat === 'installed') apps = apps.filter((a) => a.installed);
   else if (cat === 'favorites') apps = apps.filter(isFav);
   else if (cat === 'updates') apps = apps.filter(hasUpdate);
@@ -991,6 +992,17 @@ function appTile(a) {
   </button>`;
 }
 
+// A compact card for the Featured and Made by Mango rows: icon, name, one line, and a Get button right on it.
+function featCard(a) {
+  const sub = (a.description ? a.description.split('\n')[0] : '') || catLabel(a.categoryId) || a.developer || shownVersion(a) || '';
+  return `<div class="feat-card" role="button" tabindex="0" data-act="app" data-id="${a.id}">${appIcon(a)}<div class="feat-main"><div class="feat-name">${esc(a.name)}</div><div class="feat-sub">${esc(sub)}</div></div><button class="pill" data-act="get" data-id="${a.id}">${getLabel(a)}</button></div>`;
+}
+function featShelf(title, list, cat, cls = '') {
+  if (!list.length) return '';
+  const one = list.length === 1 ? ' one' : '';
+  return `<div class="section-title feat-title" style="margin-top:6px"><span>${title}</span>${list.length > 2 ? `<button class="see-link" data-cat-jump="${cat}">See all ${list.length}</button>` : ''}</div><div class="feat-shelf${one} ${cls}">${list.map(featCard).join('')}</div>`;
+}
+
 function miniCard(a, sub = '') {
   return `<button class="mini-card" data-act="app" data-id="${a.id}">${appIcon(a)}<span class="mini-name">${esc(a.name)}</span>${sub ? `<span class="mini-sub">${esc(sub)}</span>` : ''}</button>`;
 }
@@ -1032,10 +1044,8 @@ function libraryListHtml() {
     if (updates.length) {
       html += `<div class="section-title" style="margin-top:6px">⬆ Updates for you <span class="count">${updates.length}</span></div><div class="mini-shelf">${updates.map((a) => miniCard(a, `→ ${shownVersion(a)}`)).join('')}</div>`;
     }
-    const featured = apps.filter((a) => a.featured);
-    if (featured.length) {
-      html += `<div class="section-title" style="margin-top:6px">★ Featured</div><div class="mini-shelf">${featured.map((a) => miniCard(a)).join('')}</div>`;
-    }
+    html += featShelf('★ Featured', apps.filter((a) => a.featured), 'featured');
+    html += featShelf('🥭 Made by Mango', apps.filter((a) => a.madeByMango), 'mango', 'mango');
     // Everything else: one list, most recently added or updated first.
     const recent = apps.slice().sort((x, y) => String(y.updatedAt || y.addedAt).localeCompare(String(x.updatedAt || x.addedAt)));
     const shown = recent.slice(0, state.lib.limit);
@@ -1058,6 +1068,7 @@ function libCount(key) {
   if (key === 'updates') return A.filter(hasUpdate).length;
   if (key === 'new') return A.filter((a) => isNewApp(a) || isUpdatedApp(a)).length;
   if (key === 'featured') return A.filter((a) => a.featured).length;
+  if (key === 'mango') return A.filter((a) => a.madeByMango).length;
   if (key === 'none') return A.filter((a) => !catById(a.categoryId)).length;
   if (key === 'hidden') return A.filter((a) => !a.published).length;
   if (key === 'testers') return A.filter((a) => a.testersOnly).length;
@@ -1073,7 +1084,7 @@ function filterGroups() {
   const tags = [...new Set(state.apps.flatMap((a) => a.tags || []))].sort();
   const srcNames = [...new Set(state.apps.filter((a) => isSrcApp(a) && a.sourceName).map((a) => a.sourceName))].sort();
   const g = [
-    { title: 'Show', items: [['all', '📱 All'], ['favorites', '♥ Favorites'], ['installed', '✓ Installed'], ['updates', '⬆ Updates'], ['new', '🆕 New'], ['featured', '★ Featured'], ...(seesTesterApps() ? [['testers', '🧪 Testers']] : [])] },
+    { title: 'Show', items: [['all', '📱 All'], ['favorites', '♥ Favorites'], ['installed', '✓ Installed'], ['updates', '⬆ Updates'], ['new', '🆕 New'], ['featured', '★ Featured'], ...(state.apps.some((a) => a.madeByMango) ? [['mango', '🥭 Made by Mango']] : []), ...(seesTesterApps() ? [['testers', '🧪 Testers']] : [])] },
     { title: 'Categories', items: state.categories.map((c) => [c.id, `${c.emoji} ${c.name}`]) },
     { title: 'Sources', items: srcNames.map((n) => [`src:${n}`, `${state.apps.some((a) => a.cloud === 'telegram' && a.sourceName === n) ? '✈️' : '☁'} ${n}`]) },
     { title: 'Tags', items: tags.map((t) => [`tag:${t}`, `# ${t}`]) },
@@ -3172,7 +3183,7 @@ function appSheet(appId) {
         </div>
       </div>
     </div>
-    ${appBadges(a) || a.featured ? `<div class="badges" style="margin:0 0 10px">${appBadges(a)}${a.featured ? '<span class="badge warn">★ Featured</span>' : ''}</div>` : ''}
+    ${appBadges(a) || a.featured || a.madeByMango ? `<div class="badges" style="margin:0 0 10px">${appBadges(a)}${a.featured ? '<span class="badge warn">★ Featured</span>' : ''}${a.madeByMango ? '<span class="badge warn">🥭 Made by Mango</span>' : ''}</div>` : ''}
     <div class="stat-strip">
       <div><span>Installs</span><b>${a.installCount || 0}</b></div>
       <div><span>Liked</span><b>${pct === null ? '—' : pct + '%'}</b><i>${total ? `${total} vote${total === 1 ? '' : 's'}` : 'no votes'}</i></div>
@@ -3231,6 +3242,7 @@ function appSheet(appId) {
     <div class="group" style="margin-top:14px">
       ${toggle('aPub', 'Show in App Library', 'Everyone you invite can sign and install it', a.published)}
       ${toggle('aFeat', 'Featured', 'Pinned to the top of the library', a.featured)}
+      ${toggle('aMango', 'Made by Mango', 'Shows in the 🥭 Made by Mango row at the top of everyone\'s library', !!a.madeByMango)}
       ${toggle('aTest', 'Testers only', 'Only testers (and admins) can see it — a 🧪 For testers list shows at the top of their library', !!a.testersOnly)}
     </div>
     <div class="actions">
@@ -3298,6 +3310,7 @@ function appSheet(appId) {
     };
     flip('#aPub', 'published', 'Shown in App Library', 'Hidden from App Library');
     flip('#aFeat', 'featured', 'Featured ★', 'No longer featured');
+    flip('#aMango', 'madeByMango', 'Added to Made by Mango 🥭', 'Removed from Made by Mango');
     flip('#aTest', 'testersOnly', 'Only testers can see it now 🧪', 'Not just for testers anymore');
     $('#aEdit', el).onclick = () => editAppSheet(a);
     $('#aShots', el).onclick = () => screenshotsSheet(a);
@@ -3694,6 +3707,7 @@ function editAppSheet(a, isNew = false) {
     <div class="group">
       ${toggle('ePub', 'Show in App Library', 'Visible to everyone you invite', a.published)}
       ${toggle('eFeat', 'Featured', 'Pinned to the top of the library', a.featured)}
+      ${toggle('eMango', 'Made by Mango', 'Shows in the 🥭 Made by Mango row at the top of everyone\'s library', !!a.madeByMango)}
     </div>
 
     <div class="section-title">Icon</div>
@@ -3749,6 +3763,7 @@ function editAppSheet(a, isNew = false) {
           notes: $('#eNotes', el).value,
           published: $('#ePub', el).checked,
           featured: $('#eFeat', el).checked,
+          madeByMango: $('#eMango', el).checked,
           useIconWhenSigning: $('#eIconSign', el).checked,
           signDefaults: { ...collect(), minOS: $('#eMin', el).value.trim(), tweakIds: pickedTweaks(el, 'd') },
         };
