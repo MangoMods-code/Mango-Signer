@@ -3,6 +3,26 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.18.1',
+    date: '2026-11-10',
+    title: 'Hands-Free Install',
+    summary: 'Installing starts by itself after signing, and the install screen is smooth again.',
+    sections: [
+      {
+        title: '✨ New',
+        items: [
+          'When you watch an app get signed on your iPhone, the install pop-up now comes up by itself. The Install button is still there if you need it.',
+        ],
+      },
+      {
+        title: '🛠 Fixed',
+        items: [
+          'The install progress screen no longer stutters, especially at 100%.',
+        ],
+      },
+    ],
+  },
+  {
     version: '1.18.0',
     date: '2026-11-10',
     title: 'Every Screen, Redone',
