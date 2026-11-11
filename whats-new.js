@@ -3,6 +3,22 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.20.0',
+    date: '2026-11-10',
+    title: 'Settings Files for Tweaks',
+    summary: 'Tweaks can now bring their settings files (like a .plist) along when you sign.',
+    sections: [
+      {
+        title: '✨ New',
+        items: [
+          'When signing, "Add your own tweak files" now takes a tweak\'s settings files too (.plist, .json and so on), not just the .dylib or .deb.',
+          'The files are put inside the app next to the tweak, and copied into the app\'s Documents folder the first time it opens, which is where most tweaks look.',
+          'Tweaks in the library can carry their settings files with them, so they\'re added automatically, including for apps that use the tweak by default.',
+        ],
+      },
+    ],
+  },
+  {
     version: '1.19.0',
     date: '2026-11-10',
     title: 'Made by Mango',

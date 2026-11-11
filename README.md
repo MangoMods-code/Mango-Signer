@@ -26,7 +26,7 @@ Upload an `.ipa`, add a `.p12` + `.mobileprovision`, tap **Sign**, then **Instal
 - **Signed apps that stay** – with GitHub storage on a private repo, signed apps are saved to a separate "Mango Signed" release and stay in the Signed tab, ready to reinstall, until they're deleted (or their certificate expires)
 - **Installed apps** – Mango tracks what each person installed through it, only nags about real updates (by version number), marks apps whose certificate expired as "won't open", and lets people fix the list ("I already updated it", "Not on my phone anymore")
 - **Owner tools** – stats & activity, message everyone, one-tap backup & restore
-- **Tweaks** – a tweaks library (jailbreak `.deb` or `.dylib`), per-app default tweaks, automatic CydiaSubstrate/ElleKit bundling for tweaks that need it
+- **Tweaks** – a tweaks library (jailbreak `.deb` or `.dylib`), per-app default tweaks, automatic CydiaSubstrate/ElleKit bundling for tweaks that need it, and settings files (`.plist`, `.json`…) that go inside the app with the tweak and are copied to its Documents folder on first launch
 - **Presets & batch signing** – save sign settings as presets, select several apps and Get them all at once, import certificates from a `.zip`
 - **Alerts & security** – 🔔 alerts inbox (updates, requests, certificate expiry and revokes, new users, lockouts, low storage), ♥ favorites, security log, account lockout, sign out everywhere, expiring invites, daily sign limits
 - **Big files** – resumable uploads that survive dropped connections; stalled downloads/uploads are stopped with a message instead of hanging; old signed files are cleaned up automatically; app icons are stored small (180px) to save space

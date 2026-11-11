@@ -3066,6 +3066,7 @@ function tweakView(t, acc) {
   const base = {
     id: t.id, name: t.name, version: t.version, author: t.author, description: t.description, package: t.package,
     files: t.files.map((f) => ({ name: f.name, size: f.size, needsSubstrate: f.needsSubstrate, missing: f.missing })),
+    extras: (t.extras || []).map((f) => ({ name: f.name, size: f.size })), toDocuments: t.toDocuments !== false,
     warnings: t.warnings || [], addedAt: t.addedAt, published: t.published !== false,
   };
   return isStaff(acc) ? base : { ...base, package: undefined };
@@ -3144,6 +3145,68 @@ route('POST', /^\/api\/tweaks$/, async (req, res, m, acc) => {
   }
 }, 'staff');
 
+// ----- settings files that go with a tweak -----
+// Some tweaks read a settings file (a .plist, .json and so on). These are put inside the app next to the tweak
+// when signing, and (with the MangoFiles helper) copied into the app's Documents folder the first time it opens.
+const MAX_EXTRA_FILE = 5 * 1024 * 1024;
+const MAX_EXTRA_FILES = 20;
+const HELPER_DYLIB = path.join(__dirname, 'lib', 'MangoFiles.dylib');
+const helperInstalled = () => fs.existsSync(HELPER_DYLIB);
+const RESERVED_EXTRA = /^(info\.plist|embedded\.mobileprovision|pkginfo|coderesources|_codesignature|mangofiles|frameworks|plugins|sc_info|itunesmetadata\.plist)$/i;
+function safeExtraName(n) {
+  const name = path.basename(String(n || '').replace(/\\/g, '/')).replace(/[^\w.\-+ ()]/g, '_').replace(/^[.\s]+/, '').trim().slice(0, 100);
+  if (!name) throw httpError(400, 'That file has no name');
+  if (/\.(dylib|deb|ipa|app|appex|framework)$/i.test(name)) throw httpError(400, `${name} isn't a settings file. Add tweaks (.dylib or .deb) with the tweak button instead.`);
+  if (RESERVED_EXTRA.test(name)) throw httpError(400, `${name} is one of the app's own files and can't be replaced`);
+  return name;
+}
+
+route('POST', /^\/api\/tweaks\/([a-f0-9]{16})\/files$/, async (req, res, m, acc) => {
+  const t = store.tweaks.find((x) => x.id === m[1]);
+  const { uploadId, fileName } = await readJson(req);
+  const file = tmpPath(uploadId, acc);
+  try {
+    if (!t) return fail(res, 404, 'Tweak not found');
+    const name = safeExtraName(fileName);
+    const st = await fsp.stat(file);
+    if (st.size > MAX_EXTRA_FILE) return fail(res, 400, `${name} is too big (settings files can be up to 5 MB)`);
+    t.extras = (t.extras || []).filter((f) => f.name.toLowerCase() !== name.toLowerCase());
+    if (t.extras.length >= MAX_EXTRA_FILES) return fail(res, 400, `A tweak can have up to ${MAX_EXTRA_FILES} settings files`);
+    const dir = path.join(dirs.tweaks, t.id, 'extras');
+    await fsp.mkdir(dir, { recursive: true });
+    await fsp.copyFile(file, path.join(dir, name));
+    t.extras.push({ name, size: st.size });
+    store.save();
+    json(res, { tweak: tweakView(t, acc) });
+  } catch (e) {
+    fail(res, e.status || 400, e.message);
+  } finally {
+    await rmQuiet(file);
+  }
+}, 'staff');
+
+route('DELETE', /^\/api\/tweaks\/([a-f0-9]{16})\/files\/([^/]+)$/, async (req, res, m, acc) => {
+  const t = store.tweaks.find((x) => x.id === m[1]);
+  if (!t) return fail(res, 404, 'Tweak not found');
+  const name = decodeURIComponent(m[2]);
+  const f = (t.extras || []).find((x) => x.name === name);
+  if (!f) return fail(res, 404, 'File not found');
+  t.extras = t.extras.filter((x) => x !== f);
+  store.save();
+  await rmQuiet(path.join(dirs.tweaks, t.id, 'extras', f.name));
+  json(res, { tweak: tweakView(t, acc) });
+}, 'staff');
+
+route('GET', /^\/api\/tweaks\/([a-f0-9]{16})\/files\/([^/]+)$/, async (req, res, m) => {
+  const t = store.tweaks.find((x) => x.id === m[1]);
+  const name = decodeURIComponent(m[2]);
+  const f = t && (t.extras || []).find((x) => x.name === name);
+  if (!f) return fail(res, 404, 'File not found');
+  const buf = await fsp.readFile(path.join(dirs.tweaks, t.id, 'extras', f.name));
+  res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Disposition': `attachment; filename="${f.name.replace(/[^\w.\-]/g, '_')}"`, 'Content-Length': buf.length });
+  res.end(buf);
+}, 'staff');
+
 route('PATCH', /^\/api\/tweaks\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
   const t = store.tweaks.find((x) => x.id === m[1]);
   if (!t) return fail(res, 404, 'Tweak not found');
@@ -3151,6 +3214,7 @@ route('PATCH', /^\/api\/tweaks\/([a-f0-9]{16})$/, async (req, res, m, acc) => {
   if (typeof b.name === 'string' && b.name.trim()) t.name = b.name.trim().slice(0, 80);
   if (typeof b.description === 'string') t.description = b.description.slice(0, 600);
   if (typeof b.published === 'boolean') t.published = b.published;
+  if (typeof b.toDocuments === 'boolean') t.toDocuments = b.toDocuments;
   store.save();
   json(res, { tweak: tweakView(t, acc) });
 }, 'staff');
@@ -4686,7 +4750,44 @@ async function collectTweaks(uploads, libTweaks, work, job) {
   return { files, frameworks };
 }
 
-async function prepareModifiedIpa(srcIpa, work, plistEdits, job, frameworks = []) {
+// Gathers the settings files that go with the tweaks: ones uploaded for this sign, plus the library tweaks' own.
+async function collectExtras(uploads, libTweaks, toDocs, work, job) {
+  const out = [];
+  const seen = new Set();
+  const add = (name, buf, docs, from) => {
+    const k = name.toLowerCase();
+    if (seen.has(k)) { job.log.push(`Note: two settings files are called ${name}; using the first one.`); return; }
+    seen.add(k);
+    out.push({ name, buf, docs, from });
+  };
+  for (const u of uploads) {
+    const st = await fsp.stat(u.file);
+    if (st.size > MAX_EXTRA_FILE) throw new Error(`${u.name} is too big (settings files can be up to 5 MB)`);
+    add(u.name, await fsp.readFile(u.file), toDocs, 'you');
+    await rmQuiet(u.file);
+  }
+  for (const t of libTweaks) {
+    for (const f of t.extras || []) {
+      const buf = await fsp.readFile(path.join(dirs.tweaks, t.id, 'extras', f.name)).catch(() => null);
+      if (buf) add(f.name, buf, t.toDocuments !== false, t.name); else job.log.push(`Note: ${t.name}'s file ${f.name} is missing on the server.`);
+    }
+  }
+  let helper = null;
+  if (out.some((f) => f.docs)) {
+    if (helperInstalled()) {
+      helper = path.join(work, 'tweaks', 'MangoFiles.dylib');
+      await fsp.mkdir(path.dirname(helper), { recursive: true });
+      await fsp.copyFile(HELPER_DYLIB, helper);
+    } else {
+      job.log.push("Note: lib/MangoFiles.dylib isn't on the server, so settings files are only put inside the app, not copied to Documents.");
+      for (const f of out) f.docs = false;
+    }
+  }
+  if (out.length) job.log.push(`Adding ${out.length} settings file${out.length === 1 ? '' : 's'}: ${out.map((f) => f.name).join(', ')}`);
+  return { files: out, helper };
+}
+
+async function prepareModifiedIpa(srcIpa, work, plistEdits, job, frameworks = [], extras = []) {
   const extract = path.join(work, 'x');
   await fsp.mkdir(extract, { recursive: true });
   job.log.push(plistEdits.length ? 'Unpacking app to edit Info.plist…' : 'Unpacking app to add tweak support…');
@@ -4708,6 +4809,17 @@ async function prepareModifiedIpa(srcIpa, work, plistEdits, job, frameworks = []
     await fsp.cp(fw, dest, { recursive: true });
     job.log.push(`Added ${path.basename(fw)} so tweaks can run.`);
   }
+  // Settings files sit next to the tweak inside the app. Ones for Documents also go in MangoFiles/, which the helper copies out on launch.
+  for (const f of extras) {
+    const beside = path.join(payload, appDir, f.name);
+    if (fs.existsSync(beside)) job.log.push(`Note: the app already has its own ${f.name}, so that one was left alone.`);
+    else await fsp.writeFile(beside, f.buf);
+    if (f.docs) {
+      await fsp.mkdir(path.join(payload, appDir, 'MangoFiles'), { recursive: true });
+      await fsp.writeFile(path.join(payload, appDir, 'MangoFiles', f.name), f.buf);
+    }
+  }
+  if (extras.some((f) => f.docs)) job.log.push("They're copied into the app's Documents folder the first time it opens.");
   const out = path.join(work, 'modified.ipa');
   if (await runLogged('zip', ['-qry', '-0', out, 'Payload'], job, { cwd: extract }) !== 0) throw new Error("Couldn't repack the app");
   await rmQuiet(extract);
@@ -4786,6 +4898,10 @@ route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
   }));
   const libTweaks = (Array.isArray(b.tweakIds) ? b.tweakIds : []).slice(0, 20)
     .map((tid) => visibleTweaks(acc).find((t) => t.id === tid)).filter(Boolean);
+  let extraFiles;
+  try {
+    extraFiles = (Array.isArray(b.tweakFiles) ? b.tweakFiles : []).slice(0, MAX_EXTRA_FILES).map((d) => ({ file: tmpPath(d.uploadId, acc), name: safeExtraName(d.name) }));
+  } catch (e) { return fail(res, e.status || 400, e.message); }
 
   // Already signing this app for you? Follow that job instead of starting a second copy.
   const runKey = `${acc.id}:${app.id}`;
@@ -4859,6 +4975,8 @@ route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
       }
       // Tweaks: your uploaded .dylib/.deb files plus any picked from the Tweaks library.
       const inject = await collectTweaks(dylibFiles, libTweaks, work, job);
+      const extras = await collectExtras(extraFiles, libTweaks, b.filesToDocuments !== false, work, job);
+      if (extras.helper) inject.files.unshift(extras.helper); // first, so the files are in place before the tweaks look for them
       for (const p of inject.files) args.push('-l', p);
       if (inject.files.length && b.weakDylibs) args.push('-w');
       if (inject.files.length && b.injectExtensions) args.push('-P');
@@ -4886,7 +5004,7 @@ route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
         }
         job.progress = null;
       }
-      if (plistEdits.length || inject.frameworks.length) input = await prepareModifiedIpa(input, work, plistEdits, job, inject.frameworks);
+      if (plistEdits.length || inject.frameworks.length || extras.files.length) input = await prepareModifiedIpa(input, work, plistEdits, job, inject.frameworks, extras.files);
       args.push(input);
 
       job.log.push(`Signing ${app.name} with ${cert.label}…`);
@@ -4907,7 +5025,7 @@ route('POST', /^\/api\/sign$/, async (req, res, m, acc) => {
         size: meta.size, hasIcon: !!meta.icon || fs.existsSync(path.join(dirs.signed, signedId + '.png')), signedAt: new Date().toISOString(),
         expires: cert.profile.expires,
         options: {
-          ...opts, icon: !!iconFile, dylibs: dylibFiles.map((d) => d.name), tweaks: libTweaks.map((t) => t.name), tweakIds: libTweaks.map((t) => t.id), versionIndex: versionIndex || 0,
+          ...opts, icon: !!iconFile, dylibs: dylibFiles.map((d) => d.name), tweakFiles: extras.files.map((f) => f.name), tweaks: libTweaks.map((t) => t.name), tweakIds: libTweaks.map((t) => t.id), versionIndex: versionIndex || 0,
           entitlements: entEdits.map((e) => e.key), plist: plistEdits.map((e) => e.key),
         },
       };
