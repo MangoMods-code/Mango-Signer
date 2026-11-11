@@ -592,10 +592,13 @@ function bindSignOptions(el, defaults = {}, prefix = '') {
 
 // Short list of what an app's default sign settings turn on, e.g. "JIT · More RAM · 120Hz".
 // Checkboxes for tweaks from the Tweaks library.
+const isTweakFile = (n) => /\.(dylib|deb)$/i.test(n);
+// Files a tweak reads its settings from. Anything that isn't an app or a library is fine.
+const isSettingsFile = (n) => /\.[a-z0-9]{1,10}$/i.test(n) && !/\.(dylib|deb|ipa|app|appex|framework|p12|mobileprovision|zip)$/i.test(n);
 function tweakPickerHtml(prefix, selected = []) {
   if (!state.tweaks.length) return '';
   return `<div class="group tweak-pick">${state.tweaks.map((t) => toggle(`${prefix}Tw_${t.id}`, `🧩 ${esc(t.name)}${t.version ? ' ' + esc(t.version) : ''}`,
-    esc(t.description ? t.description.split('\n')[0].slice(0, 90) : (t.warnings.length ? '⚠️ ' + t.warnings[0] : `${t.files.length} file${t.files.length === 1 ? '' : 's'}`)), selected.includes(t.id))).join('')}</div>`;
+    esc(t.description ? t.description.split('\n')[0].slice(0, 90) : (t.warnings.length ? '⚠️ ' + t.warnings[0] : `${t.files.length} file${t.files.length === 1 ? '' : 's'}`)) + ((t.extras || []).length ? ` · 📄 ${t.extras.length} settings file${t.extras.length === 1 ? '' : 's'}` : ''), selected.includes(t.id))).join('')}</div>`;
 }
 const pickedTweaks = (el, prefix) => state.tweaks.filter((t) => { const x = $(`#${prefix}Tw_${t.id}`, el); return x && x.checked; }).map((t) => t.id);
 
@@ -2839,16 +2842,47 @@ function tweakSheet(tid) {
     </dl>
     <div class="field" style="margin-top:12px"><label>Name</label><input type="text" id="twName" value="${esc(t.name)}" maxlength="80"></div>
     <div class="field"><label>Description</label><textarea id="twDesc" rows="3" placeholder="What it does (shown when signing)">${esc(t.description || '')}</textarea></div>
-    <div class="group">${toggle('twPub', 'Available to everyone', 'Off = only you can pick it when signing', t.published)}</div>
+    <div class="section-title">Settings files <span class="count">${(t.extras || []).length}</span></div>
+    <p class="hint" style="margin:-2px 4px 8px">Files this tweak reads, like a .plist. They go with the tweak every time it's used, including when it's an app's default.</p>
+    ${(t.extras || []).length ? `<div class="list">${t.extras.map((f) => `<div class="row"><span class="app-icon tw-icon">📄</span><span class="row-main"><span class="row-title">${esc(f.name)}</span><span class="row-sub">${fmtSize(f.size)}</span></span><a class="mini" style="display:grid;place-items:center;text-decoration:none" href="/api/tweaks/${t.id}/files/${encodeURIComponent(f.name)}" download aria-label="Download">↓</a><button class="mini danger" data-xdel="${esc(f.name)}" aria-label="Remove">✕</button></div>`).join('')}</div>` : ''}
+    <button class="file-btn" id="twFile" style="margin-top:${(t.extras || []).length ? 10 : 0}px">${ICONS.plus}<div class="row-main"><div class="row-title">Add settings files</div><div class="row-sub">.plist, .json, .txt… · adding one with the same name replaces it</div></div></button>
+    <div class="group" style="margin-top:10px">
+      ${toggle('twDocs', 'Copy to the app\'s Documents folder', 'Files are always put inside the app next to the tweak. On = also copied into Documents when the app first opens (most tweaks look there)', t.toDocuments !== false)}
+      ${toggle('twPub', 'Available to everyone', 'Off = only you can pick it when signing', t.published)}
+    </div>
     <div class="actions">
       <button class="btn primary block" id="twSave">Save</button>
       <button class="btn block" id="twBack">Back to Tweaks</button>
       <button class="btn block danger" id="twDel">Delete</button>
     </div>`, (el) => {
     $('#twBack', el).onclick = tweaksSheet;
+    $('#twDocs', el).onchange = async (e) => {
+      try { await api('PATCH', `/api/tweaks/${t.id}`, { toDocuments: e.target.checked }); t.toDocuments = e.target.checked; } catch (err) { toast(err.message, true); }
+    };
+    $('#twFile', el).onclick = async () => {
+      const files = (await pickFile('', true)) || [];
+      let added = 0;
+      for (const f of files) {
+        if (!isSettingsFile(f.name)) { toast(`${f.name} isn't a settings file`, true); continue; }
+        try {
+          const up = await uploadFile(f);
+          await api('POST', `/api/tweaks/${t.id}/files`, { uploadId: up.uploadId, fileName: f.name });
+          added++;
+        } catch (e) { toast(`${f.name}: ${e.message}`, true); }
+      }
+      if (!files.length) return;
+      await refresh();
+      if (added) toast(`Added ${added} file${added === 1 ? '' : 's'}`);
+      tweakSheet(t.id);
+    };
+    el.querySelectorAll('[data-xdel]').forEach((b) => {
+      b.onclick = async () => {
+        try { await api('DELETE', `/api/tweaks/${t.id}/files/${encodeURIComponent(b.dataset.xdel)}`); await refresh(); toast('Removed'); tweakSheet(t.id); } catch (e) { toast(e.message, true); }
+      };
+    });
     $('#twSave', el).onclick = async () => {
       try {
-        await api('PATCH', `/api/tweaks/${t.id}`, { name: $('#twName', el).value, description: $('#twDesc', el).value, published: $('#twPub', el).checked });
+        await api('PATCH', `/api/tweaks/${t.id}`, { name: $('#twName', el).value, description: $('#twDesc', el).value, published: $('#twPub', el).checked, toDocuments: $('#twDocs', el).checked });
         await refresh(); toast('Saved'); tweaksSheet();
       } catch (e) { toast(e.message, true); }
     };
@@ -4060,8 +4094,11 @@ function signSheet(appId, overrides) {
 
       <div class="section-title">Tweaks</div>
       ${tweakPickerHtml('s', defaults.tweakIds || [])}
-      <button class="file-btn" id="sDylib" style="margin-top:${state.tweaks.length ? 10 : 0}px">${ICONS.plus}<div class="row-main"><div class="row-title">Add your own .dylib or .deb</div><div class="row-sub">Jailbreak tweaks work too — Mango pulls the tweak out of the .deb</div></div></button>
+      <button class="file-btn" id="sDylib" style="margin-top:${state.tweaks.length ? 10 : 0}px">${ICONS.plus}<div class="row-main"><div class="row-title">Add your own tweak files</div><div class="row-sub">A .dylib or .deb, plus any settings file it reads (.plist, .json…)</div></div></button>
       <div class="chips" id="sDylibs"></div>
+      <div class="group hidden" id="sDocsBox" style="margin-top:10px">
+        ${toggle('sToDocs', 'Copy settings files to Documents', "They're always put inside the app next to the tweak. On = also copied into the app's Documents folder when it first opens", true)}
+      </div>
       <div class="group" style="margin-top:10px">
         ${toggle('sWeak', 'Weak injection', 'App still opens if a tweak fails to load', !!defaults.weakDylibs)}
         ${toggle('sInjExt', 'Inject into extensions', 'Also load tweaks in widgets and share extensions', !!defaults.injectExtensions)}
@@ -4119,13 +4156,15 @@ function signSheet(appId, overrides) {
       $('#sIconName', el).textContent = f.name;
     };
     const drawDylibs = () => {
-      $('#sDylibs', el).innerHTML = extra.dylibs.map((f, i) => `<span class="chip">${esc(f.name)}<button data-i="${i}" aria-label="Remove">×</button></span>`).join('');
+      $('#sDylibs', el).innerHTML = extra.dylibs.map((f, i) => `<span class="chip">${isTweakFile(f.name) ? '🧩' : '📄'} ${esc(f.name)}<button data-i="${i}" aria-label="Remove">×</button></span>`).join('');
+      $('#sDocsBox', el).classList.toggle('hidden', !extra.dylibs.some((f) => !isTweakFile(f.name)));
       $('#sDylibs', el).querySelectorAll('button').forEach((b) => { b.onclick = () => { extra.dylibs.splice(Number(b.dataset.i), 1); drawDylibs(); }; });
     };
     $('#sDylib', el).onclick = async () => {
       const files = await pickFile('', true);
       for (const f of files || []) {
-        if (!/\.(dylib|deb)$/i.test(f.name)) { toast(`${f.name} isn't a .dylib or .deb`, true); continue; }
+        if (!isTweakFile(f.name) && !isSettingsFile(f.name)) { toast(`${f.name} isn't a tweak or a settings file`, true); continue; }
+        if (!isTweakFile(f.name) && f.size > 5 * 1024 * 1024) { toast(`${f.name} is too big (settings files can be up to 5 MB)`, true); continue; }
         extra.dylibs.push(f);
       }
       drawDylibs();
@@ -4169,6 +4208,7 @@ function signSheet(appId, overrides) {
         plist: o.plist,
         weakDylibs: $('#sWeak', el).checked,
         injectExtensions: $('#sInjExt', el).checked,
+        filesToDocuments: $('#sToDocs', el).checked,
         removeExtensions: !!o.removeExtensions,
         removeWatch: !!o.removeWatch,
         removeUISD: !!o.removeUISD,
@@ -4227,10 +4267,11 @@ function runSign(a, opts, extra) {
         opts.iconUploadId = (await uploadFile(extra.icon, setBar)).uploadId;
       }
       opts.dylibs = [];
+      opts.tweakFiles = [];
       for (const [i, f] of extra.dylibs.entries()) {
-        setTitle(`Uploading tweak ${i + 1} of ${extra.dylibs.length}…`, f.name);
+        setTitle(`Uploading tweak file ${i + 1} of ${extra.dylibs.length}…`, f.name);
         const up = await uploadFile(f, setBar);
-        opts.dylibs.push({ uploadId: up.uploadId, name: f.name });
+        (isTweakFile(f.name) ? opts.dylibs : opts.tweakFiles).push({ uploadId: up.uploadId, name: f.name });
       }
       $('#pBar', body).classList.add('hidden');
       setTitle('Signing…', 'Big apps can take a minute');
@@ -4323,6 +4364,7 @@ function signedSheet(sid) {
       <dt>Works until</dt><dd>${fmtDate(s.expires)}${left !== null ? ` (${left < 0 ? 'expired' : left + ' days'})` : ''}</dd>
       <dt>Size</dt><dd>${fmtSize(s.size)}</dd>
       ${o.dylibs && o.dylibs.length ? `<dt>Tweaks</dt><dd>${esc(o.dylibs.join(', '))}</dd>` : ''}
+      ${o.tweakFiles && o.tweakFiles.length ? `<dt>Settings files</dt><dd>${esc(o.tweakFiles.join(', '))}</dd>` : ''}
       ${extras.length ? `<dt>Changes</dt><dd>${esc(extras.join(', '))}</dd>` : ''}
     </dl>
     <div class="actions">
