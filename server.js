@@ -2472,8 +2472,10 @@ async function syncSource(src) {
   let added = 0, updated = 0;
   for (const s of parsed.apps) {
     seen.add(s.key);
-    if (isExcluded(src, s)) continue; // you deleted it from this source
     const existing = byKey.get(s.key);
+    // You deleted it from this source: don't add it back. An app of it that's still in your library keeps
+    // updating, though: deleting a duplicate with the same bundle ID used to freeze the one you kept.
+    if (!existing && isExcluded(src, s)) continue;
     if (!existing && sourceSkipsHave(src) && haveElsewhere(s.bundleId, src.id)) continue; // already have it from somewhere else
     if (existing) dropSupersededManual(existing, s.versions);
     // Your own newer uploads (added with "Add a newer version") count as part of the source.

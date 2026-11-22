@@ -20,6 +20,7 @@ module.exports = [
         items: [
           'Apps from GitHub repos could stay on an old version when GitHub said to slow down. Mango now reads the repo\'s public releases page instead, so new releases still show up.',
           'A version you had typed in for an app no longer hides newer versions from its repo or source.',
+          'Deleting a duplicate of an app from a repo or source no longer stops the copy you kept from updating.',
           'GitHub repo and source checks no longer wait behind slow Telegram channel checks: they run in their own line.',
           'Telegram files sent without an .ipa name are recognized when Telegram knows they\'re iPhone apps.',
         ],
