@@ -19,7 +19,7 @@ from urllib.parse import urlparse, parse_qs
 try:
     from telethon import TelegramClient, errors, utils
     from telethon.sessions import StringSession
-    from telethon.tl.types import DocumentAttributeFilename, InputPeerChannel
+    from telethon.tl.types import DocumentAttributeFilename, InputPeerChannel, MessageEntityTextUrl, MessageEntityUrl
 except Exception as e:  # pragma: no cover
     print(f"ERROR telethon is not installed ({e})", flush=True)
     sys.exit(3)
@@ -82,12 +82,37 @@ def file_info(msg):
     return {"name": name or f"file-{msg.id}", "size": f.size or 0, "mime": f.mime_type or ""}
 
 
+def links_of(msg):
+    """Web links in a post: typed URLs, hidden links behind words, and link buttons under the post."""
+    out = []
+    try:
+        for ent, text in msg.get_entities_text() or []:
+            if isinstance(ent, MessageEntityTextUrl) and ent.url:
+                out.append(ent.url)
+            elif isinstance(ent, MessageEntityUrl) and text:
+                out.append(text)
+    except Exception:
+        pass
+    for row in getattr(getattr(msg, "reply_markup", None), "rows", None) or []:
+        for button in getattr(row, "buttons", None) or []:
+            url = getattr(button, "url", None)
+            if url:
+                out.append(url)
+    seen = []
+    for url in out:
+        url = url.strip()
+        if url and url not in seen:
+            seen.append(url if "://" in url else "https://" + url)
+    return seen[:20]
+
+
 def post_view(msg):
     return {
         "id": msg.id,
         "date": msg.date.isoformat() if msg.date else None,
         "text": (msg.message or "")[:4000],
         "file": file_info(msg),
+        "links": links_of(msg),
         "grouped": msg.grouped_id,
     }
 
@@ -151,7 +176,7 @@ async def r_channel(q, body):
 
 
 async def r_posts(q, body):
-    """Newest-first list of posts that have a file.
+    """Newest-first list of posts that have a file or web links (an app can be posted as a link).
     min_id = only posts after that id; offset_id = only posts before that id (for paging back through history)."""
     e = await entity(q.get("ref", [""])[0])
     limit = max(1, min(400, int(q.get("limit", ["50"])[0])))
@@ -163,8 +188,10 @@ async def r_posts(q, body):
     async for msg in client.iter_messages(e, limit=limit, min_id=min_id, offset_id=offset_id):
         scanned += 1
         oldest = msg.id if oldest is None else min(oldest, msg.id)
-        if msg.document:
-            out.append(post_view(msg))
+        if msg.document or msg.entities or getattr(msg, "reply_markup", None):
+            view = post_view(msg)
+            if view["file"] or view["links"]:
+                out.append(view)
     return {"posts": out, "oldest": oldest, "scanned": scanned}
 
 

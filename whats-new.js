@@ -3,6 +3,30 @@
 // Only things people using the app will notice go here — owner-only changes are left out.
 module.exports = [
   {
+    version: '1.21.0',
+    date: '2026-11-22',
+    title: 'Smarter Update Checks',
+    summary: 'GitHub repos update reliably, Telegram channels pick up apps posted as links, and share links just work.',
+    sections: [
+      {
+        title: '✨ New',
+        items: [
+          'Telegram channels now pick up apps posted as a link instead of a file: a direct .ipa link, a GitHub release file, or a Google Drive, MediaFire, Dropbox or pixeldrain link in a post about an .ipa (including hidden links and link buttons).',
+          'Google Drive, MediaFire, Dropbox, pixeldrain and GitHub file pages work anywhere you paste a link: Mango finds the real download behind the share page.',
+        ],
+      },
+      {
+        title: '🛠 Fixed',
+        items: [
+          'Apps from GitHub repos could stay on an old version when GitHub said to slow down. Mango now reads the repo\'s public releases page instead, so new releases still show up.',
+          'A version you had typed in for an app no longer hides newer versions from its repo or source.',
+          'GitHub repo and source checks no longer wait behind slow Telegram channel checks: they run in their own line.',
+          'Telegram files sent without an .ipa name are recognized when Telegram knows they\'re iPhone apps.',
+        ],
+      },
+    ],
+  },
+  {
     version: '1.20.0',
     date: '2026-11-10',
     title: 'Settings Files for Tweaks',

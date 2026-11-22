@@ -2063,7 +2063,7 @@ function remoteDownload(app, versionIndex = 0) {
 
 // Telegram files get a fresh local URL each time (the helper may have restarted on a new port).
 async function resolveDownload(dl) {
-  if (!dl.telegram) return dl;
+  if (!dl.telegram) return dl.url && !dl.headers ? { ...dl, url: await directLink(dl.url) } : dl;
   const f = await tg.file(dl.telegram.ref, dl.telegram.msgId);
   return { ...dl, url: f.url, headers: f.headers };
 }
@@ -2161,8 +2161,33 @@ async function fetchToFile(url, headers, dest, job, label, opts = {}) {
   return got;
 }
 
+// Share pages from file hosts aren't the file itself: turn them into the link that downloads it.
+// Google Drive, Dropbox, pixeldrain, MediaFire (read from its page, since its links expire) and
+// GitHub "blob" pages. Anything else is used as it is.
+async function directLink(raw) {
+  let u;
+  try { u = new URL(raw); } catch { return raw; }
+  const host = u.hostname.toLowerCase();
+  let m;
+  if (/(^|\.)dropbox\.com$/.test(host)) { u.searchParams.set('dl', '1'); return u.toString(); }
+  if (/(^|\.)drive\.google\.com$/.test(host)) {
+    const fileId = (u.pathname.match(/\/file\/d\/([\w-]+)/) || [])[1] || u.searchParams.get('id');
+    if (fileId) return `https://drive.usercontent.google.com/download?id=${encodeURIComponent(fileId)}&export=download&confirm=t`;
+  }
+  if (/(^|\.)pixeldrain\.com$/.test(host) && (m = u.pathname.match(/^\/u\/(\w+)/))) return `https://pixeldrain.com/api/file/${m[1]}?download`;
+  if (/(^|\.)mediafire\.com$/.test(host) && /^\/(file|download)\//.test(u.pathname)) {
+    const html = await fetchText(u.toString(), 'text/html,*/*;q=0.8');
+    const d = html.match(/href="(https?:\/\/download\d*\.mediafire\.com\/[^"]+)"/i);
+    if (!d) throw new Error("Couldn't find the download button on that MediaFire page");
+    return d[1].replace(/&amp;/g, '&');
+  }
+  if (host === 'github.com' && (m = u.pathname.match(/^\/([^/]+)\/([^/]+)\/blob\/(.+)$/))) return `https://github.com/${m[1]}/${m[2]}/raw/${m[3]}`;
+  return u.toString();
+}
+
 // Reads app info from a link without downloading the whole file (falls back to a full download if the server can't do that).
 async function inspectLink(url, headers, job) {
+  if (!headers) url = await directLink(url);
   try {
     return await ipa.inspect({ url, headers: headers || undefined });
   } catch (e) {
@@ -2339,11 +2364,45 @@ async function githubApi(pathname) {
 }
 // The same app across releases: the file name without its version numbers ("BuildBox-2.1.3.ipa" -> "buildbox").
 const ipaVariant = (name) => String(name).replace(/\.ipa$/i, '').toLowerCase().replace(/v?\d+([._-]\d+)*/g, ' ').replace(/[^a-z]+/g, ' ').trim() || 'app';
+// GitHub's API allows 60 requests an hour per address without a token, and a server shares its address
+// with many others, so the API often says "slow down" before Mango has asked anything. The repo's public
+// releases feed and release pages have no such limit: read those instead when the API won't answer.
+async function githubReleasesFromPages(owner, repo) {
+  const base = `https://github.com/${owner}/${repo}`;
+  const feed = await fetchText(`${base}/releases.atom`, 'application/atom+xml,text/xml;q=0.9,*/*;q=0.8');
+  const entries = [...feed.matchAll(/<entry>([\s\S]*?)<\/entry>/g)].map((m) => m[1]).slice(0, 15);
+  const decode = (t) => String(t || '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&');
+  // The feed's notes are HTML inside XML: unwrap them to plain lines ("- " for list items).
+  const plain = (html) => decode(decode(html).replace(/<\/(p|li|h\d|div)>/gi, '\n').replace(/<li[^>]*>/gi, '- ').replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, ''))
+    .replace(/[ \t]+/g, ' ').replace(/\n[ \t]+/g, '\n').replace(/\n{2,}/g, '\n').trim();
+  const releases = [];
+  for (const e of entries) {
+    const link = (e.match(/<link[^>]+href="([^"]+)"/) || [])[1] || '';
+    const tag = decodeURIComponent((link.match(/\/releases\/tag\/([^"?#]+)/) || [])[1] || '');
+    if (!tag) continue;
+    const date = (e.match(/<updated>([^<]+)<\/updated>/) || [])[1] || '';
+    const title = plain((e.match(/<title>([\s\S]*?)<\/title>/) || [])[1]);
+    const body = plain((e.match(/<content[^>]*>([\s\S]*?)<\/content>/) || [])[1]);
+    let assets = [];
+    try {
+      const html = await fetchText(`${base}/releases/expanded_assets/${encodeURIComponent(tag)}`, 'text/html,*/*;q=0.8');
+      assets = [...new Set([...html.matchAll(/href="(\/[^"]+\/releases\/download\/[^"]+\.ipa)"/gi)].map((m) => m[1]))]
+        .map((href) => ({ name: decodeURIComponent(href.split('/').pop()), browser_download_url: `https://github.com${href}`, size: 0, id: `https://github.com${href}` }));
+    } catch { /* this release's files couldn't be listed: skip it */ }
+    releases.push({ tag_name: tag, name: title, published_at: date, body, draft: false, prerelease: /\bpre-?release\b/i.test(title), assets });
+  }
+  return releases;
+}
 async function githubRepoSource(src) {
   const { owner, repo } = src.repo;
   const [info, releases] = await Promise.all([
     githubApi(`/repos/${owner}/${repo}`).catch(() => null),
-    githubApi(`/repos/${owner}/${repo}/releases?per_page=30`),
+    githubApi(`/repos/${owner}/${repo}/releases?per_page=30`).catch(async (e) => {
+      if (/couldn't find/i.test(e.message)) throw e; // a wrong or private repo: say so
+      const pages = await githubReleasesFromPages(owner, repo).catch(() => null);
+      if (!pages || !pages.length) throw e;
+      return pages;
+    }),
   ]);
   const byVariant = new Map();
   // Newest first by when each release came out (GitHub's own list order isn't by date; it can follow tag names).
@@ -2446,6 +2505,9 @@ async function syncSource(src) {
     await saveRepoMeta(app, s);
     if (oldVersion && v.version && oldVersion !== v.version) {
       app.previousVersion = app.versionOverride || oldVersion;
+      // A version you typed in for the old release would hide the new one forever: it goes, as it does
+      // when a Telegram post or a new file updates the app (unless you locked it).
+      if (!locked.has('versionOverride')) app.versionOverride = null;
       app.updatedAt = new Date().toISOString();
       notifyUpdate(app, app.previousVersion);
       updated++;
@@ -2547,8 +2609,8 @@ route('POST', /^\/api\/sources$/, async (req, res, m, acc) => {
   if (addingLinks.has(linkKey(url))) return fail(res, 409, 'That source is already being added');
   const src = { id: id(), url, name: repo ? repo.repo : 'Source', showInLibrary: b.showInLibrary !== false, addedAt: new Date().toISOString() };
   if (repo) Object.assign(src, { kind: 'ghrepo', repo: { owner: repo.owner, repo: repo.repo } });
-  // Nothing else checking: add it right away (and tell you if the link is wrong).
-  if (!checkBusy()) {
+  // No other repo or source being checked: add it right away (and tell you if the link is wrong).
+  if (!runningIn('web') && !checkQueue.some((c) => laneOf(c.job) === 'web')) {
     addingLinks.add(linkKey(url));
     try {
       store.sources.push(src);
@@ -3901,7 +3963,45 @@ function cleanCaption(text) {
 }
 const normName = (n) => String(n || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 
+// What app a Telegram post holds: an .ipa file, or a link to one (a direct .ipa link, a GitHub release
+// file, or a share page on Google Drive, MediaFire, Dropbox, pixeldrain… when the post says it's an .ipa).
+const SHARE_HOSTS = /(^|\.)(drive\.google\.com|mediafire\.com|pixeldrain\.com|dropbox\.com|github\.com|catbox\.moe|gofile\.io)$/i;
+function ipaFileOf(p) {
+  if (!p.file) return null;
+  const name = String(p.file.name || '');
+  if (/\.ipa$/i.test(name)) return name;
+  // Sent without its name (or a made-up one), but Telegram knows it's an iPhone app.
+  if (/itunes-ipa|ios-app|\bipa\b/i.test(p.file.mime || '') && !/\.[a-z0-9]{2,5}$/i.test(name)) return `${name}.ipa`;
+  return null;
+}
+function ipaLinkOf(p) {
+  const text = String(p.text || '');
+  const typed = [...text.matchAll(/https?:\/\/[^\s<>"')\]]+/gi)].map((m) => m[0]);
+  const saysIpa = /\.ipa\b|\bipa\b/i.test(text);
+  for (const raw of [...(p.links || []), ...typed]) {
+    let u;
+    try { u = new URL(raw); } catch { continue; }
+    if (!/^https?:$/.test(u.protocol) || u.hostname === 't.me') continue;
+    const file = decodeURIComponent(u.pathname);
+    if (/\.ipa(\/|$)/i.test(file)) return u.toString(); // also MediaFire's ".../App.ipa/file"
+    if (saysIpa && SHARE_HOSTS.test(u.hostname) && !/\.(zip|deb|apk|png|jpe?g|mp4)$/i.test(file) && !(u.hostname === 'github.com' && !/\/(releases|blob|raw)\//.test(u.pathname))) return u.toString();
+  }
+  return null;
+}
+// { name, link } for a post with an app (link only when it's a link post), or null.
+function postApp(p) {
+  const file = ipaFileOf(p);
+  if (file) return { name: file, link: null };
+  const link = ipaLinkOf(p);
+  if (!link) return null;
+  const u = new URL(link);
+  const last = decodeURIComponent(u.pathname).split('/').filter(Boolean).reverse().find((seg) => /\.ipa$/i.test(seg)) || '';
+  const firstLine = String(p.text || '').split('\n').map((l) => l.trim()).find(Boolean) || '';
+  return { name: /\.ipa$/i.test(last) ? last : `${firstLine.slice(0, 60) || u.hostname}.ipa`, link };
+}
 async function tgPeek(src, post) {
+  const app = post.app || postApp(post);
+  if (app && app.link) return inspectLink(app.link, null);
   const f = await tg.file(tgRef(src), post.id);
   return ipa.inspect({ url: f.url, headers: f.headers });
 }
@@ -3910,11 +4010,13 @@ const fileKey = (name) => String(name || '').toLowerCase().replace(/\.ipa$/, '')
 
 async function tgImportPost(src, post, job, preMeta) {
   const opts = src.options;
-  const f = await tg.file(tgRef(src), post.id);
-  const meta = preMeta || await ipa.inspect({ url: f.url, headers: f.headers });
+  const postAppInfo = post.app || postApp(post) || { name: (post.file && post.file.name) || 'app.ipa', link: null };
+  const link = postAppInfo.link;
+  const f = link ? { url: link, headers: null } : await tg.file(tgRef(src), post.id);
+  const meta = preMeta || (link ? await inspectLink(link, null, job) : await ipa.inspect({ url: f.url, headers: f.headers }));
   if (!meta.bundleId) throw new Error("couldn't read the app inside");
   const bid = meta.bundleId.toLowerCase();
-  const mine = (a) => a.remote && a.remote.kind === 'telegram' && a.remote.sourceId === src.id;
+  const mine = (a) => a.remote && ['telegram', 'link'].includes(a.remote.kind) && a.remote.sourceId === src.id;
   let app = store.apps.find((a) => mine(a) && (a.bundleId || '').toLowerCase() === bid)
     || (opts.matchName ? store.apps.find((a) => mine(a) && normName(a.originalName || a.name) === normName(meta.name)) : null)
     || (opts.updateMine ? store.apps.find((a) => (a.bundleId || '').toLowerCase() === bid && (!a.remote || ['github', 'link'].includes(a.remote.kind))) : null);
@@ -3939,7 +4041,10 @@ async function tgImportPost(src, post, job, preMeta) {
     return 'same';
   }
   // Where the file lives: on Telegram (just the post), or copied once to your GitHub storage.
-  const remote = { kind: 'telegram', sourceId: src.id, ref: src.ref, msgId: post.id, postDate: post.date, fileKey: fileKey(post.file && post.file.name) };
+  // A link post keeps its link (fetched while signing, like a link you added); a file post keeps the post.
+  const remote = link
+    ? { kind: 'link', url: link, sourceId: src.id, ref: src.ref, msgId: post.id, postDate: post.date, fileKey: fileKey(postAppInfo.name) }
+    : { kind: 'telegram', sourceId: src.id, ref: src.ref, msgId: post.id, postDate: post.date, fileKey: fileKey(postAppInfo.name) };
   if (opts.storage === 'github') {
     const g = ghSettings();
     const gh = ghClient();
@@ -3948,8 +4053,8 @@ async function tgImportPost(src, post, job, preMeta) {
     const startCtrl = new AbortController();
     const startTimer = setTimeout(() => startCtrl.abort(new Error("Telegram didn't start sending the file. Try again.")), 120000);
     let r;
-    try { r = await fetchAuthed(f.url, f.headers, AbortSignal.any([job.signal, startCtrl.signal])); } finally { clearTimeout(startTimer); }
-    if (!r.ok || !r.body) throw new Error(`couldn't read the file from Telegram (HTTP ${r.status})`);
+    try { r = await fetchAuthed(link ? await directLink(link) : f.url, f.headers, AbortSignal.any([job.signal, startCtrl.signal])); } finally { clearTimeout(startTimer); }
+    if (!r.ok || !r.body) throw new Error(`couldn't read the file from ${link ? new URL(link).hostname : 'Telegram'} (HTTP ${r.status})`);
     const size = Number(r.headers.get('content-length')) || meta.size;
     const safe = `tg-${normName(meta.name).slice(0, 40) || 'app'}-${meta.version || 'v'}-${id().slice(0, 6)}.ipa`;
     const asset = await gh.uploadStream(g.releaseId, safe, r.body, size, (p) => { job.progress = p; }, job.signal);
@@ -3983,7 +4088,7 @@ async function tgImportPost(src, post, job, preMeta) {
   }
   const lines = String(post.text || '').split('\n').map((l) => l.trim()).filter(Boolean);
   const rec = newLibraryRecord(meta, {
-    source: 'telegram', remote, fileName: (post.file && post.file.name) || 'app.ipa',
+    source: 'telegram', remote, fileName: postAppInfo.name,
     description: cleanCaption(lines.slice(0, 12).join('\n')).slice(0, 600), notes,
     published: src.showInLibrary !== false, categoryId: src.categoryId && catExists(src.categoryId) ? src.categoryId : null,
     descFromCaption: true,
@@ -4006,27 +4111,31 @@ async function tgImportPost(src, post, job, preMeta) {
 }
 const catExists = (cid) => store.categories.some((c) => c.id === cid);
 
-// ----- one check at a time -----
-// Checking a Telegram channel, a GitHub repo or a source all wait in one line, so only one runs at a time
-// (they share Telegram's and GitHub's speed limits, and running several at once makes them all crawl).
-// Starting one while another runs is fine: it waits its turn and says what it's waiting for.
+// ----- checks: two lines, one at a time in each -----
+// Telegram channels wait in their own line, one at a time (Telegram has strict speed limits and its channels
+// are the slow ones). GitHub repos, sources and downloads pages have a second line, so a quick repo check never
+// waits behind a long channel check. Starting one while another runs in its line is fine: it waits its turn
+// and says what it's waiting for.
 const checkQueue = [];
-let checkRunning = null;
-// Where a waiting check is in line and what it's waiting for, worked out fresh each time it's asked
+const runningChecks = new Set(); // at most one per line
+const laneOf = (job) => (job.isTelegram ? 'telegram' : 'web');
+const runningIn = (lane) => [...runningChecks].find((j) => laneOf(j) === lane) || null;
+// Where a waiting check is in its line and what it's waiting for, worked out fresh each time it's asked
 // (so it never says it's waiting for something that already finished).
 function queueInfo(job) {
-  const i = checkQueue.findIndex((c) => c.job === job);
+  const lane = laneOf(job);
+  const line = checkQueue.filter((c) => laneOf(c.job) === lane);
+  const i = line.findIndex((c) => c.job === job);
   if (i < 0) return null;
+  const running = runningIn(lane);
   const wrapping = windingDown.has(job.srcId) ? 'the stopped check of it to wrap up' : null;
-  return { position: i + 1, waitingFor: (checkRunning && checkRunning.title) || wrapping || (i > 0 ? checkQueue[i - 1].job.title : null) };
+  return { position: i + 1, waitingFor: (running && running.title) || wrapping || (i > 0 ? line[i - 1].job.title : null) };
 }
 function runCheck(job, work) {
   job.isCheck = true;
-  // Telegram has strict rate limits and its channels are the slow ones, so they always go last:
-  // a repo or source check that joins the line goes ahead of any Telegram channel still waiting.
-  const tgFirst = job.isTelegram ? -1 : checkQueue.findIndex((c) => c.job.isTelegram);
-  if (tgFirst >= 0) checkQueue.splice(tgFirst, 0, { job, work }); else checkQueue.push({ job, work });
-  if (checkRunning || checkQueue.length > 1 || checkQueue[0].job !== job) {
+  checkQueue.push({ job, work });
+  const lane = laneOf(job);
+  if (runningIn(lane) || checkQueue.find((c) => laneOf(c.job) === lane).job !== job) {
     job.status = 'queued';
     job.waitingFor = [queueInfo(job).waitingFor].filter(Boolean); // for the reply that started it
   }
@@ -4036,49 +4145,54 @@ function runCheck(job, work) {
 // Sources whose check was stopped but is still finishing its current step (a Telegram request, say).
 // A new check of the same source waits for that, so the two never import the same posts at once.
 const windingDown = new Set();
-async function pumpChecks() {
-  if (checkRunning) return;
-  const i = checkQueue.findIndex((c) => c.job.cancelled || !windingDown.has(c.job.srcId));
-  if (i < 0) return;
-  const [next] = checkQueue.splice(i, 1);
-  const { job, work } = next;
-  if (job.cancelled) { job.status = 'cancelled'; job.endedAt = Date.now(); return pumpChecks(); }
-  checkRunning = job;
-  job.status = 'running';
-  job.waitingFor = null;
-  job.started = Date.now();
-  job.activityAt = Date.now();
-  try { await work(); } catch (e) {
-    if (job.status === 'running') { job.status = 'error'; job.error = e.message; }
-  } finally {
-    if (job.status === 'running') job.status = job.cancelled ? 'cancelled' : 'done';
-    job.endedAt = job.endedAt || Date.now();
-    if (job.srcId) windingDown.delete(job.srcId);
-    // Free the line if this is still the check holding it (Stop or the watchdog may have already).
-    if (checkRunning === job) checkRunning = null;
-    setImmediate(pumpChecks);
+function pumpChecks() {
+  for (const lane of ['web', 'telegram']) {
+    if (runningIn(lane)) continue;
+    const i = checkQueue.findIndex((c) => laneOf(c.job) === lane && (c.job.cancelled || !windingDown.has(c.job.srcId)));
+    if (i < 0) continue;
+    const [next] = checkQueue.splice(i, 1);
+    const { job, work } = next;
+    if (job.cancelled) { job.status = 'cancelled'; job.endedAt = Date.now(); setImmediate(pumpChecks); continue; }
+    runningChecks.add(job);
+    job.status = 'running';
+    job.waitingFor = null;
+    job.started = Date.now();
+    job.activityAt = Date.now();
+    (async () => {
+      try { await work(); } catch (e) {
+        if (job.status === 'running') { job.status = 'error'; job.error = e.message; }
+      } finally {
+        if (job.status === 'running') job.status = job.cancelled ? 'cancelled' : 'done';
+        job.endedAt = job.endedAt || Date.now();
+        if (job.srcId) windingDown.delete(job.srcId);
+        // Free the line if this is still a check holding it (Stop or the watchdog may have already).
+        runningChecks.delete(job);
+        setImmediate(pumpChecks);
+      }
+    })();
   }
 }
-// Stopping the running check frees the line right away: the next one starts now instead of waiting
+// Stopping a running check frees its line right away: the next one starts now instead of waiting
 // for the stopped one to finish whatever request it was in the middle of.
 function releaseCheck(job) {
-  if (checkRunning !== job) return;
+  if (!runningChecks.has(job)) return;
   if (job.srcId) windingDown.add(job.srcId);
   job.status = 'cancelled';
   job.endedAt = Date.now();
-  checkRunning = null;
+  runningChecks.delete(job);
   setImmediate(pumpChecks);
 }
-const checkBusy = () => !!checkRunning || checkQueue.length > 0;
+const checkBusy = () => runningChecks.size > 0 || checkQueue.length > 0;
 // Is this source already being checked (or waiting)? Then reuse that instead of starting another.
 function checkFor(srcId) {
-  return [checkRunning, ...checkQueue.map((c) => c.job)].find((j) => j && j.srcId === srcId && !j.cancelled && ['running', 'queued'].includes(j.status)) || null;
+  return [...runningChecks, ...checkQueue.map((c) => c.job)].find((j) => j && j.srcId === srcId && !j.cancelled && ['running', 'queued'].includes(j.status)) || null;
 }
 // Watchdog: a check that has shown no sign of life for 15 minutes is stopped, so it can never hold up
 // the line forever. "Sign of life" = a new log line, counter or progress change.
 setInterval(() => {
-  const j = checkRunning;
-  if (!j) return;
+  for (const j of [...runningChecks]) watchCheck(j);
+}, 30_000).unref();
+function watchCheck(j) {
   const sig = `${j.log.length}|${j.counter ? j.counter.done : ''}|${j.progress ?? ''}`;
   if (sig !== j.activitySig) { j.activitySig = sig; j.activityAt = Date.now(); return; }
   if (Date.now() - (j.activityAt || j.started) < 15 * 60_000) return;
@@ -4088,7 +4202,7 @@ setInterval(() => {
   releaseCheck(j);
   j.status = 'error';
   j.error = 'Stopped after 15 minutes with no progress. Try it again.';
-}, 30_000).unref();
+}
 
 // Every hour, everything gets checked (see scheduleChecks). Remember when, to show "next check in…".
 let nextAutoCheck = Date.now() + 5 * 60_000;
@@ -4113,8 +4227,8 @@ function tgSync(src, acc) {
       await ensurePeer(src, job);
       const { posts } = await tgTry(job, () => tg.posts(tgRef(src), src.lastMsgId || 0, first ? 400 : 200), src);
       const words = opts.keywords.split(',').map((w) => w.trim().toLowerCase()).filter(Boolean);
-      let ipas = posts.filter((p) => p.file && /\.ipa$/i.test(p.file.name));
-      if (words.length) ipas = ipas.filter((p) => words.some((w) => `${p.file.name}\n${p.text}`.toLowerCase().includes(w)));
+      let ipas = posts.filter((p) => (p.app = postApp(p)));
+      if (words.length) ipas = ipas.filter((p) => words.some((w) => `${p.app.name}\n${p.text}`.toLowerCase().includes(w)));
       result.skipped = posts.length - ipas.length;
       if (first) ipas = ipas.slice(0, opts.backfill);
       job.log.push(ipas.length ? `${ipas.length} new post${ipas.length === 1 ? '' : 's'} with an app` : 'No new apps posted ✓');
@@ -4125,7 +4239,7 @@ function tgSync(src, acc) {
       let blocked = false;
       for (const [i, p] of ipas.entries()) {
         if (job.cancelled) { blocked = true; maxDone = Math.min(maxDone || p.id - 1, p.id - 1); break; }
-        job.log.push(`(${i + 1}/${ipas.length}) ${p.file.name}`);
+        job.log.push(`(${i + 1}/${ipas.length}) ${p.app.name}${p.app.link ? ` (link: ${new URL(p.app.link).hostname})` : ''}`);
         try {
           const r = await tgImportPost(src, p, job);
           result[r]++;
@@ -4136,7 +4250,7 @@ function tgSync(src, acc) {
           if (job.cancelled) { blocked = true; maxDone = Math.min(maxDone || p.id - 1, p.id - 1); break; }
           src.failures[p.id] = (src.failures[p.id] || 0) + 1;
           result.failed++;
-          job.log.push(`✕ ${p.file.name}: ${e.message}`);
+          job.log.push(`✕ ${p.app.name}: ${e.message}`);
           // Try a failed post again next time (up to 3 times), so a hiccup doesn't skip an app forever.
           if (src.failures[p.id] < 3 && !blocked) { blocked = true; maxDone = Math.min(maxDone || p.id - 1, p.id - 1); }
         }
@@ -4197,8 +4311,8 @@ function tgDeepScan(src, count, acc, { recheck = false, quick = true } = {}) {
         if (!page.scanned) break;
         looked += page.scanned;
         for (const p of page.posts) {
-          if (!p.file || !/\.ipa$/i.test(p.file.name)) continue;
-          if (words.length && !words.some((w) => `${p.file.name}\n${p.text}`.toLowerCase().includes(w))) { result.skipped++; continue; }
+          if (!(p.app = postApp(p))) continue;
+          if (words.length && !words.some((w) => `${p.app.name}\n${p.text}`.toLowerCase().includes(w))) { result.skipped++; continue; }
           if (found.length < want) found.push(p);
         }
         job.counter.done = looked;
@@ -4215,13 +4329,13 @@ function tgDeepScan(src, count, acc, { recheck = false, quick = true } = {}) {
       const done = new Set(src.done);
       // A name every post shares (like "app.ipa") says nothing about which app it is, so it's ignored.
       const keyCount = new Map();
-      for (const p of found) { const kk = fileKey(p.file.name); keyCount.set(kk, (keyCount.get(kk) || 0) + 1); }
+      for (const p of found) { const kk = fileKey(p.app.name); keyCount.set(kk, (keyCount.get(kk) || 0) + 1); }
       const usableKey = (kk) => quick && kk.length >= 4 && !['game', 'signed', 'modded', 'hacked', 'tweaked', 'file', 'download'].includes(kk) && keyCount.get(kk) <= Math.max(25, found.length * 0.3);
       const newestByKey = new Map();
-      for (const a of store.apps) if (a.remote && a.remote.kind === 'telegram' && a.remote.sourceId === src.id && a.remote.fileKey) newestByKey.set(a.remote.fileKey, Math.max(newestByKey.get(a.remote.fileKey) || 0, a.remote.msgId));
+      for (const a of store.apps) if (a.remote && ['telegram', 'link'].includes(a.remote.kind) && a.remote.sourceId === src.id && a.remote.fileKey) newestByKey.set(a.remote.fileKey, Math.max(newestByKey.get(a.remote.fileKey) || 0, a.remote.msgId));
       const todo = [];
       for (const p of found) { // newest first
-        const key = usableKey(fileKey(p.file.name)) ? fileKey(p.file.name) : '';
+        const key = usableKey(fileKey(p.app.name)) ? fileKey(p.app.name) : '';
         if (!recheck && done.has(p.id)) { result.known++; continue; }
         if (key && newestByKey.has(key) && newestByKey.get(key) > p.id) { result.older++; done.add(p.id); continue; }
         if (key && !newestByKey.has(key)) newestByKey.set(key, p.id);
@@ -4238,7 +4352,7 @@ function tgDeepScan(src, count, acc, { recheck = false, quick = true } = {}) {
         const metas = await Promise.all(batch.map((p) => tgPeek(src, p).then((meta) => ({ meta }), (error) => ({ error }))));
         for (const [n, p] of batch.entries()) {
           if (job.cancelled) break;
-          job.log.push(`(${i + n + 1}/${todo.length}) ${p.file.name}`);
+          job.log.push(`(${i + n + 1}/${todo.length}) ${p.app.name}`);
           try {
             if (metas[n].error) throw metas[n].error;
             result[await tgImportPost(src, p, job, metas[n].meta)]++;
@@ -4246,7 +4360,7 @@ function tgDeepScan(src, count, acc, { recheck = false, quick = true } = {}) {
           } catch (e) {
             if (job.cancelled) break;
             result.failed++;
-            job.log.push(`✕ ${p.file.name}: ${e.message}`);
+            job.log.push(`✕ ${p.app.name}: ${e.message}`);
           }
           job.counter.done = i + n + 1;
           job.progress = (i + n + 1) / todo.length;
@@ -5060,7 +5174,7 @@ function jobView(j) {
   // A check shown as running or waiting must really be: one that isn't running and isn't in line has
   // finished (or was lost), so it never shows as running or waiting forever.
   if (j.isCheck && status === 'queued' && !checkQueue.some((c) => c.job === j)) status = j.result ? 'done' : 'cancelled';
-  if (j.isCheck && status === 'running' && checkRunning !== j) status = j.error ? 'error' : 'done';
+  if (j.isCheck && status === 'running' && !runningChecks.has(j)) status = j.error ? 'error' : 'done';
   const q = status === 'queued' ? queueInfo(j) : null;
   return {
     id: j.id, title: j.title, status, progress: status === 'running' ? j.progress ?? null : null,
@@ -5101,7 +5215,7 @@ route('GET', /^\/api\/jobs$/, (req, res, m, acc) => {
   const rank = (v) => (v.status === 'running' ? 0 : v.status === 'queued' ? 1 : 2);
   json(res, {
     jobs: list.map(jobView).sort((a, b) => rank(a) - rank(b) || (a.position || 0) - (b.position || 0) || (b.endedAt || b.started) - (a.endedAt || a.started)),
-    checks: isStaff(acc) ? { nextAuto: nextAutoCheck, sources: store.sources.length, running: !!checkRunning, waiting: checkQueue.length } : null,
+    checks: isStaff(acc) ? { nextAuto: nextAutoCheck, sources: store.sources.length, running: runningChecks.size > 0, waiting: checkQueue.length } : null,
   });
 });
 
